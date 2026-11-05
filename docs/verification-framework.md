@@ -1,47 +1,58 @@
 # Verification Framework
 
-## Purpose and principle
+## Purpose and traceability
 
-The framework makes completion claims auditable and independent of the implementer's assertion. Its documents and schemas define intended contracts; the initial repository does not execute or enforce them.
+Verification makes completion claims auditable against a specific target and increment. Map every acceptance criterion to its source requirement, applicable decision, component, implementation reference, relevant documentation, test/scenario, and evidence. Use only these statuses:
 
-## Traceability
+- `PASS`: current, observable evidence supports the criterion.
+- `FAIL`: evidence demonstrates the criterion is unmet.
+- `NEEDS_EVIDENCE`: evidence is absent, stale, or insufficient.
+- `NOT_APPLICABLE`: the criterion does not apply, with rationale and an authorized disposition where the criterion was previously approved.
 
-Map each acceptance criterion to its source requirement, responsible component, implementation reference, test/scenario, and evidence. Use only these statuses:
+A planned command, test name, or agent assertion is not evidence. Documentation criteria are checked against actual code and behavior, not just whether a document changed.
 
-- `PASS`: observable evidence supports the criterion.
-- `FAIL`: evidence demonstrates it is unmet.
-- `NEEDS_EVIDENCE`: evidence is absent or insufficient.
-- `NOT_APPLICABLE`: criterion does not apply, with rationale.
+## Evidence identity and validity
 
-A test name, planned command, or agent statement alone is not evidence of a pass.
+Each evidence record has a unique ID and identifies target, increment, observation time, result, and the immutable revision identity `content:<lowercase SHA-256>`. This identity is never a commit SHA. It hashes RFC 8785 canonical JSON containing the original baseline commit SHA captured before work and retained unchanged in workflow state, plus a path-sorted manifest for explicit `revision_paths`: product code, tests, configuration, product documentation, and the source requirements/approved decisions that define the reviewed criteria. Each manifest entry contains path, file type, mode, and file-content SHA-256; include in-scope untracked files and represent symlinks by link text, while rejecting links outside target root. Exclude Git metadata and mutable workflow state, activity logs, evidence, review reports, and gate records so those records can refer to the revision without changing it. Persist the manifest as a target-local artifact. Each evidence record additionally carries a scope-specific fingerprint and paths that must be a subset of `revision_paths`, plus source state (`commit` or `working_tree`), baseline commit, and optional commit SHA provenance. Command and test evidence also records exact command, canonical working directory, exit code, observed result, relevant environment fingerprint, and artifact reference. Keep artifacts and references in the target repository; redact secrets and sensitive payloads.
 
-## Evidence
+When applied by a validator, JSON Schema checks record shape. A cross-reference validator must additionally ensure that each referenced ID resolves exactly once, belongs to the same target and increment, and is bound to the revision under review. It must verify that evidence supports the criterion's stated verification approach; a matching ID alone does not establish support. Neither validator exists in the current release.
 
-Evidence should be reproducible and attributable. A command/test record includes the exact command, target working directory, exit code, observed result, time where useful, and output/artifact reference. File references should identify the target revision and path/line where possible. Record limitations such as skipped tests, unavailable services, or non-representative data. Redact secrets and sensitive payloads.
+Evidence is current only for the recorded immutable content identity, evidence scope, and environment. Any change to `revision_paths` creates a new identity; prior evidence and review reports cannot satisfy the new gate, even if their individual scope fingerprints are unchanged. Use impact analysis to select which checks to rerun, but create current evidence records for every required criterion bound to the final identity. Full-suite, build, integration, and security checks must be rerun when an in-scope source, test, configuration, dependency-lock, or relevant environment input changes. Never relabel prior records.
 
-Schema contracts live in `harness/schemas/`. They are JSON Schema documents but are not currently validated automatically.
+The primary sequence approves the content identity before an optional commit. After a separately authorized commit, recompute the manifest over the same `revision_paths` using the original baseline SHA retained in workflow state; record the commit SHA as provenance and mark it equivalent only when the identity matches exactly and the commit contains no unapproved product changes. A mismatch leaves the earlier gate attached only to its prior identity and requires current evidence for all required criteria, all required reviews on the new identity, and a new gate. `COMPLETED` must reference the exact approved content identity and final evidence for that identity; a commit SHA cannot substitute for it.
 
-## Findings
+## Findings and blocking rules
 
-Classify severity as Critical, High, Medium, Low, or Informational. Also classify the nature of the item: confirmed defect, potential risk, known limitation, or optional improvement. Include evidence, concrete failure scenario, impact, and recommendation. Do not state an unverified hypothesis as a confirmed defect.
+Classify findings as `Critical`, `High`, `Medium`, `Low`, or `Informational`, and separately as confirmed defect, potential risk, known limitation, or optional improvement. Include evidence, scenario, impact, recommendation, target revision, and disposition.
 
-## Independent reviewers
+- **Critical and High:** always block `APPROVE` while open. They cannot be accepted as risk for approval under the default policy.
+- **Medium:** blocks until fixed or accepted by an authorized human as a documented risk. Acceptance must include scenario, impact, compensating controls, residual risk, owner, review date, and authorizer. It cannot waive a failed required criterion or a legal, regulatory, or security obligation.
+- **Low and Informational:** may be deferred with rationale, owner, and review date. Keep the finding visible in the gate record.
+- A fix that changes the content identity makes earlier evidence and reports ineligible for the new gate. Rerun checks selected by impact analysis, create current evidence for every required criterion, and obtain every required reviewer report on the final identity. `not_reproducible` requires reproduction evidence and reviewer disposition; it is not an automatic deletion of the finding.
 
-Requirements, QA/Test, Code, Architecture, and Security reviewer contracts are defined in `harness/verification/reviewer-contracts.md`. Reviewers are read-only, inspect evidence directly, disclose limits on independence, and report findings. The workflow owner records review results. No author may be the sole approver of their work.
+Before review starts, workflow state records assigned reviewer roles, declared identities, assurance, sessions, review IDs, exact scope paths, content revision, and assignment reference. The gate independently derives minimum roles and whether high-risk scope requires a second reviewer; every required slot must have a matching completed report for the exact increment, content identity, and assigned scope. A report declares `complete` or `incomplete`, explicitly attests to full assigned-scope completion, lists mandatory checks completed and remaining, and discloses limitations and unverified areas. It cannot be complete with required checks remaining. An empty finding set is acceptable only for a completed review; incompleteness is not evidence of no defects. The canonical finding record names every report that produced it. Before computing the gate result, reconcile assignments, all recorded reports, report finding-ID summaries/tables, and the canonical register in both directions. Missing, duplicate, orphaned, pending, incomplete, or revision/scope-mismatched records prevent approval.
 
-Review effort is risk-based. Changes involving external contracts, persistence, concurrency, authorization, sensitive data, deployment, or irreversible actions require deeper scrutiny than low-risk documentation edits.
+These controls establish record integrity and require reviewer attestation; they cannot prove that a reviewer honestly disclosed every observation or that a substantive review was exhaustive. A reviewer’s completion declaration and schema validation are not guarantees of truth. Review quality, limitations, and unverified areas remain explicit human responsibilities.
+
+## Review roles, independence, and authority
+
+The Requirements Reviewer checks source and criteria; QA/Test checks whether evidence exercises realistic behavior; Code checks changed implementation; Architecture checks boundaries and approved decisions; Security checks trust boundaries, sensitive data, authorization, dependencies, and operational exposure. Apply relevant roles according to risk. Reviewers inspect the target revision and evidence read-only, disclose their identity, role, scope, and limitations, and return findings without editing files.
+
+Assess the increment at the highest risk band triggered by any requirement, affected component, data flow, operation, or finding. The implementer does not downgrade the band; the evaluator records its basis.
+
+Each review records declared identity, identity assurance (`declared` or `externally_authenticated`), role, kind, session identity, reviewed content identity and paths, completion, limitations, and report reference. The gate records implementer identity/session and their assurance. A session identity is an identifier for an execution context, not merely a phase name; unless supplied by a trusted runtime, it is a declaration. String inequality does not prove that two identities belong to different people. Medium-risk review requires a separate read-only session; another session of the same agent is permitted as a reported separation, not proof of distinct personhood. High-risk approval requires externally authenticated implementer and human reviewer principals, a distinct authenticated subject, and a separate session. High-risk security-sensitive, material data-loss/irreversible, or Critical/High-finding cases require a second independent human reviewer; all human reviewers must be externally authenticated, and at least one must be a Security Reviewer for security-sensitive work. A different phase in the implementation session is never independent.
+
+Human gate approvals, risk acceptances, and restricted-operation authorizations require a verifiable reference from a trusted external identity source. For accepted risk or high-risk approval, compare trusted external subject identifiers to ensure the authority differs from the implementer and each human reviewer. Agent-session reviewers are separated by session; their session strings are not human identities and are not compared as authenticated principals. If no trusted source can verify identity/authority, stop at `WAITING_FOR_HUMAN` or `ESCALATE`; a repository role or self-reported name is insufficient. The harness can validate fields and references but has no identity provider and cannot authenticate people in this release. Provider integration remains a future implementation decision.
+
+The implementer cannot issue or override `APPROVE`. A deterministic Policy Evaluator may auto-approve only low-risk increments when all required criteria pass with current evidence, no Medium-or-higher findings remain, no unresolved decision affects scope, and the applicable checks and documentation review pass. Medium-risk work requires a separate independent review; the Policy Evaluator may approve only if its findings and criteria satisfy policy and there is no risk acceptance request. If a Medium finding is accepted as risk, the authorized human gate approver issues `APPROVE` after the independent review and must have a trusted authenticated identity distinct from the implementer and any human reviewer; agent-session reviewers must be in a separate session from the implementer. High-risk work requires independent human review and approval from the target's designated human gate authority, with trusted authenticated identities distinct from the implementer and human reviewers. Security-sensitive work also requires a Security Reviewer. Only an authorized human may accept a Medium risk, approve high-risk work, or resolve a consequential product/security decision.
+
+Every decision records implementer declared identity/session/assurance, reviewer identity/session/assurance and completed scope, approver identity/role/authority basis/authentication reference, scope, immutable content revision and manifest reference, time, rationale, evidence references, canonical findings register reference/fingerprint, and unresolved decisions. A target's designated gate authority must be identified in target project state and externally authenticated before a human-authorized gate action. If no trusted authentication evidence exists, do not issue human `APPROVE`; escalate. Do not infer authority from repository access.
 
 ## Gate outcomes
 
-The verification gate can:
+- `APPROVE`: all required criteria pass on current evidence, required independent reviews are recorded, no Critical/High finding is open, Medium findings are fixed or have authorized risk acceptance, lower-severity deferrals are documented, and no pending decision blocks scope.
+- `REJECT_REQUEST_CORRECTION`: a confirmed in-scope defect, failed criterion, or open Critical/High finding needs correction.
+- `REQUEST_EVIDENCE`: a claim may be valid but required evidence is absent, stale, ambiguous, or not reproducible.
+- `ESCALATE`: progress requires a human product/security decision, authorization, risk acceptance, or designated gate authority.
 
-- `APPROVE` a bounded scope with evidence and no blocking findings.
-- `REJECT_REQUEST_CORRECTION` for a confirmed defect or unmet criterion.
-- `REQUEST_EVIDENCE` when a claim is plausible but not established.
-- `ESCALATE` when progress requires a user decision or authorization.
-
-Required criteria without evidence cannot be approved. Findings need explicit disposition. Corrections require affected checks to be rerun.
-
-## Evidence limitations
-
-Evidence can be invalidated by changed code, environment, configuration, or target revision. Link evidence to a revision where feasible. Tests can be vacuous, skipped, overly mocked, or unrelated to requirements; reviewers must assess whether they demonstrate the claimed behavior. A successful local check is not proof of production readiness.
+The gate may approve a bounded increment while later work remains, but must not represent that result as project completion. Decisions and evidence are target-specific records. Schemas define structure; current policy is not technically enforced in this release.

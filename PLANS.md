@@ -2,7 +2,7 @@
 
 ## Current status
 
-**Foundation initialized.** This repository contains reusable workflow documentation, prompts, reviewer contracts, gate policy, schemas, and templates. No executable automation or multi-agent orchestration is implemented.
+**Documented foundation and operational contracts defined.** This repository contains reusable workflow instructions, target and authorization contracts, prompts, reviewer/gate policy, schemas, and templates. No executable automation or multi-agent orchestration is implemented.
 
 ## Roadmap
 
@@ -20,9 +20,9 @@
 
 ### 3. Single-agent workflow automation — planned
 
-- Define a minimal invocation and target-path contract.
+- Implement invocation, target resolution, state persistence, and scoped access using the documented contracts in `docs/workflow.md` and `harness/config/verification-policy.yaml`.
 - Automate evidence collection and selected policy checks only after the manual workflow is stable.
-- Make command execution, working directory, approvals, and failure handling explicit.
+- Enforce command execution, working directory, approvals, and failure handling against the documented contracts.
 - Avoid adding an orchestration framework unless a demonstrated need warrants it.
 
 ### 4. Multi-agent support — future, not started

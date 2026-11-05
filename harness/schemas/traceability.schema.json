@@ -4,26 +4,38 @@
   "title": "Acceptance criterion traceability record",
   "type": "object",
   "additionalProperties": false,
-  "required": ["criterion_id", "requirement_id", "source_reference", "status", "evidence_ids"],
+  "required": ["target_id", "increment_id", "criterion_id", "requirement_id", "source_reference", "status", "evidence_ids", "documentation_impact"],
   "properties": {
+    "target_id": {"type": "string", "minLength": 1},
+    "increment_id": {"type": "string", "minLength": 1},
     "criterion_id": {"type": "string", "minLength": 1},
     "requirement_id": {"type": "string", "minLength": 1},
     "source_reference": {"type": "string", "minLength": 1},
+    "decision_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
     "responsible_components": {"type": "array", "items": {"type": "string"}},
-    "implementation_references": {"type": "array", "items": {"type": "string"}},
-    "test_references": {"type": "array", "items": {"type": "string"}},
-    "evidence_ids": {"type": "array", "items": {"type": "string"}},
+    "implementation_references": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "documentation_references": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "documentation_impact": {"enum": ["updated", "not_applicable", "needs_update"]},
+    "documentation_rationale": {"type": "string"},
+    "test_references": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "evidence_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
     "status": {"enum": ["PASS", "FAIL", "NEEDS_EVIDENCE", "NOT_APPLICABLE"]},
     "status_rationale": {"type": "string"}
   },
   "allOf": [
     {
       "if": {"properties": {"status": {"const": "PASS"}}, "required": ["status"]},
-      "then": {"properties": {"evidence_ids": {"minItems": 1}}}
+      "then": {
+        "properties": {"evidence_ids": {"minItems": 1}, "documentation_impact": {"enum": ["updated", "not_applicable"]}}
+      }
     },
     {
       "if": {"properties": {"status": {"const": "NOT_APPLICABLE"}}, "required": ["status"]},
       "then": {"required": ["status_rationale"]}
+    },
+    {
+      "if": {"properties": {"documentation_impact": {"const": "not_applicable"}}, "required": ["documentation_impact"]},
+      "then": {"required": ["documentation_rationale"]}
     }
   ]
 }

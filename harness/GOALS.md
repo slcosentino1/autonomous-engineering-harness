@@ -14,6 +14,7 @@ Enable one engineering agent to take a software assignment, work in a separately
 6. Keep project data and product artifacts in the target repository.
 7. Support autonomous progress on authorized, reversible work while escalating genuine blockers and consequential decisions.
 8. Keep the initial implementation simple, portable, and dependency-free.
+9. Keep target technical documentation accurate as part of each material implementation increment.
 
 ## Non-goals for this foundation
 
@@ -26,4 +27,4 @@ Enable one engineering agent to take a software assignment, work in a separately
 
 ## Success signals
 
-A new target project can use the workflow to identify its source of truth, preserve existing decisions, prepare a plan, execute one increment, capture trustworthy evidence, receive independent review, correct confirmed defects, and record a defensible gate result without mixing target files into this repository.
+A new target project can use the workflow to identify its source of truth, preserve existing decisions, discover applicable instructions and capabilities, prepare a plan, execute one increment with relevant documentation updates, capture trustworthy evidence, receive independent review, correct confirmed defects, and record a defensible gate result without mixing target files into this repository.

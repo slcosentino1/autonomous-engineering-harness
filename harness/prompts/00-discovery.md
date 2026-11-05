@@ -2,11 +2,12 @@
 
 Work read-only unless the user explicitly authorizes a discovery artifact to be written.
 
-1. Confirm the target repository and read its instructions, assignment source, plans, current status, and relevant documents before proposing edits.
-2. Inspect the working tree and existing files. Audit existing information before changing any document; preserve prior work and confirmed decisions. Never silently replace or discard existing information.
-3. Identify relevant source, tests, configuration, interfaces, and validation commands.
-4. Report observed facts with file/line or command evidence. Label assumptions and gaps.
-5. Separate requirements, inferences, confirmed decisions, optional improvements, and open questions.
-6. Do not modify product code, requirements, or decisions during discovery. Ask only about genuine blockers or consequential decisions; continue independent read-only analysis.
+1. Require an explicit repository-root target path. Resolve real paths for target and harness. Apply `target.git_environment`: reject identity-affecting and unknown inherited `GIT_*` variables, remove known non-identity variables, construct only the approved child environment, neutralize count-based config injection, and reject unresolved local config includes. Resolve Git's canonical `--show-toplevel` under that environment and require it to equal the canonical authorized root. Compare canonical roots, common dirs, refs stores, object stores, transitive repository alternates, and shared ref/object device-inode pairs. Fail closed on any mismatch or unprovable independence. Establish authorized working directory and explicit write scopes; empty `included_paths` means read-only. Do not initialize or clone it.
+2. Read target-local instructions through the selected component. Read ancestor instruction files only within an explicit canonical `workspace_root` chain, or from exact explicitly supplied canonical `instruction_roots` when no workspace root is given, and only from the policy allowlist. Without that input, do not read above target root. Resolve symlinks and refuse references outside authorized roots; do not enumerate arbitrary directories. Discover available skills/agent guidance; inspect purpose, scope, conditions, and side effects before applying any. Never install, download, or modify them without specific authorization.
+3. Inspect the working tree and existing files. Audit code and documentation before proposing edits; preserve pre-existing work and confirmed decisions. Never silently replace or discard existing information.
+4. Identify relevant source, tests, configuration, interfaces, project conventions, documentation conventions, and validation commands.
+5. Report observed facts with file/line or command evidence. Label assumptions and gaps.
+6. Separate requirements, inferences, confirmed decisions, optional improvements, and open questions.
+7. Do not modify product code, requirements, or decisions during discovery. Ask only about genuine blockers or consequential decisions; continue independent read-only analysis.
 
-Return: target and source of truth, baseline state, relevant architecture, existing validation, risks, open questions, and a bounded recommendation for the next phase.
+Return: target ID/root, Git common/ref/object stores, authorized code/artifact scopes, baseline state, authorized instruction roots and discovered instruction records, applicable capabilities, relevant architecture, documentation condition, existing validation, authorization boundaries, risks, open questions, and a bounded recommendation for the next phase. Record workflow state and capability references only under explicitly authorized `artifact_paths`.

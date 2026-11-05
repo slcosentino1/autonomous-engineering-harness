@@ -1,0 +1,291 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/autonomous-engineering-harness/workflow-state.schema.json",
+  "title": "Target engineering workflow state",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "workflow_id", "target", "harness_root", "harness_git_root", "harness_git_common_dir", "harness_git_refs_dir", "harness_git_object_store_paths", "scope", "baseline", "phase", "status", "phase_records", "artifact_references", "findings_register_reference", "review_assignments", "authorized_instruction_roots", "instruction_records", "applied_capabilities", "authorizations", "pending_decisions", "updated_at"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "workflow_id": {"type": "string", "minLength": 1},
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_id", "input_path", "resolved_input_path", "git_root", "git_common_dir", "git_refs_dir", "git_object_store_paths"],
+      "properties": {
+        "target_id": {"type": "string", "minLength": 1},
+        "input_path": {"type": "string", "minLength": 1, "description": "Explicit repository-root target_path supplied by the assignment/invocation."},
+        "resolved_input_path": {"type": "string", "minLength": 1, "description": "Canonical absolute real path; must equal target.git_root after controlled Git root discovery."},
+        "git_root": {"type": "string", "minLength": 1, "description": "Canonical absolute Git worktree root."},
+        "git_common_dir": {"type": "string", "minLength": 1, "description": "Canonical absolute Git common directory."},
+        "git_refs_dir": {"type": "string", "minLength": 1, "description": "Canonical absolute refs directory."},
+        "git_object_store_paths": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "description": "Canonical absolute object store path, including discovered alternates."}},
+        "gate_authority_identity": {"type": "string"},
+        "gate_authority_role": {"type": "string"},
+        "gate_authority_reference": {"type": "string"},
+        "gate_authority_identity_assurance": {"enum": ["declared", "externally_authenticated"]},
+        "gate_authority_authentication_reference": {"type": "string", "minLength": 1}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"gate_authority_identity_assurance": {"const": "externally_authenticated"}}, "required": ["gate_authority_identity_assurance"]},
+          "then": {"required": ["gate_authority_authentication_reference"]}
+        }
+      ]
+    },
+    "harness_root": {"type": "string", "minLength": 1, "description": "Canonical absolute harness root."},
+    "harness_git_root": {"type": "string", "minLength": 1, "description": "Canonical absolute harness Git worktree root."},
+    "harness_git_common_dir": {"type": "string", "minLength": 1, "description": "Canonical absolute harness Git common directory."},
+    "harness_git_refs_dir": {"type": "string", "minLength": 1, "description": "Canonical absolute harness refs directory."},
+    "harness_git_object_store_paths": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "description": "Canonical absolute harness object store, including discovered alternates."}},
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["assignment_reference", "authorized_working_directories", "increment_id", "included_paths", "code_paths", "artifact_paths", "revision_paths", "excluded_paths"],
+      "properties": {
+        "assignment_reference": {"type": "string", "minLength": 1},
+        "authorized_working_directories": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "description": "Canonical absolute real paths strictly beneath or equal to target.git_root."}},
+        "increment_id": {"type": "string", "minLength": 1},
+        "included_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "description": "Normalized repository-relative allowlist path; empty means no writes."}},
+        "code_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "description": "Code/test/config paths, each a member of included_paths."}},
+        "artifact_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "description": "Workflow/project artifact paths, each a member of included_paths."}},
+        "revision_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "description": "Normalized repository-relative product source/test/config/documentation and source-requirement/approved-decision paths whose exact contents form the immutable verification revision; excludes mutable workflow records and evidence."}},
+        "excluded_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"included_paths": {"maxItems": 0}}, "required": ["included_paths"]},
+          "then": {"properties": {"code_paths": {"maxItems": 0}, "artifact_paths": {"maxItems": 0}}}
+        }
+      ]
+    },
+    "baseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "status_captured_at", "working_tree_fingerprint", "preexisting_changes"],
+      "properties": {
+        "commit": {"type": "string", "minLength": 1},
+        "status_captured_at": {"type": "string", "format": "date-time"},
+        "working_tree_fingerprint": {"type": "string", "minLength": 1},
+        "preexisting_changes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "index_state", "working_tree_state"],
+            "properties": {
+              "path": {"type": "string", "minLength": 1},
+              "index_state": {"enum": ["unchanged", "added", "modified", "deleted", "renamed", "unmerged"]},
+              "working_tree_state": {"enum": ["unchanged", "untracked", "modified", "deleted", "renamed"]}
+            }
+          }
+        }
+      }
+    },
+    "phase": {"enum": ["DISCOVERY", "REQUIREMENTS", "ARCHITECTURE", "PLANNING", "IMPLEMENTATION", "TESTING", "INDEPENDENT_VERIFICATION", "CORRECTION", "VERIFICATION_GATE", "COMMIT", "NEXT_INCREMENT", "COMPLETED"]},
+    "status": {"enum": ["ACTIVE", "WAITING_FOR_HUMAN", "BLOCKED", "COMPLETED"]},
+    "phase_records": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["phase", "result", "completed_at", "input_fingerprint", "artifact_references"],
+        "properties": {
+          "phase": {"enum": ["DISCOVERY", "REQUIREMENTS", "ARCHITECTURE", "PLANNING", "IMPLEMENTATION", "TESTING", "INDEPENDENT_VERIFICATION", "CORRECTION", "VERIFICATION_GATE", "COMMIT", "NEXT_INCREMENT"]},
+          "result": {"enum": ["complete", "skipped_with_rationale"]},
+          "completed_at": {"type": "string", "format": "date-time"},
+          "input_fingerprint": {"type": "string", "minLength": 1},
+          "artifact_references": {"type": "array", "items": {"type": "string", "minLength": 1}},
+          "rationale": {"type": "string"}
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"result": {"const": "skipped_with_rationale"}}, "required": ["result"]},
+            "then": {"required": ["rationale"], "properties": {"rationale": {"type": "string", "minLength": 1}}}
+          }
+        ]
+      }
+    },
+    "artifact_references": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "findings_register_reference": {"type": "string", "minLength": 1},
+    "review_assignments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["review_id", "role", "reviewer_identity", "reviewer_kind", "identity_assurance", "reviewer_session_identity", "target_revision_id", "scope_paths", "assignment_reference", "status"],
+        "properties": {
+          "review_id": {"type": "string", "minLength": 1},
+          "role": {"type": "string", "minLength": 1},
+          "reviewer_identity": {"type": "string", "minLength": 1},
+          "reviewer_kind": {"enum": ["human", "agent_session"]},
+          "identity_assurance": {"enum": ["declared", "externally_authenticated"]},
+          "authentication_reference": {"type": "string", "minLength": 1},
+          "reviewer_session_identity": {"type": "string", "minLength": 1},
+          "target_revision_id": {"type": "string", "pattern": "^content:[a-f0-9]{64}$"},
+          "scope_paths": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+          "assignment_reference": {"type": "string", "minLength": 1},
+          "status": {"enum": ["pending", "complete"]},
+          "report_reference": {"type": "string", "minLength": 1},
+          "finding_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+        },
+        "allOf": [
+          {"if": {"properties": {"identity_assurance": {"const": "externally_authenticated"}}, "required": ["identity_assurance"]}, "then": {"required": ["authentication_reference"]}},
+          {
+            "if": {"properties": {"status": {"const": "complete"}}, "required": ["status"]},
+            "then": {"required": ["report_reference", "finding_ids"]}
+          }
+        ]
+      },
+      "description": "Expected read-only reviews assigned before review starts; the gate checks the risk-required roster against these assignments and their reports."
+    },
+    "authorized_instruction_roots": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "description": "Canonical absolute directories; target root is required and ancestors need explicit authorization."}},
+    "instruction_records": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source_reference", "canonical_path", "content_fingerprint", "applicability_paths", "status"],
+        "properties": {
+          "source_reference": {"type": "string", "minLength": 1},
+          "canonical_path": {"type": "string", "minLength": 1},
+          "content_fingerprint": {"type": "string", "minLength": 1},
+          "applicability_paths": {"type": "array", "items": {"type": "string", "minLength": 1}},
+          "status": {"enum": ["applied", "discovered_not_applicable", "conflict", "blocked"]},
+          "rationale": {"type": "string"}
+        }
+      }
+    },
+    "applied_capabilities": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "kind", "source_reference", "phases", "use_rationale"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "kind": {"enum": ["skill", "agent_instruction", "tool_guidance", "workflow"]},
+          "source_reference": {"type": "string", "minLength": 1},
+          "phases": {"type": "array", "minItems": 1, "items": {"enum": ["DISCOVERY", "REQUIREMENTS", "ARCHITECTURE", "PLANNING", "IMPLEMENTATION", "TESTING", "INDEPENDENT_VERIFICATION", "CORRECTION", "VERIFICATION_GATE", "COMMIT", "NEXT_INCREMENT"]}},
+          "use_rationale": {"type": "string", "minLength": 1},
+          "limitations": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "authorizations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["authorization_id", "operation", "resource", "scope", "limits", "authorizer_identity", "authorizer_kind", "authorizer_role", "authorizer_identity_assurance", "authorizer_authentication_reference", "authority_reference", "authorized_at", "source_reference", "expires_or_revocation"],
+        "properties": {
+          "authorization_id": {"type": "string", "minLength": 1},
+          "operation": {"type": "string", "minLength": 1},
+          "resource": {"type": "string", "minLength": 1},
+          "scope": {"type": "string", "minLength": 1},
+          "limits": {"type": "array", "items": {"type": "string"}},
+          "authorizer_identity": {"type": "string", "minLength": 1},
+          "authorizer_kind": {"const": "human"},
+          "authorizer_role": {"type": "string", "minLength": 1},
+          "authorizer_identity_assurance": {"const": "externally_authenticated"},
+          "authorizer_authentication_reference": {"type": "string", "minLength": 1},
+          "authority_reference": {"type": "string", "minLength": 1},
+          "authorized_at": {"type": "string", "format": "date-time"},
+          "source_reference": {"type": "string", "minLength": 1},
+          "expires_or_revocation": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "pending_decisions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["decision_id", "question_or_action", "impact", "recommended_option", "required_authority", "affected_phase", "requested_at", "status"],
+        "properties": {
+          "decision_id": {"type": "string", "minLength": 1},
+          "question_or_action": {"type": "string", "minLength": 1},
+          "impact": {"type": "string", "minLength": 1},
+          "recommended_option": {"type": "string", "minLength": 1},
+          "alternatives": {"type": "array", "items": {"type": "string"}},
+          "required_authority": {"type": "string", "minLength": 1},
+          "affected_phase": {"enum": ["DISCOVERY", "REQUIREMENTS", "ARCHITECTURE", "PLANNING", "IMPLEMENTATION", "TESTING", "INDEPENDENT_VERIFICATION", "CORRECTION", "VERIFICATION_GATE", "COMMIT", "NEXT_INCREMENT"]},
+          "requested_at": {"type": "string", "format": "date-time"},
+          "status": {"enum": ["open", "resolved"]},
+          "resolution": {"type": "string"},
+          "resolved_by": {"type": "string"},
+          "resolved_by_kind": {"enum": ["human", "agent_session", "policy_evaluator"]},
+          "resolved_by_identity_assurance": {"enum": ["declared", "externally_authenticated"]},
+          "resolution_authentication_reference": {"type": "string", "minLength": 1},
+          "resolved_at": {"type": "string", "format": "date-time"}
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"status": {"const": "resolved"}}, "required": ["status"]},
+            "then": {
+              "required": ["resolution", "resolved_by", "resolved_at", "resolved_by_kind", "resolved_by_identity_assurance"],
+              "properties": {"resolution": {"minLength": 1}, "resolved_by": {"minLength": 1}}
+            }
+          },
+          {
+            "if": {"properties": {"resolved_by_identity_assurance": {"const": "externally_authenticated"}}, "required": ["resolved_by_identity_assurance"]},
+            "then": {"required": ["resolution_authentication_reference"]}
+          }
+        ]
+      }
+    },
+    "blocker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reason", "affected_phase", "recorded_at", "safe_recovery_path"],
+      "properties": {
+        "reason": {"type": "string", "minLength": 1},
+        "affected_phase": {"enum": ["DISCOVERY", "REQUIREMENTS", "ARCHITECTURE", "PLANNING", "IMPLEMENTATION", "TESTING", "INDEPENDENT_VERIFICATION", "CORRECTION", "VERIFICATION_GATE", "COMMIT", "NEXT_INCREMENT"]},
+        "recorded_at": {"type": "string", "format": "date-time"},
+        "safe_recovery_path": {"type": "string", "minLength": 1}
+      }
+    },
+    "completion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gate_decision_reference", "gate_decision_id", "gate_outcome", "approved_revision_id", "final_evidence_ids"],
+      "properties": {
+        "gate_decision_reference": {"type": "string", "minLength": 1},
+        "gate_decision_id": {"type": "string", "minLength": 1},
+        "gate_outcome": {"const": "APPROVE"},
+        "approved_revision_id": {"type": "string", "pattern": "^content:[a-f0-9]{64}$", "description": "Immutable content identity approved by the referenced gate."},
+        "commit_sha": {"type": "string", "pattern": "^[a-f0-9]{40,64}$", "description": "Optional commit provenance; it does not replace approved_revision_id."},
+        "commit_equivalence_reference": {"type": "string", "minLength": 1, "description": "Record showing the committed revision_paths manifest equals approved_revision_id."},
+        "final_evidence_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+      },
+      "allOf": [
+        {"if": {"required": ["commit_sha"]}, "then": {"required": ["commit_equivalence_reference"]}},
+        {"if": {"required": ["commit_equivalence_reference"]}, "then": {"required": ["commit_sha"]}}
+      ]
+    },
+    "updated_at": {"type": "string", "format": "date-time"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "WAITING_FOR_HUMAN"}}, "required": ["status"]},
+      "then": {"properties": {"pending_decisions": {"minItems": 1, "contains": {"properties": {"status": {"const": "open"}}, "required": ["status"]}}}}
+    },
+    {
+      "if": {"properties": {"status": {"const": "BLOCKED"}}, "required": ["status"]},
+      "then": {"required": ["blocker"]}
+    },
+    {
+      "if": {"properties": {"status": {"const": "COMPLETED"}}, "required": ["status"]},
+      "then": {
+        "required": ["completion"],
+        "properties": {
+          "phase": {"const": "COMPLETED"},
+          "pending_decisions": {"not": {"contains": {"properties": {"status": {"const": "open"}}, "required": ["status"]}}},
+          "phase_records": {"contains": {"properties": {"phase": {"const": "VERIFICATION_GATE"}, "result": {"const": "complete"}}, "required": ["phase", "result"]}},
+          "review_assignments": {"not": {"contains": {"properties": {"status": {"const": "pending"}}, "required": ["status"]}}}
+        },
+        "not": {"required": ["blocker"]}
+      }
+    }
+  ]
+}

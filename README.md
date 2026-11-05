@@ -18,8 +18,10 @@ flowchart LR
     D --> E[Small implementation increment]
     E --> F[Tests and validation evidence]
     F --> G[Independent verification]
+    G -->|Findings need correction| K[Correction]
+    K --> F
     G --> H{Verification gate}
-    H -->|Correction required| E
+    H -->|Correction required| K
     H -->|Evidence missing| F
     H -->|Accepted| I[Local commit, if authorized]
     I --> J[Next increment or close]
@@ -28,8 +30,8 @@ flowchart LR
 ## Start here
 
 1. Read [the working instructions](AGENTS.md) and [the goals and roadmap](harness/GOALS.md).
-2. Read [the workflow](docs/workflow.md), [the architecture](docs/architecture.md), and [the verification framework](docs/verification-framework.md).
-3. In the target repository, establish its assignment source, instructions, current status, and existing work before proposing changes.
+2. Read [the workflow](docs/workflow.md), [the architecture](docs/architecture.md), [the verification framework](docs/verification-framework.md), and the [operation and verification policy](harness/config/verification-policy.yaml).
+3. Receive an explicit target path; verify canonical roots, Git common/ref/object stores, and authorized path scopes are independent from the harness; then establish applicable instructions, capabilities, current status, documentation structure, and existing work before proposing changes.
 4. Use the reusable prompts under `harness/prompts/` and copy/adapt templates into the target repository only when needed.
 5. Record project-specific requirements, decisions, traceability, reviews, and build evidence in the target repository.
 
@@ -39,14 +41,14 @@ flowchart LR
 - `harness/prompts/`: reusable prompts for discovery through verification and single-agent execution.
 - `harness/verification/`: reviewer contracts and evidence rules.
 - `harness/gates/`: stage-gate policy.
-- `harness/schemas/`: JSON Schema contracts for traceability, evidence, findings, and gate decisions.
+- `harness/schemas/`: JSON Schema contracts for workflow state, traceability, evidence, findings, and gate decisions.
 - `harness/config/`: default verification policy.
 - `harness/templates/`: starting points for target-repository documents.
 - `docs/`: architecture, workflow, decisions, and generalized lessons.
 
 ## Current limitations
 
-The documents describe intended process controls; they do not technically enforce them. There are no executable scripts, dependency requirements, or CI integration in this initial foundation. The single-agent workflow is a human/agent instruction set, not an autonomous service. Multi-agent roles are specified as future-compatible contracts only; no coordinator or agent runtime is implemented.
+The documents, matrix, state, and schemas describe intended process controls; they do not technically enforce them. There are no executable scripts, dependency requirements, permission broker, state store, identity provider, or CI integration in this initial foundation. The single-agent workflow is a human/agent instruction set, not an autonomous service. Reviewer roles, authentication evidence, and gate authority are contracts only; no coordinator, agent runtime, Draft 2020-12 schema validator, cross-record evidence/revision validator, identity verifier, or policy evaluator is implemented. Report attestations cannot prove substantive reviewer exhaustiveness.
 
 ## Roadmap
 

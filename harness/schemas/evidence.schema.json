@@ -4,19 +4,40 @@
   "title": "Verification evidence record",
   "type": "object",
   "additionalProperties": false,
-  "required": ["evidence_id", "kind", "description", "observed_at", "result"],
+  "required": ["evidence_id", "target_id", "increment_id", "kind", "description", "observed_at", "observed_result", "revision"],
   "properties": {
     "evidence_id": {"type": "string", "minLength": 1},
-    "kind": {"enum": ["command", "test", "file_reference", "artifact", "observation"]},
+    "target_id": {"type": "string", "minLength": 1},
+    "increment_id": {"type": "string", "minLength": 1},
+    "kind": {"enum": ["command", "test", "file_reference", "artifact", "observation", "review"]},
     "description": {"type": "string", "minLength": 1},
     "observed_at": {"type": "string", "format": "date-time"},
-    "result": {"type": "string", "minLength": 1},
+    "observed_result": {"type": "string", "minLength": 1},
     "command": {"type": "string"},
     "working_directory": {"type": "string"},
     "exit_code": {"type": "integer"},
     "artifact_reference": {"type": "string"},
     "source_reference": {"type": "string"},
-    "limitations": {"type": "array", "items": {"type": "string"}}
+    "criterion_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "limitations": {"type": "array", "items": {"type": "string"}},
+    "revision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_state", "baseline_commit", "revision_id", "scope_paths", "fingerprint"],
+      "properties": {
+        "source_state": {"enum": ["commit", "working_tree"]},
+        "baseline_commit": {"type": "string", "pattern": "^[a-f0-9]{40,64}$"},
+        "revision_id": {"type": "string", "pattern": "^content:[a-f0-9]{64}$", "description": "Immutable content identity for workflow revision_paths; never a commit SHA or mutable worktree label."},
+        "scope_paths": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "description": "Subset of revision_paths covered by this evidence."}},
+        "fingerprint": {"type": "string", "pattern": "^[a-f0-9]{64}$", "description": "SHA-256 manifest fingerprint for the evidence's declared scope."},
+        "commit_sha": {"type": "string", "pattern": "^[a-f0-9]{40,64}$", "description": "Commit provenance for source_state=commit; separate from revision_id."},
+        "environment_fingerprint": {"type": "string"}
+      },
+      "allOf": [
+        {"if": {"properties": {"source_state": {"const": "commit"}}, "required": ["source_state"]}, "then": {"required": ["commit_sha"]}},
+        {"if": {"properties": {"source_state": {"const": "working_tree"}}, "required": ["source_state"]}, "then": {"not": {"required": ["commit_sha"]}}}
+      ]
+    }
   },
   "allOf": [
     {

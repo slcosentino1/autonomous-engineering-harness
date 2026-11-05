@@ -1,42 +1,187 @@
-version: 1
-purpose: "Default policy; adapt in the target repository and record material deviations."
-statuses:
-  - PASS
-  - FAIL
-  - NEEDS_EVIDENCE
-  - NOT_APPLICABLE
-finding_severities:
-  - Critical
-  - High
-  - Medium
-  - Low
-  - Informational
+version: 2
+purpose: "Default operational policy. A target may tighten it; only a human may authorize a scoped exception."
+statuses: [PASS, FAIL, NEEDS_EVIDENCE, NOT_APPLICABLE]
+finding_severities: [Critical, High, Medium, Low, Informational]
+
+target:
+  input: "Explicit repository-root target_path supplied with the assignment or invocation; never infer a target from the harness working directory or accept a component path as repository identity. Select any narrower working directory separately."
+  validation:
+    - "Resolve target_path to a canonical real path and require an existing directory."
+    - "For both harness and target, invoke Git only under the `git_environment` policy below. Require `git -C <canonical-target_path> rev-parse --is-inside-work-tree` to return true; obtain and realpath `--show-toplevel`, `--git-common-dir`, `--git-path refs`, and `--git-path objects`; require the canonical show-toplevel to equal canonical target_path and the separately recorded authorized root. Reject bare repositories and do not initialize Git automatically."
+    - "Require target root and harness root to be disjoint; reject equal, nested, or ancestor roots in either direction."
+    - "Resolve relative git-common-dir, refs, and objects paths against the corresponding Git worktree/root before realpath comparison. Reject if canonical common dirs or refs dirs are equal or overlap, or if object stores overlap or any direct/transitive repository-local Git alternates share objects. Ambient object-directory/alternate variables are rejected before Git starts and are never treated as repository identity. Compare device/inode identity for existing refs and object files (including packed refs, loose objects, and pack files) to detect hard-linked shared data even when paths differ. If the relationship cannot be proven disjoint, fail closed. Distinct checkout paths are not evidence of independent history."
+    - "Default authorized working directory to target root. An explicit component directory must resolve beneath target root."
+    - "Recheck canonical paths and symlink resolution before every write; reject paths escaping the authorized root or declared increment scope."
+  git_environment:
+    inherited_variables: "No inherited GIT_* variable is passed to Git. Enumerate variable names before invocation; never log their values."
+    reject_if_present: [GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR, GIT_OBJECT_DIRECTORY, GIT_ALTERNATE_OBJECT_DIRECTORIES, GIT_INDEX_FILE, GIT_CEILING_DIRECTORIES, GIT_DISCOVERY_ACROSS_FILESYSTEM, GIT_CONFIG, GIT_CONFIG_PARAMETERS, GIT_CONFIG_COUNT, GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM, GIT_NAMESPACE, GIT_SHALLOW_FILE, GIT_REPLACE_REF_BASE]
+    indexed_config_variables: "Reject if any GIT_CONFIG_KEY_<n> or GIT_CONFIG_VALUE_<n> variable is present, regardless of GIT_CONFIG_COUNT. Do not parse or apply inherited count-based configuration."
+    unknown_variables: "Reject before invoking Git if any inherited GIT_* name is not in reject_if_present, indexed_config_variables, or the known_non_identity_variables list."
+    known_non_identity_variables: [GIT_PAGER, GIT_EDITOR, GIT_SEQUENCE_EDITOR, GIT_ASKPASS, GIT_TERMINAL_PROMPT, GIT_OPTIONAL_LOCKS, GIT_TRACE, GIT_TRACE_SETUP, GIT_TRACE_PACKET, GIT_TRACE_PERFORMANCE, GIT_EXEC_PATH, GIT_PREFIX, GIT_CONFIG_NOSYSTEM]
+    child_allowlist: [GIT_CONFIG_NOSYSTEM=1, GIT_CONFIG_GLOBAL=<private-empty-config>, GIT_TERMINAL_PROMPT=0]
+    read_only_commands: "The harness may add GIT_OPTIONAL_LOCKS=0 only for read-only identity/status queries. No inherited GIT_* value is retained."
+    local_config: "Use an empty controlled system/global config outside the target. Inspect repository-local config without following includes; reject unresolved or external include/includeIf sources and reject any core.worktree value that does not resolve to the canonical target root. Resolve object stores only from the controlled Git paths, repository-local alternates, and alternates explicitly declared by the target contract; ambient environment overrides are never accepted."
+    failure: "If variables cannot be enumerated/removed, a rejected or unknown variable is present, controlled config cannot be established, or canonical `--show-toplevel` differs from the authorized target root, stop before any Git-dependent action. Record variable names and the failure reason only."
+  git_object_separation: "Resolve Git object stores from `--git-path objects` under the controlled environment and each repository's objects/info/alternates file, resolving relative alternate paths from the object directory. Ambient GIT_OBJECT_DIRECTORY and GIT_ALTERNATE_OBJECT_DIRECTORIES are rejected before Git runs and never define identity. Traverse repository alternates transitively with cycle detection. Compare canonical paths/overlap with the harness set and compare file device/inode pairs to detect hard-linked Git object files. Also detect symlinked refs/object paths by comparing their canonical destinations. Any shared store, hard-linked ref/object file, or unresolved alternate fails closed."
+  dirty_worktree: "Capture status and diff before work. Preserve pre-existing changes; never overwrite, stage, stash, reset, or clean them. Stop if ownership of overlapping changes cannot be established."
+  monorepo: "Use the selected repository root and explicit component scope. A nested independent repository or submodule is a separate target requiring explicit selection and authorization."
+  artifacts: "Store all product-specific requirements, decisions, plans, state, evidence, reports, and documentation in the target repository using its existing conventions. Never store target artifacts in the harness repository."
+  instructions: "Discover applicable instructions from target root through working directory and scoped descendants. Ancestor discovery follows the explicit instruction_roots contract below. Inspect common equivalents such as AGENTS.md, CLAUDE.md, GEMINI.md, CONTRIBUTING files, project guidance, and tool-specific instructions when present. Do not inventory unrelated siblings."
+
+write_scope:
+  path_format: "Normalized repository-relative POSIX paths. Resolve symlinks before each write; reject absolute paths, traversal, paths outside target root, and ambiguous paths."
+  included_paths: "The explicit union allowlist for code_paths and artifact_paths. Empty means zero writes authorized; there is no default or fallback."
+  code_paths: "Explicit code/test/configuration path prefixes, each also present in included_paths. Empty means no product-code writes."
+  artifact_paths: "Explicit workflow-state, requirements, plan, decision, documentation, evidence, report, and other project-record path prefixes, each also present in included_paths. Empty means no project-artifact writes."
+  revision_paths: "Explicit subset of authorized code/artifact paths containing product code, tests, configuration, product documentation, and the source requirements/approved decisions that define the reviewed criteria. Exclude mutable workflow state, activity logs, review reports, evidence, and gate records created while the review is in progress."
+  excluded_paths: "Always deny writes under these paths, even when another scope includes them."
+  matching: "Compare normalized path components, not string prefixes. Paths are non-empty normalized repository-relative POSIX paths: reject absolute paths, '.', '..', empty components, and alternate spellings. included_paths must equal the component-wise union of code_paths and artifact_paths; every entry must have exactly one classification, and the code/artifact classifications must not overlap by component-prefix in either direction. excluded_paths always wins and excludes the named path and all descendants."
+  rule: "Before writing, prove the canonical destination is under target root, under exactly one authorized code_paths or artifact_paths prefix, present in included_paths, and outside excluded_paths. Resolve all existing parent components and symlinks; for a not-yet-existing destination, resolve its nearest existing parent and validate the remaining components. Perform the operation relative to a verified target-root directory handle with no-follow path resolution, or an equivalent mechanism that keeps containment valid through the write; if the platform cannot provide that guarantee, do not write. Recheck immediately before the filesystem operation. If a path changes during validation, a symlink escapes scope, or any check is uncertain, stop. State and required project records may be persisted only if their artifact paths are explicitly authorized."
+  hard_link_safety: "O_NOFOLLOW or equivalent blocks symlink traversal only; it does not block hard links. Before mutation, inspect the opened file descriptor and destination entry without following links; require a regular file and st_nlink=1, and require device/inode identity to match. Reject every mutation of an existing file with st_nlink>1, unavailable, or inconsistent, including overwrite, truncate, chmod, and in-place update. Never mutate an existing inode in place. New files use exclusive creation. For replacing an existing single-link file, write and flush an exclusive temporary file in the verified destination directory, then replace only if the platform can atomically confirm the destination still has the validated device/inode and link count or an exclusive lock is proven to cover all writers; otherwise reject replacement. Hold verified directory/file handles and recheck identity immediately before the operation. A link-count check alone and O_NOFOLLOW alone do not prevent a concurrent hard-link or path swap. If the filesystem/runtime cannot provide reliable link counts, stable directory handles, no-follow component resolution, and conditional atomic replacement, stop before writing."
+  state_validation: "Require included_paths to equal the component-wise union of code_paths and artifact_paths, with exactly one classification per path and no component-prefix overlap. Require revision_paths to be an explicitly declared subset of authorized code/artifact paths; exclude workflow records. The findings register, revision manifest, workflow-state, decision, evidence, report, and documentation destinations must be in artifact_paths (product documentation may also be in revision_paths). JSON Schema enforces the empty included_paths case; union equality, revision-scope containment, normalization, canonical containment, symlink, and overlap checks are semantic and fail closed. Writes never fall back to target root or a default artifacts directory."
+
+instruction_roots:
+  default: "The target root and applicable descendants only. Ancestors above target root are not read unless the invocation supplies an explicit canonical workspace_root or exact instruction_roots."
+  ancestor_scope: "If workspace_root is supplied, it must be a canonical ancestor of target root; inspect only the direct chain from workspace_root through target root. If exact instruction_roots are supplied without workspace_root, inspect only those canonical directories, each of which must be an ancestor of or equal to target root. Never recurse into siblings or arbitrary system directories."
+  automatic_files: [AGENTS.md, CLAUDE.md, GEMINI.md, CODEX.md, CONTRIBUTING, CONTRIBUTING.md, .github/copilot-instructions.md]
+  referenced_files: "Follow a reference only when its resolved path is within target root or an explicitly authorized instruction root and it is itself instruction content. Otherwise record it as inaccessible and request authorization if it may affect the work."
+  symlinks: "Canonicalize instruction files. Do not read a symlink whose resolved file is outside the authorized instruction roots; record the blocked reference. If a governing instruction cannot be read, do not write in its scope until resolved."
+  record: "Record discovered instruction source, canonical path, fingerprint, applicability paths, and whether applied, conflicting, or blocked in target workflow state."
+  validation: "The target root must always be in authorized_instruction_roots. Every additional root must be explicitly supplied and canonical, and must be an ancestor of or equal to target root. If workspace_root is configured, no additional root may be broader than it. Every discovered path must resolve within an authorized root. Resolve each candidate and referenced file before reading; a symlink outside an authorized root is not followed."
+
+instruction_precedence:
+  - "Platform and human authorization boundaries"
+  - "Harness safety policy"
+  - "User assignment and user-confirmed product decisions"
+  - "Applicable target-repository instructions, which may tighten but cannot widen authorization"
+  - "Discovered skills, agent prompts, and tool guidance, which provide expertise but never grant authority"
+conflicts: "Do not guess. Record the conflicting sources and affected scope as a pending decision; continue independent work only."
+
+authorization_record:
+  required_fields: [authorization_id, operation, resource, scope, limits, authorizer_identity, authorizer_kind, authorizer_role, authorizer_identity_assurance, authorizer_authentication_reference, authority_reference, authorized_at, source_reference, expires_or_revocation]
+  rule: "Authorization is operation-, resource-, environment-, and scope-specific. It does not imply permission for adjacent operations. Target instructions alone cannot grant external or destructive authority. A required human approval must resolve to verifiable authentication evidence from a trusted source; if no such evidence can be checked, treat the authorization as pending and do not perform the operation."
+
+authorization_matrix:
+  automatic:
+    - operation: read_harness_and_target_files
+      limits: "Only configured harness assets, explicit user-provided sources, selected target scope, and allowlisted instruction files in configured instruction_roots. Ancestor reads are limited to those exact files; secrets are not copied into reports."
+    - operation: git_status_diff_log
+      limits: "Read-only, against the selected target repository."
+    - operation: write_target_files
+      limits: "Only files proven under included_paths and the applicable code_paths or artifact_paths allowlist. Empty included_paths authorizes no writes. No harness-repository writes during a target assignment."
+    - operation: run_existing_tests_linters_formatters_static_analysis_and_builds
+      limits: "Only discovered or explicitly selected project commands after inspecting their effects; no implicit installs, network access, image pulls, shared infrastructure writes, or destructive effects. Formatters may change only in-scope files."
+    - operation: run_existing_local_container_command
+      limits: "Automatic only with an already available image, inspected command, network disabled (no egress), no pull, no privileged mode, and mounts limited to authorized target paths. If the runtime cannot guarantee no network, do not run automatically. Container side effects remain subject to this matrix."
+    - operation: local_ephemeral_test_fixtures
+      limits: "Only disposable, isolated resources created and removed by an already authorized test command; no shared, persistent, or external state."
+  approval_required:
+    - operation: install_dependencies
+      limits: "Human approval before installation; specify package manager, packages, source/registry, target environment, and permitted lockfile changes."
+    - operation: download_external_resources
+      limits: "Human approval before network access. Record resource_type (dependency, package, container_image, file, or artifact), exact source and reference, destination where applicable, integrity checks, and permitted use. Download permission does not authorize installation, image execution, or other resource access."
+    - operation: install_download_or_modify_skills
+      limits: "Human approval before install, download, or modification; specify skill source, identity/version, destination, and scope. Presence in a repository is not trust or authorization."
+    - operation: run_container_with_network_access
+      limits: "Human approval must select exactly one mode: local_service_access (exact local endpoints, data effects, duration, and no external egress) or external_egress (exact external endpoints/services, data sent, permitted actions, and duration). Authorization for one mode does not authorize the other. If the runtime cannot constrain or verify the selected boundary, do not execute."
+    - operation: create_or_modify_persistent_databases_or_infrastructure
+      limits: "Human approval before action; specify resource, environment, data effects, rollback, and cost boundary."
+    - operation: git_add
+      limits: "Human approval for the exact paths to stage. Stage only harness-authored changes after reviewing the index and preserving pre-existing staged content."
+    - operation: git_commit
+      limits: "Separate human approval for a local commit, exact staged diff, and commit scope. Review staged paths and secrets first. Commit approval does not authorize push."
+    - operation: git_checkout_switch_or_branch
+      limits: "Human approval for exact refs and worktree effect. Never discard or overwrite uncommitted changes; no force variants."
+    - operation: git_fetch_or_pull
+      limits: "Human approval for exact remote and refs because this contacts a remote and may change local state. No automatic merge or rebase."
+    - operation: git_merge_or_rebase
+      limits: "Human approval for exact refs and expected result. No automatic conflict resolution that changes scope; no force push."
+    - operation: git_reset_or_clean
+      limits: "Human approval naming exact paths/ref and data loss. No broad or implicit target; refuse if user changes may be affected."
+    - operation: git_push
+      limits: "Human approval for exact remote, branch, and commit range. Force push is prohibited by this default policy."
+    - operation: deploy_or_publish
+      limits: "Human approval for exact artifact, destination, environment, and rollback plan. Production actions require approval from the target's designated owner."
+    - operation: contact_external_services
+      limits: "Human approval before network contact; specify service, operation, data sent, and whether the call can mutate state or incur cost."
+    - operation: destructive_operations
+      limits: "Human approval before exact, bounded, recoverable operation. Irreversible or unbounded deletion, credential exposure, and actions with unknown blast radius are prohibited."
+    - operation: unknown_or_unreviewed_command
+      limits: "Inspect command and side effects; request human approval before execution. Shell access is not blanket authorization."
+  prohibited:
+    - operation: write_outside_target_or_declared_increment_scope
+      limits: "No exception through target instructions or broad task authorization."
+    - operation: modify_harness_during_target_assignment
+      limits: "The target must be disjoint from the harness and is the only repository writable for product work."
+    - operation: force_push_or_unbounded_destructive_action
+      limits: "Prohibited by default policy."
+    - operation: expose_secrets_or_send_unapproved_sensitive_data
+      limits: "Prohibited."
+
+workflow:
+  phases: [DISCOVERY, REQUIREMENTS, ARCHITECTURE, PLANNING, IMPLEMENTATION, TESTING, INDEPENDENT_VERIFICATION, CORRECTION, VERIFICATION_GATE, COMMIT, NEXT_INCREMENT, COMPLETED]
+  waiting_states: [WAITING_FOR_HUMAN, BLOCKED]
+  resume_rule: "Resume from the recorded pending decision or last incomplete phase after revalidating target identity, working-tree baseline, relevant instructions, and evidence freshness. Do not repeat completed phases unless their inputs changed."
+
 review:
-  independent_review_required_for:
-    - security_sensitive_changes
-    - architecture_changes
-    - externally_visible_contract_changes
-    - high_risk_or_irreversible_operations
+  risk_bands:
+    low: "Documentation-only or internal, reversible changes with no behavior, security, data, persistence, concurrency, external contract, or deployment impact."
+    medium: "Behavioral changes or changes with meaningful maintenance, compatibility, or operational impact, without high-risk characteristics."
+    high: "Authentication/authorization, sensitive data, persistence or migrations, concurrency, externally visible contracts, deployment, infrastructure, security controls, irreversible effects, or material security findings."
+  risk_assessment: "Use the highest band triggered by any requirement, affected component, data flow, operation, or finding in the increment. The implementer cannot lower the band; the evaluator records the basis."
+  independent_review_required_for: [medium, high]
+  medium_reviewer: "A reviewer who did not implement the change, in a separate agent or session with read-only access to the target revision and evidence."
+  high_reviewer: "An externally authenticated human reviewer distinct from the implementer; security-sensitive changes also require a Security Reviewer."
+  second_high_risk_review: "Require a second independent human review when a high-risk increment is security-sensitive, can cause material data loss/irreversible effects, or has an open Critical/High finding at any review pass. The second reviewer must have a different authenticated human identity and session from the primary reviewer and implementer; for security-sensitive work at least one of the two must have the Security Reviewer role. Re-run the required reviews on the corrected final revision."
   author_is_sole_approver: false
-  reviewer_file_access: read_only
-  workflow_owner_records_review: true
+  reviewers_are_read_only: true
+  identity_model: "Record declared_identity, session_identity, identity_assurance (declared or externally_authenticated), and authentication_reference when external evidence exists. String inequality is not proof that two records represent different people. Session identifiers are attestations unless supplied by a trusted runtime. High-risk human reviewer separation and every human gate approval/risk acceptance require verifiable external authentication evidence; if no trusted source can verify it, set the review/decision to incomplete or ESCALATE and do not APPROVE. Do not implement or assume a particular identity provider."
+  independence_validation: "Each required review records review_id, assignment reference, declared identity, identity assurance, role, kind, session_identity, reviewed_revision_id, explicit scope, completion status, limitations, and report_reference; the gate records implementation identity/session and their assurance. Medium risk requires a separate read-only session; a distinct session of the same agent is permitted only as a reported separation, not proof of a different person. High risk requires externally authenticated implementer and human reviewer principals, a distinct authenticated principal, and a separate session. Apply second_high_risk_review when triggered; all human reviewers in a required high-risk roster must be externally authenticated. For any accepted risk or high-risk approval, compare trusted external subject identities and require the authenticated authority to differ from the implementer and every human reviewer; for agent-session reviewers, enforce separate-session independence without treating session strings as human identities. Display-string inequality alone is insufficient. Every assigned reviewer and approval authority must examine the exact target_revision_id and assigned scope. A different phase in the same session is never independent."
+  gate_authority: "A deterministic policy evaluator may auto-approve low-risk increments only when all policy conditions pass and no risk acceptance is requested. Medium-risk approval requires a separate independent review and may be issued by the policy evaluator only when no risk acceptance is requested; an accepted risk requires an externally authenticated human gate approver. High-risk approval requires an externally authenticated human gate approver after required independent human reviews. The implementer cannot issue or override an approval."
+  human_approval_required_for: [accept_medium_risk, approve_high_risk_increment, resolve_product_or_architecture_decision, accept_security_risk, authorize_matrix_operation, waive_required_criterion]
+
 evidence:
   required_for_pass: true
-  command_execution_fields:
-    - command
-    - working_directory
-    - exit_code
-    - observed_result
-  allow_claim_without_artifact: false
+  command_fields: [command, working_directory, exit_code, observed_result]
+  identity_fields: [target_id, increment_id, evidence_id]
+  revision_binding: "The gate and every evidence/review record used by that gate bind to one immutable content identity, `content:<lowercase SHA-256>`, never a commit SHA or mutable worktree label. Compute it from RFC 8785 canonical JSON containing the original baseline commit SHA captured before work, the exact sorted revision_paths list, and a manifest sorted by repository-relative path over those paths. The baseline SHA is fixed in workflow state and is not replaced by a later commit SHA when recomputing identity. Each entry contains path, file type, mode, and SHA-256 of file bytes; include in-scope untracked files, represent symlinks by link text, reject links escaping target root, and exclude Git metadata plus mutable workflow state, activity logs, review reports, evidence and gate records. `revision_paths` includes product code, tests, configuration, product documentation, source requirements, and approved decisions defining the reviewed criteria; it excludes mutable workflow records. Persist the full path list and manifest as a target-local artifact, and include its reference in the gate decision. At gate evaluation, verify the artifact's paths match the approved assignment and workflow-state paths. Any change to the path list or its manifest creates a new identity: prior evidence, reviews, and gate decisions are not current for that identity. Run required checks and reviews for the final identity, recording current evidence for every required criterion; checks may be selected by impact analysis, but prior-revision records cannot be relabeled or directly satisfy the new gate."
+  commit_equivalence: "Primary model: approve the immutable content identity first, then optionally commit only with separate authorization. After a post-gate commit, recompute using the original baseline SHA retained in workflow state and the exact approved revision_paths; the resulting identity must equal the approved content identity. Its staged changes may include only those verified product paths plus explicitly authorized post-gate workflow artifacts; any other product path or content difference is unapproved and requires affected tests, all required reviews on the new identity, and a new gate. Record commit SHA and equivalence result. A commit SHA is provenance, not a replacement for target_revision_id."
+  cross_reference_validation: "Every referenced evidence/finding ID must resolve exactly once to a canonical target-local record for the same target, increment, and reviewed revision; duplicates, missing IDs, stale IDs, orphan IDs, and mismatched records prevent approval. Validate outside JSON Schema."
+  gate_semantics_validation: "Before reviews start, record expected review assignments in workflow state from the approved increment plan and the minimum roles implied by policy risk assessment. At the gate, independently derive required roles and any second-review condition; require every assignment to have a report for the exact target/increment/content identity and assigned scope, with identity, kind, session, and role matching. The report must declare review_completion=complete, affirm full-scope completion, have no required checks remaining, and disclose limitations/unverified areas; otherwise treat it as incomplete and do not APPROVE. Any revision identity change requires all required reviewers to report against the new exact identity; old reports cannot satisfy the final gate. Reconcile assignments against every report in the completed INDEPENDENT_VERIFICATION phase, including explicit empty finding sets; duplicate/missing assignments or reports prevent APPROVE. Reconcile complete finding-ID lists to report tables and the canonical register in both directions. This detects record inconsistencies but cannot prove that a reviewer honestly disclosed every observation; that limitation must remain explicit. Derive blocking and accepted-risk sets from the complete register and compare exactly with decision lists. Verify all evidence links/freshness, reviewer independence/authentication evidence where required, criterion coverage, and gate authority."
+  invalidation: "Any revision identity change makes all prior evidence records ineligible for the new gate, even when an individual scope fingerprint is unchanged. Re-run required checks as selected by impact analysis and create current records for every required criterion bound to the final identity; full-suite, build, security, or integration checks must be rerun when an in-scope source, test, configuration, dependency-lock, or relevant environment input changes. Never relabel stale evidence."
+
+findings:
+  blocking_severities: [Critical, High]
+  register: "A canonical target-local register is selected in workflow state for each increment. The workflow coordinator appends every finding from every review before gate evaluation; reviewer reports and the register must reconcile exactly. Missing, duplicate, unindexed, or mismatched finding records prevent APPROVE."
+  medium: "Blocks APPROVE until fixed or accepted as a documented risk by an authorized human; acceptance cannot waive a failed mandatory acceptance criterion or security/legal obligation."
+  low_or_informational: "May be deferred with rationale, owner, and review date; disposition remains visible."
+  accepted_risk_may_approve: "Only Medium or lower, with scenario, impact, compensating controls, residual risk, owner, review date, and externally authenticated human authorizer plus authentication reference recorded. Critical/High findings cannot be accepted for approval."
+  unresolved_critical_or_high: "Never approve."
+  disposition_rules:
+    fixed: "Resolved only when resolution_evidence_ids exist, are current for the reviewed revision, and cover affected validation."
+    not_reproducible: "Resolved only with current reproduction evidence, explicit reviewer disposition, and no contradictory report in the canonical register."
+    accepted_risk: "Non-blocking only for Medium or lower after required human acceptance is valid; never resolves Critical/High."
+    deferred: "Remains unresolved. Critical, High, and Medium deferred findings block APPROVE. Low/Informational deferred findings may be non-blocking only with owner, rationale, and review_by."
+    open: "Unresolved and blocking for every severity until fixed, validly accepted where allowed, or validly deferred where allowed."
+    gate_lists: "blocking_findings is the exact derived set of unresolved blockers. accepted_risk_findings is the exact derived set of validly accepted findings. Neither list may omit or reclassify records. The decision records the canonical register reference and fingerprint used for derivation."
+
 gates:
-  accepted_blocking_findings: 0
+  accepted_open_blocking_findings: 0
   unresolved_required_acceptance_criteria: 0
-  missing_required_evidence: 0
-  outcomes:
-    - APPROVE
-    - REJECT_REQUEST_CORRECTION
-    - REQUEST_EVIDENCE
-    - ESCALATE
+  missing_or_stale_required_evidence: 0
+  unresolved_scope_blocking_decisions: 0
+  outcomes: [APPROVE, REJECT_REQUEST_CORRECTION, REQUEST_EVIDENCE, ESCALATE]
+  approval_rule: "Require every required criterion PASS with current evidence, valid traceability, documentation impact assessed, a complete findings-register scan and exact derived gate lists, findings dispositioned under the severity policy, required independent reviews, correct risk-band authority, and no scope-blocking pending decision."
+
+workflow_state_invariants:
+  completed: "COMPLETED requires phase=COMPLETED, a complete VERIFICATION_GATE phase record, a referenced gate decision with outcome APPROVE, no open pending_decisions, no blocker record, no unresolved blocking finding in the complete canonical register, and final evidence IDs valid for the exact approved content identity. Resolve and compare target_id, increment_id, decision_id, outcome, approved_revision_id, target_revision_id, and every final evidence ID against referenced target-local records. If a commit exists, require its revision_paths manifest to equal approved_revision_id and record its SHA separately. Any relevant change after approval creates a new identity and prevents completion until affected tests, reviews and gate are repeated. Validate these cross-record and freshness conditions outside JSON Schema; schema shape alone is insufficient."
+  resolved_decision: "status=resolved requires resolution, resolved_by, resolved_by_kind, resolved_by_identity_assurance, and resolved_at. For a decision whose required_authority is human or whose impact triggers human approval, require externally authenticated assurance and a verifiable resolution_authentication_reference; cross-check the authenticated actor against the required authority. Keep the decision record immutable except for an appended resolution."
+  scope_validation: "Treat included_paths as the sole write allowlist; validate exact code/artifact union coverage, excluded-path precedence, canonical containment, and findings/register destinations before accepting workflow state. Empty included_paths means read-only."
+
+documentation:
+  required_each_increment: true
+  rule: "Inspect existing docs and conventions; update the smallest relevant existing artifact when behavior, contracts, architecture, operations, or maintenance change. No new document for trivial changes. Review documentation against actual code and include relevant docs in traceability and gate checks."
+
 notes:
-  - "This file is policy documentation, not an enforcement mechanism."
-  - "A target project may define stricter gates based on risk and its own instructions."
+  - "This is documented policy, not technical enforcement in the current release."
+  - "Target policy may be stricter. A target cannot broaden the human authorization boundaries above."

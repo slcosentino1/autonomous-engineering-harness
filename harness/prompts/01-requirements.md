@@ -7,6 +7,7 @@ Use the assignment and user-confirmed decisions as the authoritative scope. Read
 - Make acceptance criteria observable and testable without inventing product behavior.
 - Label inferences, proposed defaults, optional improvements, and unresolved questions separately.
 - Trace each criterion to a verification approach; mark evidence pending until observed.
+- Assess whether each criterion has documentation impact; include relevant documentation expectations without requiring a document for trivial or non-documentable behavior.
 - Identify contradictions and ask about consequential ambiguity. Do not silently rewrite confirmed decisions.
 
-Prepare a focused change proposal or requirements document as authorized. State what changed, what remains open, and what approval is needed before architecture or implementation.
+Prepare a focused change proposal or requirements document in the target as authorized. Persist unresolved decisions with recommended options, affected phase, and required authority. State what changed, what remains open, and which transitions are blocked pending a decision.
