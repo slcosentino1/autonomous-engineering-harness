@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/autonomous-engineering-harness/evidence.schema.json",
+  "title": "Verification evidence record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["evidence_id", "kind", "description", "observed_at", "result"],
+  "properties": {
+    "evidence_id": {"type": "string", "minLength": 1},
+    "kind": {"enum": ["command", "test", "file_reference", "artifact", "observation"]},
+    "description": {"type": "string", "minLength": 1},
+    "observed_at": {"type": "string", "format": "date-time"},
+    "result": {"type": "string", "minLength": 1},
+    "command": {"type": "string"},
+    "working_directory": {"type": "string"},
+    "exit_code": {"type": "integer"},
+    "artifact_reference": {"type": "string"},
+    "source_reference": {"type": "string"},
+    "limitations": {"type": "array", "items": {"type": "string"}}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"kind": {"enum": ["command", "test"]}}, "required": ["kind"]},
+      "then": {"required": ["command", "working_directory", "exit_code"]}
+    }
+  ]
+}

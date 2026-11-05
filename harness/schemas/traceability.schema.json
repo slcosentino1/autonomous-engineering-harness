@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/autonomous-engineering-harness/traceability.schema.json",
+  "title": "Acceptance criterion traceability record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["criterion_id", "requirement_id", "source_reference", "status", "evidence_ids"],
+  "properties": {
+    "criterion_id": {"type": "string", "minLength": 1},
+    "requirement_id": {"type": "string", "minLength": 1},
+    "source_reference": {"type": "string", "minLength": 1},
+    "responsible_components": {"type": "array", "items": {"type": "string"}},
+    "implementation_references": {"type": "array", "items": {"type": "string"}},
+    "test_references": {"type": "array", "items": {"type": "string"}},
+    "evidence_ids": {"type": "array", "items": {"type": "string"}},
+    "status": {"enum": ["PASS", "FAIL", "NEEDS_EVIDENCE", "NOT_APPLICABLE"]},
+    "status_rationale": {"type": "string"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "PASS"}}, "required": ["status"]},
+      "then": {"properties": {"evidence_ids": {"minItems": 1}}}
+    },
+    {
+      "if": {"properties": {"status": {"const": "NOT_APPLICABLE"}}, "required": ["status"]},
+      "then": {"required": ["status_rationale"]}
+    }
+  ]
+}

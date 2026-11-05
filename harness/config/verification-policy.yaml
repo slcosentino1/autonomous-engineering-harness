@@ -1,0 +1,42 @@
+version: 1
+purpose: "Default policy; adapt in the target repository and record material deviations."
+statuses:
+  - PASS
+  - FAIL
+  - NEEDS_EVIDENCE
+  - NOT_APPLICABLE
+finding_severities:
+  - Critical
+  - High
+  - Medium
+  - Low
+  - Informational
+review:
+  independent_review_required_for:
+    - security_sensitive_changes
+    - architecture_changes
+    - externally_visible_contract_changes
+    - high_risk_or_irreversible_operations
+  author_is_sole_approver: false
+  reviewer_file_access: read_only
+  workflow_owner_records_review: true
+evidence:
+  required_for_pass: true
+  command_execution_fields:
+    - command
+    - working_directory
+    - exit_code
+    - observed_result
+  allow_claim_without_artifact: false
+gates:
+  accepted_blocking_findings: 0
+  unresolved_required_acceptance_criteria: 0
+  missing_required_evidence: 0
+  outcomes:
+    - APPROVE
+    - REJECT_REQUEST_CORRECTION
+    - REQUEST_EVIDENCE
+    - ESCALATE
+notes:
+  - "This file is policy documentation, not an enforcement mechanism."
+  - "A target project may define stricter gates based on risk and its own instructions."

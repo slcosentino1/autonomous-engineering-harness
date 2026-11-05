@@ -1,0 +1,22 @@
+# Operating system and editor artifacts
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+
+# Generated output and caches
+__pycache__/
+*.py[cod]
+.cache/
+.coverage
+htmlcov/
+dist/
+build/

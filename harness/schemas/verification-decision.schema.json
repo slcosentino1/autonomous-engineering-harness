@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/autonomous-engineering-harness/verification-decision.schema.json",
+  "title": "Verification gate decision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["decision_id", "outcome", "scope", "decided_at", "rationale", "reviewer_identity", "evidence_references"],
+  "properties": {
+    "decision_id": {"type": "string", "minLength": 1},
+    "outcome": {"enum": ["APPROVE", "REJECT_REQUEST_CORRECTION", "REQUEST_EVIDENCE", "ESCALATE"]},
+    "scope": {"type": "string", "minLength": 1},
+    "decided_at": {"type": "string", "format": "date-time"},
+    "rationale": {"type": "string", "minLength": 1},
+    "reviewer_identity": {"type": "string", "minLength": 1},
+    "evidence_references": {"type": "array", "items": {"type": "string"}},
+    "blocking_findings": {"type": "array", "items": {"type": "string"}},
+    "open_decisions": {"type": "array", "items": {"type": "string"}}
+  }
+}
