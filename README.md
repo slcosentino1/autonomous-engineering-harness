@@ -4,7 +4,7 @@ Repository: `autonomous-engineering-harness`
 
 A reusable foundation for working through software assignments in an existing or new target repository. It defines an evidence-based engineering lifecycle, review contracts, quality gates, reusable project-document templates, and a read-only target preflight CLI. It is designed to be language- and architecture-neutral.
 
-The current release is a **documented workflow foundation with a read-only preflight CLI**. It does not include an executable engineering orchestrator, write broker, automatic gate evaluator, or multi-agent runtime. A single Codex session can follow the workflow manually using the prompts and contracts here.
+The current release provides a **Codex operating procedure and a read-only target preflight CLI**. Prompt 06 is the canonical task entrypoint; it instructs the primary Codex session to carry an assignment through all authorized increments and closeout. This remains an instruction-driven procedure, not an executable orchestrator, write broker, state store, or automatic policy evaluator. Required independent review and gate authorities must be operationally available under the policy; the primary implementation session cannot replace them.
 
 ## Repository boundary
 
@@ -31,16 +31,17 @@ flowchart LR
 
 ## Start here
 
-1. Read [the working instructions](AGENTS.md) and [the goals and roadmap](harness/GOALS.md).
-2. Read [the workflow](docs/workflow.md), [the architecture](docs/architecture.md), [the verification framework](docs/verification-framework.md), and the [operation and verification policy](harness/config/verification-policy.yaml).
-3. Receive an explicit target path; verify canonical roots, Git common/ref/object stores, and authorized path scopes are independent from the harness; then establish applicable instructions, capabilities, current status, documentation structure, and existing work before proposing changes.
-4. Use the reusable prompts under `harness/prompts/` and copy/adapt templates into the target repository only when needed.
-5. Record project-specific requirements, decisions, traceability, reviews, and build evidence in the target repository.
+1. Give Codex the task and the **absolute repository-root path** of the target. If the target path is missing or ambiguous, Codex must ask for it; it never guesses from the harness working directory.
+2. Use [prompt 06](harness/prompts/06-autonomous-single-agent.md) as Codex's top-level operating instruction. The primary Codex session owns discovery, requirements, planning, implementation, validation, corrections, gate coordination, and closeout. It uses prompts `00`–`05` as phase procedures and continues through the planned increments without routine approval requests.
+3. Codex runs the [read-only preflight](#read-only-target-preflight), reads the target's instructions and conventions, and derives and records narrow per-increment code and artifact scopes from the authorized task before writing. Product records stay in the target. If the target has no workflow-state convention, the default is `.engineering/workflows/<workflow_id>/workflow-state.json`; related workflow evidence and reports are kept in that workflow directory. Existing target conventions take precedence.
+4. When policy permits an agent-session review, a separate read-only Codex session receives the exact revision, scope, instructions, and evidence. The primary session handles findings and corrections. This does not replace authenticated human reviewers or gate approvers required for High-risk work. If a required session or authority is unavailable, Codex records the blocked phase and does not claim completion.
+
+See the [workflow guide](docs/workflow.md), [engineering lifecycle](harness/workflows/engineering-lifecycle.md), [verification framework](docs/verification-framework.md), [reviewer contracts](harness/verification/reviewer-contracts.md), [gate policy](harness/gates/verification-gate.md), and [authorization policy](harness/config/verification-policy.yaml) for the detailed boundaries and phase conditions.
 
 ## Contents
 
 - `harness/workflows/`: lifecycle and operating procedure.
-- `harness/prompts/`: reusable prompts for discovery through verification and single-agent execution.
+- `harness/prompts/`: phase prompts `00`–`05` and canonical top-level single-agent entrypoint `06`.
 - `harness/verification/`: reviewer contracts and evidence rules.
 - `harness/gates/`: stage-gate policy.
 - `harness/schemas/`: JSON Schema contracts for workflow state, traceability, evidence, findings, and gate decisions.
@@ -87,7 +88,7 @@ The standard-library test suite runs with `python3 -m unittest discover -s tests
 
 ## Current limitations
 
-The documents, matrix, workflow state, and schemas describe intended process controls; most are not technically enforced. The preflight CLI enforces its read-only inspection contract and validates observed identity and scope inputs, but there is no write permission broker, state store, identity provider, CI integration, engineering orchestrator, agent runtime, Draft 2020-12 schema validator, cross-record evidence/revision validator, identity verifier, or policy evaluator. Reviewer roles, authentication evidence, and gate authority remain contracts. Report attestations cannot prove substantive reviewer exhaustiveness.
+The operating procedure and policy describe controls but do not technically enforce them. The preflight CLI enforces its own read-only inspection contract; there is no executable engineering orchestrator, write broker, persistent state store, identity provider, CI integration, Draft 2020-12 schema validator, cross-record evidence/revision validator, or automatic policy evaluator. Independent Codex sessions and required human reviewers/approvers must be available through the host environment; the prompt cannot create those capabilities. Report attestations cannot prove substantive reviewer exhaustiveness.
 
 ## Roadmap
 
