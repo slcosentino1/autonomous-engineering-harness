@@ -1,5 +1,7 @@
 # Autonomous Engineering Harness
 
+Repository: `autonomous-engineering-harness`
+
 A reusable foundation for working through software assignments in an existing or new target repository. It defines an evidence-based engineering lifecycle, review contracts, quality gates, and reusable project-document templates. It is designed to be language- and architecture-neutral.
 
 The current release is a **documented workflow foundation**. It does not yet include an executable orchestrator, CLI, automatic policy enforcement, or multi-agent runtime. A single Codex session can follow the workflow manually using the prompts and contracts here.
