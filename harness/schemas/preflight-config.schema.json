@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/autonomous-engineering-harness/preflight-config.schema.json",
+  "title": "Read-only target preflight configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "target_path": {"type": "string", "minLength": 1, "description": "Optional assertion that must match the explicit --target argument."},
+    "workspace_root": {"type": "string", "minLength": 1, "description": "Optional explicitly authorized ancestor instruction root."},
+    "instruction_roots": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "authorized_working_directories": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "included_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "code_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "artifact_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "revision_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "excluded_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+  },
+  "description": "All path normalization, containment, union, overlap, exclusion, revision-scope, and symlink rules are additionally checked semantically by harness/preflight.py. Omitted write-scope arrays default to empty and authorize no writes."
+}
