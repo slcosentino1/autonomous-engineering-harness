@@ -48,7 +48,7 @@ See the [workflow guide](docs/workflow.md), [engineering lifecycle](harness/work
 - `harness/gates/`: stage-gate policy.
 - `harness/schemas/`: JSON Schema contracts for workflow state, traceability, evidence, findings, and gate decisions.
 - `harness/preflight.py`: dependency-free read-only target identity, isolation, state, instruction, scope, and filesystem inspection.
-- `harness/safe_writer.py`: narrow scope-checked target file creation/replacement helper; re-runs preflight and emits JSON operation evidence under the documented single-writer assumption.
+- `harness/safe_writer.py`: narrow scope-checked target directory creation and file creation/replacement helper; re-runs preflight and emits JSON operation evidence under the documented single-writer assumption.
 - `harness/claude_reviewer.py`: bounded Aily/Claude read-only review invocation, evidence and manifest validation, one-shot persisted two-round enforcement, isolated snapshot, report validation, and review-evidence mapping. Explicit user authorization can be persisted with declared identity assurance when external identity is unavailable.
 - `harness/schemas/preflight-config.schema.json`: optional JSON input contract for preflight scopes and instruction roots.
 - `harness/config/`: default verification policy.
@@ -93,6 +93,11 @@ Preflight verifies Git identity and separation from the harness, reads repositor
 Use the safe writer with the same JSON scope configuration used by preflight. It accepts bytes on standard input and only writes a path covered by exactly one authorized code or artifact prefix:
 
 ```sh
+python3 harness/safe_writer.py mkdir \
+  --target /absolute/path/to/target \
+  --config /absolute/path/to/preflight.json \
+  --path src/new-module/types
+
 python3 harness/safe_writer.py create \
   --target /absolute/path/to/target \
   --config /absolute/path/to/preflight.json \
@@ -105,6 +110,8 @@ python3 harness/safe_writer.py replace \
   --expected-sha256 SHA256_RECORDED_BEFORE_EDIT < /path/to/replacement-content
 ```
 
+`mkdir` creates missing path components one at a time with exclusive directory creation. Every missing component must independently pass the explicit write-scope and code/artifact classification checks; a scope for a nested leaf does not authorize creating an out-of-scope parent. Existing components are opened with no-follow directory descriptors and are not replaced or directly changed. If the requested directory already exists, the operation fails. A later filesystem error leaves earlier directories in place and returns partial JSON evidence; inspect that evidence before retrying. Creating a child necessarily updates its existing parent directory's filesystem timestamps, while preserving the parent's identity, mode, ownership, and existing entries.
+
 Creation uses `O_EXCL` and never overwrites an existing entry. Replacement requires the expected baseline SHA-256 recorded before implementation, rejects symlinks and files with multiple hard links, writes and fsyncs a temporary file in the verified destination directory, checks the original path/descriptor identity and content immediately before an atomic rename, fsyncs the directory, then verifies the resulting hash and identity. The JSON response contains the operation, path, before/after identities and hashes, and link count; retain it with the target workflow evidence. The helper preserves POSIX mode and owner/group where permitted; it does not preserve extended attributes or ACLs, so do not use it on files whose correctness depends on those metadata.
 
 The replacement rename is atomic for readers, but macOS does not condition it on the destination inode checked immediately beforehand. The workflow therefore assumes one Codex writer and requires humans and automation to pause edits during that workflow. This is not protection against arbitrary non-cooperating writers racing after the final check. Stop and revalidate if an unexpected modification is observed. A process crash during exclusive creation may leave a partial new file; inspect and resolve it before retrying.
@@ -113,7 +120,7 @@ The standard-library test suite runs with `python3 -m unittest discover -s tests
 
 ## Current limitations
 
-The operating procedure and policy do not implement a general engineering orchestrator, state store, identity provider, CI integration, full cross-record gate evaluator, or automatic policy evaluator. The safe writer enforces only the path/scope and file checks performed by its own invocation; operating instructions do not technically prevent direct edits that bypass it. It relies on the single-writer assumption and does not preserve ACLs/extended attributes. The Claude adapter validates target/workflow/reviewer/data-specific authorization attestations, evidence artifacts, scoped manifests, one-shot round claims, and workflow history. A user task prompt can authorize a bounded external review; the adapter records declared identity when the runtime lacks authenticated user identity and does not claim cryptographic proof. Its temporary snapshot plus Claude Code `--restricted`, `--safe-mode`, no-MCP configuration, and read-only tool allowlist constrain file tools to the authorized snapshot; this is not an OS sandbox around the Aily/Claude process. Human identities and approvals required by High-risk policy still need trusted authentication. The workflow owner must compute the complete workflow `revision_paths` identity for the gate. Authorization records must acknowledge possible provider cost, but the adapter cannot inspect billing or enforce a monetary ceiling. Report attestations cannot prove reviewer exhaustiveness. No live Claude call was made during this harness implementation.
+The operating procedure and policy do not implement a general engineering orchestrator, state store, identity provider, CI integration, full cross-record gate evaluator, or automatic policy evaluator. The safe writer enforces only the path/scope and directory/file checks performed by its own invocation; operating instructions do not technically prevent direct edits that bypass it. It relies on the single-writer assumption and does not preserve ACLs/extended attributes. The Claude adapter validates target/workflow/reviewer/data-specific authorization attestations, evidence artifacts, scoped manifests, one-shot round claims, and workflow history. A user task prompt can authorize a bounded external review; the adapter records declared identity when the runtime lacks authenticated user identity and does not claim cryptographic proof. Its temporary snapshot plus Claude Code `--restricted`, `--safe-mode`, no-MCP configuration, and read-only tool allowlist constrain file tools to the authorized snapshot; this is not an OS sandbox around the Aily/Claude process. Human identities and approvals required by High-risk policy still need trusted authentication. The workflow owner must compute the complete workflow `revision_paths` identity for the gate. Authorization records must acknowledge possible provider cost, but the adapter cannot inspect billing or enforce a monetary ceiling. Report attestations cannot prove reviewer exhaustiveness. No live Claude call was made during this harness implementation.
 
 ## Roadmap
 

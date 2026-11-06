@@ -12,7 +12,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(ROOT / "harness"))
-from safe_writer import SafeWriteError, create_file, replace_file
+from safe_writer import SafeWriteError, create_directories, create_file, replace_file
 
 
 def clean_git_env():
@@ -80,6 +80,101 @@ class SafeWriterTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             create_file(self.root, self.config_path, "src/new.txt", b"replacement\n")
         self.assertEqual((self.root / "src/new.txt").read_bytes(), b"new\n")
+
+    def test_creates_one_directory_and_reports_identity_evidence(self):
+        result = create_directories(self.root, self.config_path, "src/new-dir")
+        created = self.root / "src/new-dir"
+        info = created.stat()
+        self.assertTrue(created.is_dir())
+        self.assertEqual(result["operation"], "mkdir")
+        self.assertEqual(result["path"], "src/new-dir")
+        self.assertEqual(result["created_directories"], [{
+            "path": "src/new-dir", "device": info.st_dev, "inode": info.st_ino,
+            "mode": info.st_mode & 0o7777, "owner_uid": info.st_uid, "owner_gid": info.st_gid,
+        }])
+        self.assertEqual((result["device"], result["inode"]), (info.st_dev, info.st_ino))
+        json.dumps(result)
+
+    def test_creates_nested_directories_one_component_at_a_time(self):
+        result = create_directories(self.root, self.config_path, "src/new/types")
+        self.assertTrue((self.root / "src/new/types").is_dir())
+        self.assertEqual([entry["path"] for entry in result["created_directories"]],
+                         ["src/new", "src/new/types"])
+        self.assertTrue(all(entry["inode"] > 0 for entry in result["created_directories"]))
+
+    def test_existing_requested_directory_is_never_reused_or_modified(self):
+        destination = self.root / "src/existing"
+        destination.mkdir()
+        sentinel = destination / "keep.txt"
+        sentinel.write_text("unchanged\n", encoding="utf-8")
+        before = destination.stat()
+        with self.assertRaises(FileExistsError):
+            create_directories(self.root, self.config_path, "src/existing")
+        after = destination.stat()
+        self.assertEqual((after.st_dev, after.st_ino, after.st_mode, after.st_uid, after.st_gid),
+                         (before.st_dev, before.st_ino, before.st_mode, before.st_uid, before.st_gid))
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "unchanged\n")
+        self.assertEqual(sorted(item.name for item in destination.iterdir()), ["keep.txt"])
+
+    def test_symlinks_in_existing_parent_and_requested_destination_are_rejected(self):
+        outside = Path(self.temp.name) / "outside"
+        outside.mkdir()
+        (self.root / "src/linked-parent").symlink_to(outside, target_is_directory=True)
+        (self.root / "src/linked-destination").symlink_to(outside, target_is_directory=True)
+        for relative in ("src/linked-parent/child", "src/linked-destination"):
+            with self.subTest(relative=relative):
+                with self.assertRaises((OSError, SafeWriteError)):
+                    create_directories(self.root, self.config_path, relative)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_path_traversal_is_rejected(self):
+        with self.assertRaisesRegex(SafeWriteError, "not normalized"):
+            create_directories(self.root, self.config_path, "src/../../outside")
+        self.assertFalse((Path(self.temp.name) / "outside").exists())
+
+    def test_each_missing_directory_component_requires_its_own_scope(self):
+        self.write_config({"src/nested/leaf"})
+        with self.assertRaisesRegex(SafeWriteError, "outside included_paths"):
+            create_directories(self.root, self.config_path, "src/nested/leaf")
+        self.assertFalse((self.root / "src/nested").exists())
+
+    def test_unexpected_mkdir_error_fails_without_creating_destination(self):
+        with patch("safe_writer.os.mkdir", side_effect=PermissionError("simulated mkdir denial")):
+            with self.assertRaisesRegex(PermissionError, "simulated mkdir denial"):
+                create_directories(self.root, self.config_path, "src/new-dir")
+        self.assertFalse((self.root / "src/new-dir").exists())
+
+    def test_later_mkdir_error_keeps_and_reports_prior_created_directories(self):
+        original_mkdir = os.mkdir
+        calls = 0
+
+        def fail_second(component, mode=0o777, *, dir_fd=None):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise PermissionError("simulated second mkdir denial")
+            return original_mkdir(component, mode, dir_fd=dir_fd)
+
+        with patch("safe_writer.os.mkdir", side_effect=fail_second):
+            with self.assertRaisesRegex(SafeWriteError, "partial result") as raised:
+                create_directories(self.root, self.config_path, "src/new/types")
+        self.assertTrue((self.root / "src/new").is_dir())
+        self.assertFalse((self.root / "src/new/types").exists())
+        evidence = raised.exception.evidence
+        self.assertEqual(evidence["operation"], "mkdir")
+        self.assertEqual([entry["path"] for entry in evidence["created_directories"]], ["src/new"])
+        json.dumps(evidence)
+
+    def test_existing_directory_metadata_and_contents_remain_intact_when_child_is_added(self):
+        parent = self.root / "src"
+        sentinel = parent / "existing.txt"
+        sentinel.write_text("keep\n", encoding="utf-8")
+        before = parent.stat()
+        create_directories(self.root, self.config_path, "src/child")
+        after = parent.stat()
+        self.assertEqual((after.st_dev, after.st_ino, after.st_mode, after.st_uid, after.st_gid),
+                         (before.st_dev, before.st_ino, before.st_mode, before.st_uid, before.st_gid))
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep\n")
 
     def test_stale_expected_content_is_rejected_without_change(self):
         destination = self.root / "src/app.py"

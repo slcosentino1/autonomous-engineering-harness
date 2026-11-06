@@ -70,6 +70,8 @@ authorization_matrix:
       limits: "Read-only, against the selected target repository."
     - operation: write_target_files
       limits: "Only files proven under included_paths and the applicable code_paths or artifact_paths allowlist. Empty included_paths authorizes no writes. No harness-repository writes during a target assignment."
+    - operation: create_target_directories
+      limits: "Only missing directory components proven under included_paths and the applicable code_paths or artifact_paths allowlist; authorize every component separately before creation. Empty included_paths authorizes no writes. Existing directories are never replaced, and partial nested creation is retained and reported if a later component fails. No harness-repository writes during a target assignment."
     - operation: run_existing_tests_linters_formatters_static_analysis_and_builds
       limits: "Only discovered or explicitly selected project commands after inspecting their effects; no implicit installs, network access, image pulls, shared infrastructure writes, or destructive effects. Formatters may change only in-scope files."
     - operation: run_existing_local_container_command

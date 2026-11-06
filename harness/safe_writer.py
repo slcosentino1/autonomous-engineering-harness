@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Narrow, scope-checked file creation and replacement for target repositories.
+"""Narrow, scope-checked directory and file writes for target repositories.
 
 Replacement uses a documented single-writer assumption. The final rename is
 atomic for readers, but it is not a compare-and-swap against arbitrary writers.
@@ -30,6 +30,10 @@ NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 
 class SafeWriteError(Exception):
     """A requested target write was rejected or failed safely."""
+
+    def __init__(self, message: str, *, evidence: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.evidence = evidence
 
 
 def _sha256_fd(fd: int) -> str:
@@ -107,7 +111,7 @@ def _scope_allows(target: Path, relative_path: str, config: dict[str, Any]) -> N
 def _run_preflight(target: Path, config_path: Path) -> dict[str, Any]:
     if not NOFOLLOW or not getattr(os, "O_DIRECTORY", 0) or not all(hasattr(os, name) for name in ("fchmod", "fchown", "fsync")) or \
             os.open not in os.supports_dir_fd or os.stat not in os.supports_dir_fd or os.rename not in os.supports_dir_fd or \
-            os.unlink not in os.supports_dir_fd:
+            os.unlink not in os.supports_dir_fd or os.mkdir not in os.supports_dir_fd:
         raise SafeWriteError("This platform lacks required no-follow directory-relative write primitives")
     result = Preflight(str(target), str(HARNESS_ROOT), str(config_path), None).run()
     if result.get("overall_result") != "READY":
@@ -307,6 +311,174 @@ def create_file(target: str | Path, config_path: str | Path, relative_path: str,
         os.close(root_fd)
 
 
+def create_directories(target: str | Path, config_path: str | Path,
+                       relative_path: str) -> dict[str, Any]:
+    """Create missing directory components exclusively beneath authorized scopes.
+
+    Existing parents are opened without following symlinks and are never
+    changed directly. Each missing component needs its own explicit scope
+    authorization. If a later component fails, earlier created directories
+    are retained and reported; this operation never removes directories.
+    """
+    root, config_file, relative, report, config_digest = _prepare_preflight(
+        target, config_path, relative_path
+    )
+    path = PurePosixPath(relative)
+    parts = tuple(path.parts)
+    if not parts:
+        raise SafeWriteError("The target root is not a creatable destination")
+
+    # Load the already-digested configuration for component-by-component
+    # authorization. _prepare_preflight has validated its shape and target.
+    config = json.loads(config_file.read_text(encoding="utf-8"))
+    root_fd = os.open(root, REQUIRED_DIR_FLAGS)
+    parent_fd = root_fd
+    parent_parts: tuple[str, ...] = ()
+    created: list[dict[str, Any]] = []
+    created_but_unverified: str | None = None
+    try:
+        root_info = os.fstat(root_fd)
+        root_path_info = os.stat(root, follow_symlinks=False)
+        if (not stat.S_ISDIR(root_info.st_mode) or
+                (root_info.st_dev, root_info.st_ino) != (root_path_info.st_dev, root_path_info.st_ino)):
+            raise SafeWriteError("Target root identity changed during directory validation")
+
+        missing_at: int | None = None
+        # Resolve the existing prefix one component at a time with no-follow
+        # directory handles. Never use Path.exists()/resolve() on the requested
+        # destination, because either may traverse a symlink.
+        for index, component in enumerate(parts):
+            _verify_parent_still_named(root, parent_parts, root_fd, parent_fd)
+            try:
+                entry = _stat_destination(parent_fd, component)
+            except FileNotFoundError:
+                missing_at = index
+                break
+            if not stat.S_ISDIR(entry.st_mode):
+                raise SafeWriteError("An existing directory path component is not a real directory")
+            try:
+                next_fd = os.open(component, REQUIRED_DIR_FLAGS, dir_fd=parent_fd)
+            except OSError as exc:
+                raise SafeWriteError(f"Could not open an existing directory without following links: {exc.strerror}") from exc
+            try:
+                opened = os.fstat(next_fd)
+                if (not stat.S_ISDIR(opened.st_mode) or
+                        (entry.st_dev, entry.st_ino) != (opened.st_dev, opened.st_ino)):
+                    raise SafeWriteError("An existing directory changed during no-follow path resolution")
+            except BaseException:
+                os.close(next_fd)
+                raise
+            if parent_fd != root_fd:
+                os.close(parent_fd)
+            parent_fd = next_fd
+            parent_parts = parts[:index + 1]
+
+        if missing_at is None:
+            raise FileExistsError(relative)
+
+        # Pre-authorize all components that would be created before making the
+        # first filesystem change, so a narrow child scope cannot implicitly
+        # authorize its missing parent.
+        for index in range(missing_at, len(parts)):
+            component_path = PurePosixPath(*parts[:index + 1]).as_posix()
+            _scope_allows(root, component_path, config)
+
+        for index in range(missing_at, len(parts)):
+            component = parts[index]
+            component_path = PurePosixPath(*parts[:index + 1]).as_posix()
+            _verify_parent_still_named(root, parent_parts, root_fd, parent_fd)
+            _assert_config_unchanged(config_file, config_digest)
+            # mkdirat is exclusive: an existing entry, including a symlink,
+            # causes failure and is never reused or replaced.
+            os.mkdir(component, 0o777, dir_fd=parent_fd)
+            created_but_unverified = component_path
+            entry = _stat_destination(parent_fd, component)
+            if not stat.S_ISDIR(entry.st_mode):
+                raise SafeWriteError("New directory entry is not a real directory")
+            next_fd = os.open(component, REQUIRED_DIR_FLAGS, dir_fd=parent_fd)
+            try:
+                opened = os.fstat(next_fd)
+                named_again = _stat_destination(parent_fd, component)
+                if (not stat.S_ISDIR(opened.st_mode) or
+                        (entry.st_dev, entry.st_ino) != (opened.st_dev, opened.st_ino) or
+                        (named_again.st_dev, named_again.st_ino) != (opened.st_dev, opened.st_ino)):
+                    raise SafeWriteError("New directory identity or type changed during verification")
+                created.append({
+                    "path": component_path,
+                    "device": opened.st_dev,
+                    "inode": opened.st_ino,
+                    "mode": stat.S_IMODE(opened.st_mode),
+                    "owner_uid": opened.st_uid,
+                    "owner_gid": opened.st_gid,
+                })
+                created_but_unverified = None
+                _verify_parent_still_named(root, parent_parts, root_fd, parent_fd)
+                os.fsync(parent_fd)
+            except BaseException:
+                os.close(next_fd)
+                raise
+            if parent_fd != root_fd:
+                os.close(parent_fd)
+            parent_fd = next_fd
+            parent_parts = parts[:index + 1]
+
+        # Confirm the final requested path still resolves to the opened
+        # directory through the target root, then obtain its actual parent for
+        # evidence consistent with file operations.
+        _verify_parent_still_named(root, parts, root_fd, parent_fd)
+        evidence_root_fd, evidence_parent_fd = _open_root_and_parent(root, parts[:-1])
+        try:
+            if (os.fstat(evidence_root_fd).st_ino, os.fstat(evidence_root_fd).st_dev) != (root_info.st_ino, root_info.st_dev):
+                raise SafeWriteError("Target root identity changed before directory evidence was recorded")
+            final_entry = _stat_destination(evidence_parent_fd, parts[-1])
+            final_info = os.fstat(parent_fd)
+            if (not stat.S_ISDIR(final_entry.st_mode) or
+                    (final_entry.st_dev, final_entry.st_ino) != (final_info.st_dev, final_info.st_ino)):
+                raise SafeWriteError("Final directory name and opened identity do not match")
+            evidence = _evidence_context(root, config_digest, report, evidence_root_fd, evidence_parent_fd)
+            os.fsync(evidence_parent_fd)
+            return {
+                **evidence,
+                "operation": "mkdir",
+                "path": relative,
+                "created_directories": created,
+                "device": final_info.st_dev,
+                "inode": final_info.st_ino,
+                "mode": stat.S_IMODE(final_info.st_mode),
+                "owner_uid": final_info.st_uid,
+                "owner_gid": final_info.st_gid,
+            }
+        finally:
+            if evidence_parent_fd != evidence_root_fd:
+                os.close(evidence_parent_fd)
+            os.close(evidence_root_fd)
+    except (OSError, SafeWriteError) as exc:
+        if not created and created_but_unverified is None:
+            raise
+        try:
+            partial = _evidence_context(root, config_digest, report, root_fd, parent_fd)
+        except (OSError, SafeWriteError):
+            partial = {
+                "target_path": str(root),
+                "scope_config_sha256": config_digest,
+                "preflight": report.get("overall_result"),
+            }
+        partial.update({
+            "operation": "mkdir",
+            "path": relative,
+            "created_directories": created,
+            "created_path_unverified": created_but_unverified,
+        })
+        raise SafeWriteError(
+            f"Directory creation stopped after a partial result; created directories were left in place: {exc}",
+            evidence=partial,
+        ) from exc
+    finally:
+        if parent_fd != root_fd:
+            os.close(parent_fd)
+        os.close(root_fd)
+
+
 def replace_file(target: str | Path, config_path: str | Path, relative_path: str,
                  content: bytes, expected_sha256: str) -> dict[str, Any]:
     """Replace one file after checking its expected baseline and current identity.
@@ -406,20 +578,25 @@ def replace_file(target: str | Path, config_path: str | Path, relative_path: str
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Scope-checked target file create/replace helper")
-    parser.add_argument("operation", choices=("create", "replace"))
+    parser = argparse.ArgumentParser(description="Scope-checked target directory/file write helper")
+    parser.add_argument("operation", choices=("mkdir", "create", "replace"))
     parser.add_argument("--target", required=True, help="Explicit canonical target repository root")
     parser.add_argument("--config", required=True, help="Existing JSON preflight scope configuration")
     parser.add_argument("--path", required=True, help="Authorized repository-relative destination")
     parser.add_argument("--expected-sha256", help="Required baseline content hash for replacement")
     args = parser.parse_args(argv)
     try:
-        data = sys.stdin.buffer.read()
-        if args.operation == "create":
+        if args.operation == "mkdir":
+            if args.expected_sha256 is not None:
+                raise SafeWriteError("--expected-sha256 is valid only for replacement")
+            result = create_directories(args.target, args.config, args.path)
+        elif args.operation == "create":
+            data = sys.stdin.buffer.read()
             if args.expected_sha256 is not None:
                 raise SafeWriteError("--expected-sha256 is valid only for replacement")
             result = create_file(args.target, args.config, args.path, data)
         else:
+            data = sys.stdin.buffer.read()
             if args.expected_sha256 is None:
                 raise SafeWriteError("Replacement requires --expected-sha256 from the recorded baseline")
             result = replace_file(args.target, args.config, args.path, data, args.expected_sha256)
@@ -427,7 +604,10 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write("\n")
         return 0
     except (OSError, TypeError, ValueError, SafeWriteError) as exc:
-        json.dump({"status": "FAIL", "error": str(exc)}, sys.stdout, sort_keys=True)
+        failure = {"status": "FAIL", "error": str(exc)}
+        if isinstance(exc, SafeWriteError) and exc.evidence is not None:
+            failure["evidence"] = exc.evidence
+        json.dump(failure, sys.stdout, sort_keys=True)
         sys.stdout.write("\n")
         return 2
 
