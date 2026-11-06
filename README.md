@@ -4,7 +4,7 @@ Repository: `autonomous-engineering-harness`
 
 A reusable foundation for working through software assignments in an existing or new target repository. It defines an evidence-based engineering lifecycle, review contracts, quality gates, reusable project-document templates, and a read-only target preflight CLI. It is designed to be language- and architecture-neutral.
 
-The current release provides a **Codex operating procedure and a read-only target preflight CLI**. Prompt 06 is the canonical task entrypoint; it instructs the primary Codex session to carry an assignment through all authorized increments and closeout. This remains an instruction-driven procedure, not an executable orchestrator, write broker, state store, or automatic policy evaluator. Required independent review and gate authorities must be operationally available under the policy; the primary implementation session cannot replace them.
+The current release provides a **single-session Codex operating procedure, a read-only target preflight CLI, and a bounded Claude-through-Aily reviewer adapter**. Prompt 06 is the canonical task entrypoint; it instructs one primary Codex session to carry an assignment through discovery, all authorized increments, testing, structured self-review, correction, gate coordination, and closeout. The adapter can support policy-required Medium-risk read-only review after a target-specific external-service authorization has been verified. It is not an executable engineering orchestrator, write broker, state store, or automatic policy evaluator. Self-review and reviewer recommendations are not gate approval. High-risk human review and approval authorities remain required; unavailable reviewers or gate authorities leave the workflow incomplete or blocked.
 
 ## Repository boundary
 
@@ -19,7 +19,7 @@ flowchart LR
     C --> D[Implementation plan]
     D --> E[Small implementation increment]
     E --> F[Tests and validation evidence]
-    F --> G[Independent verification]
+    F --> G[Self-review and any required independent review]
     G -->|Findings need correction| K[Correction]
     K --> F
     G --> H{Verification gate}
@@ -34,7 +34,7 @@ flowchart LR
 1. Give Codex the task and the **absolute repository-root path** of the target. If the target path is missing or ambiguous, Codex must ask for it; it never guesses from the harness working directory.
 2. Use [prompt 06](harness/prompts/06-autonomous-single-agent.md) as Codex's top-level operating instruction. The primary Codex session owns discovery, requirements, planning, implementation, validation, corrections, gate coordination, and closeout. It uses prompts `00`–`05` as phase procedures and continues through the planned increments without routine approval requests.
 3. Codex runs the [read-only preflight](#read-only-target-preflight), reads the target's instructions and conventions, and derives and records narrow per-increment code and artifact scopes from the authorized task before writing. Product records stay in the target. If the target has no workflow-state convention, the default is `.engineering/workflows/<workflow_id>/workflow-state.json`; related workflow evidence and reports are kept in that workflow directory. Existing target conventions take precedence.
-4. When policy permits an agent-session review, a separate read-only Codex session receives the exact revision, scope, instructions, and evidence. The primary session handles findings and corrections. This does not replace authenticated human reviewers or gate approvers required for High-risk work. If a required session or authority is unavailable, Codex records the blocked phase and does not claim completion.
+4. The primary session performs structured self-review using the applicable reviewer contracts, fixes in-scope findings, and reruns affected checks. For Medium-risk work, it may use the Claude adapter after explicit user task-prompt authorization is persisted with exact target, reviewer, data paths, cost, and mutation terms. Record identity as declared when the runtime cannot establish stronger assurance; this provenance is not authentication. The adapter validates persisted authorization and evidence and runs from a bounded read-only snapshot; its report is advisory. High-risk human review, second-review, and gate-approval requirements remain. If a required reviewer or authority is unavailable, Codex records the incomplete/blocked phase and does not claim completion.
 
 See the [workflow guide](docs/workflow.md), [engineering lifecycle](harness/workflows/engineering-lifecycle.md), [verification framework](docs/verification-framework.md), [reviewer contracts](harness/verification/reviewer-contracts.md), [gate policy](harness/gates/verification-gate.md), and [authorization policy](harness/config/verification-policy.yaml) for the detailed boundaries and phase conditions.
 
@@ -46,6 +46,7 @@ See the [workflow guide](docs/workflow.md), [engineering lifecycle](harness/work
 - `harness/gates/`: stage-gate policy.
 - `harness/schemas/`: JSON Schema contracts for workflow state, traceability, evidence, findings, and gate decisions.
 - `harness/preflight.py`: dependency-free read-only target identity, isolation, state, instruction, scope, and filesystem inspection.
+- `harness/claude_reviewer.py`: bounded Aily/Claude read-only review invocation, evidence and manifest validation, one-shot persisted two-round enforcement, isolated snapshot, report validation, and review-evidence mapping. Explicit user authorization can be persisted with declared identity assurance when external identity is unavailable.
 - `harness/schemas/preflight-config.schema.json`: optional JSON input contract for preflight scopes and instruction roots.
 - `harness/config/`: default verification policy.
 - `harness/templates/`: starting points for target-repository documents.
@@ -88,7 +89,7 @@ The standard-library test suite runs with `python3 -m unittest discover -s tests
 
 ## Current limitations
 
-The operating procedure and policy describe controls but do not technically enforce them. The preflight CLI enforces its own read-only inspection contract; there is no executable engineering orchestrator, write broker, persistent state store, identity provider, CI integration, Draft 2020-12 schema validator, cross-record evidence/revision validator, or automatic policy evaluator. Independent Codex sessions and required human reviewers/approvers must be available through the host environment; the prompt cannot create those capabilities. Report attestations cannot prove substantive reviewer exhaustiveness.
+The operating procedure and policy describe controls but do not implement a general engineering orchestrator, write broker, identity provider, CI integration, full cross-record gate evaluator, or automatic policy evaluator. The Claude adapter validates target/workflow/reviewer/data-specific authorization attestations, evidence artifacts, scoped manifests, one-shot round claims, and workflow history. A user task prompt can authorize a bounded external review; the adapter records declared identity when the runtime lacks authenticated user identity and does not claim cryptographic proof. Its temporary snapshot plus Claude Code `--restricted`, `--safe-mode`, no-MCP configuration, and read-only tool allowlist constrain file tools to the authorized snapshot; this is not an OS sandbox around the Aily/Claude process. Human identities and approvals required by High-risk policy still need trusted authentication. The workflow owner must compute the complete workflow `revision_paths` identity for the gate. Authorization records must acknowledge possible provider cost, but the adapter cannot inspect billing or enforce a monetary ceiling. Report attestations cannot prove reviewer exhaustiveness. No live Claude call was made during this harness implementation.
 
 ## Roadmap
 

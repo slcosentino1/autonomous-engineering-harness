@@ -25,7 +25,8 @@ def clean_env(extra=None):
 
 
 def run_git(root, *args):
-    return subprocess.run(["git", "-C", str(root), *args], env=clean_env(), check=True,
+    return subprocess.run(["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+                           "-C", str(root), *args], env=clean_env(), check=True,
                           text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
@@ -61,7 +62,9 @@ class PreflightTests(unittest.TestCase):
 
     def make_repo(self, root):
         root.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["git", "-c", "init.defaultBranch=main", "init", "-q", str(root)], env=clean_env(), check=True)
+        subprocess.run(["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+                        "-c", "init.defaultBranch=main", "init", "-q", str(root)],
+                       env=clean_env(), check=True)
         run_git(root, "config", "user.name", "Preflight Fixture")
         run_git(root, "config", "user.email", "preflight@example.invalid")
         (root / "README.txt").write_text("fixture\n", encoding="utf-8")
@@ -71,7 +74,8 @@ class PreflightTests(unittest.TestCase):
     def add_submodule(self, relative_path):
         source = self.base / ("submodule-source-" + relative_path.replace("/", "-"))
         self.make_repo(source)
-        subprocess.run(["git", "-C", str(self.target), "-c", "protocol.file.allow=always",
+        subprocess.run(["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+                        "-C", str(self.target), "-c", "protocol.file.allow=always",
                         "submodule", "add", "-q", str(source), relative_path], env=clean_env(), check=True)
         run_git(self.target, "add", ".gitmodules", relative_path)
         run_git(self.target, "commit", "-m", "add test submodule", "-q")
@@ -172,7 +176,9 @@ class PreflightTests(unittest.TestCase):
 
     def test_shared_object_alternate_is_blocked(self):
         shared = self.base / "shared-clone"
-        subprocess.run(["git", "clone", "-q", "--shared", str(self.harness), str(shared)], env=clean_env(), check=True)
+        subprocess.run(["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+                        "clone", "-q", "--shared", str(self.harness), str(shared)],
+                       env=clean_env(), check=True)
         _, report = self.invoke(shared)
         self.assertEqual(report["overall_result"], "BLOCKED")
         self.assertEqual(self.status(report, "git.isolation"), "FAIL")
@@ -294,7 +300,8 @@ class PreflightTests(unittest.TestCase):
     def test_nested_bare_repository_scopes_are_rejected(self):
         bare = self.target / "src" / "internal-repo.git"
         bare.parent.mkdir()
-        subprocess.run(["git", "init", "--bare", "-q", str(bare)], env=clean_env(), check=True)
+        subprocess.run(["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+                        "init", "--bare", "-q", str(bare)], env=clean_env(), check=True)
         for path in ("src/internal-repo.git/objects", "src/internal-repo.git"):
             with self.subTest(path=path):
                 config = {"included_paths": [path], "code_paths": [path], "artifact_paths": []}

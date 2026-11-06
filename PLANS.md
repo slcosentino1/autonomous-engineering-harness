@@ -2,7 +2,7 @@
 
 ## Current status
 
-**Codex single-agent operating procedure documented; read-only preflight implemented.** Codex can follow the canonical prompt through authorized work when separately required read-only Codex review sessions and gate authorities are available through the host environment. This is instruction-driven, not an executable workflow orchestrator: no state store, write broker, automatic policy evaluator, or session-launch mechanism is implemented. Completion remains contingent on required reviewer and gate authorities being available under policy.
+**Codex single-session workflow, read-only preflight, and bounded Claude reviewer adapter implemented.** One primary Codex session owns orchestration and product changes. The Aily adapter can perform a policy-required Medium-risk read-only review after target-specific external-service authorization; it does not approve gates or replace High-risk human reviewers. The workflow remains instruction-driven, not a general orchestrator: there is no state store, write broker, identity provider, cross-record evaluator, or automatic gate evaluator. Self-review is not independent review or approval.
 
 ## Roadmap
 
@@ -21,7 +21,7 @@
 ### 3. Codex single-agent operating procedure — complete
 
 - Make `harness/prompts/06-autonomous-single-agent.md` the canonical task entrypoint.
-- Define the primary session's complete increment loop, scope derivation, reviewer handoff, correction, gate, closeout, and resume procedure.
+- Define the primary session's complete increment loop, scope derivation, structured self-review, correction, gate, closeout, and resume procedure.
 - Define a target-local default workflow-state location without replacing target conventions or creating a custom state engine.
 - Keep approval and external-operation boundaries from the existing policy.
 
@@ -32,7 +32,14 @@
 - Enforce command execution, working directory, approvals, and failure handling against the documented contracts.
 - No custom execution engine or orchestration framework is part of the current operating-procedure increment.
 
-### 5. Multi-agent support — future, not started
+### 5. Bounded Claude reviewer integration — complete
+
+- Invoke Claude through the configured Aily CLI for an authorized, read-only independent Medium-risk review.
+- Persist reserved review rounds, validated reports, linked execution evidence, finding decisions, and resume information in target-local workflow artifacts.
+- Limit each review cycle to two rounds and escalate unresolved findings or disagreements; preserve existing High-risk human review and approval requirements.
+- Do not make external calls without a verified target-specific human authorization record. This adapter does not implement a policy evaluator or identity provider.
+
+### 6. Broader multi-agent orchestration — future, not started
 
 - Reuse the reviewer and handoff contracts defined here.
 - Add a coordinator and role-specific agents only after the single-agent path works and explicit authorization is given.

@@ -33,7 +33,7 @@
       "description": "All review reports that independently recorded this finding. Cross-record validation checks these references against complete review reports."
     },
     "severity": {"enum": ["Critical", "High", "Medium", "Low", "Informational"]},
-    "classification": {"enum": ["confirmed_defect", "potential_risk", "known_limitation", "optional_improvement"]},
+    "classification": {"enum": ["confirmed_defect", "potential_risk", "known_limitation", "optional_improvement", "test_coverage_suggestion", "documentation_editorial"]},
     "title": {"type": "string", "minLength": 1},
     "description": {"type": "string", "minLength": 1},
     "location": {"type": "string"},

@@ -4,6 +4,35 @@
   "title": "Target engineering workflow state",
   "type": "object",
   "additionalProperties": false,
+  "$defs": {
+    "reviewResponseMetadata": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "response_field": {"const": "result"},
+        "envelope_type": {"const": "result"},
+        "subtype": {"type": "string", "maxLength": 48},
+        "is_error": {"type": "boolean"},
+        "session_id": {"type": "string", "maxLength": 160},
+        "invocation_id": {"type": "string", "maxLength": 160},
+        "request_id": {"type": "string", "maxLength": 160},
+        "model": {"type": "string", "maxLength": 128},
+        "cost_usd": {"type": "number", "minimum": 0},
+        "usage": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "input_tokens": {"type": "integer", "minimum": 0},
+            "output_tokens": {"type": "integer", "minimum": 0},
+            "cache_creation_input_tokens": {"type": "integer", "minimum": 0},
+            "cache_read_input_tokens": {"type": "integer", "minimum": 0},
+            "output_tokens_details": {"type": "object", "additionalProperties": false, "properties": {"thinking_tokens": {"type": "integer", "minimum": 0}}},
+            "server_tool_use": {"type": "object", "additionalProperties": false, "properties": {"web_search_requests": {"type": "integer", "minimum": 0}, "web_fetch_requests": {"type": "integer", "minimum": 0}}},
+            "cache_creation": {"type": "object", "additionalProperties": false, "properties": {"ephemeral_1h_input_tokens": {"type": "integer", "minimum": 0}, "ephemeral_5m_input_tokens": {"type": "integer", "minimum": 0}}},
+            "service_tier": {"type": "string", "maxLength": 48}
+          }
+        }
+      }
+    }
+  },
   "required": ["schema_version", "workflow_id", "target", "harness_root", "harness_git_root", "harness_git_common_dir", "harness_git_refs_dir", "harness_git_object_store_paths", "scope", "baseline", "phase", "status", "phase_records", "artifact_references", "findings_register_reference", "review_assignments", "authorized_instruction_roots", "instruction_records", "applied_capabilities", "authorizations", "pending_decisions", "updated_at"],
   "properties": {
     "schema_version": {"const": 1},
@@ -139,6 +168,148 @@
       },
       "description": "Expected read-only reviews assigned before review starts; the gate checks the risk-required roster against these assignments and their reports."
     },
+    "claude_review_cycles": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["cycle_id", "scope_kind", "increment_id", "assignment_reference", "target_revision_id", "scope_paths", "max_rounds", "round_count", "status", "rounds", "finding_decisions", "unresolved_finding_ids", "human_escalation"],
+        "properties": {
+          "cycle_id": {"type": "string", "minLength": 1},
+          "scope_kind": {"enum": ["increment", "final"]},
+          "increment_id": {"type": "string", "minLength": 1},
+          "assignment_reference": {"type": "string", "minLength": 1},
+          "target_revision_id": {"type": "string", "pattern": "^content:[a-f0-9]{64}$"},
+          "scope_paths": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+          "max_rounds": {"const": 2},
+          "round_count": {"type": "integer", "minimum": 0, "maximum": 2},
+          "status": {"enum": ["pending", "review_reserved", "invocation_failed", "review_rejected", "finding_analysis_pending", "complete", "blocked", "human_intervention_required"]},
+          "rounds": {
+            "type": "array",
+            "maxItems": 2,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["round_number", "target_revision_id", "started_at", "status", "attempt_number", "report_valid", "envelope_valid", "finding_ids", "invocation_attempts", "recovery_transitions", "verification_evidence_references"],
+              "properties": {
+                "round_number": {"type": "integer", "enum": [1, 2]},
+                "target_revision_id": {"type": "string", "pattern": "^content:[a-f0-9]{64}$"},
+                "started_at": {"type": "string", "format": "date-time"},
+                "attempt_number": {"type": "integer", "enum": [1, 2]},
+                "invocation_attempted_at": {"type": "string", "format": "date-time", "description": "Persisted one-shot claim written atomically immediately before the external invocation."},
+                "review_manifest_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$", "description": "Deterministic authorized-input manifest bound to target, workflow, revision, review assignment and round."},
+                "completed_at": {"type": "string", "format": "date-time"},
+                "status": {"enum": ["reserved", "completed", "failed"]},
+                "outcome": {"enum": ["INVOCATION_FAILED", "REVIEW_REJECTED", "REVIEW_COMPLETED"]},
+                "process_exit_code": {"type": ["integer", "null"]},
+                "report_valid": {"type": "boolean"},
+                "envelope_valid": {"type": "boolean"},
+                "failure_kind": {"type": ["string", "null"], "enum": ["process_launch_failure", "authentication_failure", "reviewer_execution_failure", "invalid_json", "empty_response", "invalid_reviewer_report", "stale_revision", "request_validation_failure", null]},
+                "diagnostic": {"type": ["string", "null"], "maxLength": 1200},
+                "validation_errors": {"type": "array", "maxItems": 32, "items": {"type": "string", "maxLength": 1200}},
+                "response_metadata": {
+                  "type": "object", "additionalProperties": false,
+                  "properties": {
+                    "response_field": {"const": "result"},
+                    "envelope_type": {"const": "result"},
+                    "subtype": {"type": "string", "maxLength": 48},
+                    "is_error": {"type": "boolean"},
+                    "session_id": {"type": "string", "maxLength": 160},
+                    "invocation_id": {"type": "string", "maxLength": 160},
+                    "request_id": {"type": "string", "maxLength": 160},
+                    "model": {"type": "string", "maxLength": 128},
+                    "cost_usd": {"type": "number", "minimum": 0},
+                    "usage": {
+                      "type": "object", "additionalProperties": false,
+                      "properties": {
+                        "input_tokens": {"type": "integer", "minimum": 0},
+                        "output_tokens": {"type": "integer", "minimum": 0},
+                        "cache_creation_input_tokens": {"type": "integer", "minimum": 0},
+                        "cache_read_input_tokens": {"type": "integer", "minimum": 0},
+                        "output_tokens_details": {"type": "object", "additionalProperties": false, "properties": {"thinking_tokens": {"type": "integer", "minimum": 0}}},
+                        "server_tool_use": {"type": "object", "additionalProperties": false, "properties": {"web_search_requests": {"type": "integer", "minimum": 0}, "web_fetch_requests": {"type": "integer", "minimum": 0}}},
+                        "cache_creation": {"type": "object", "additionalProperties": false, "properties": {"ephemeral_1h_input_tokens": {"type": "integer", "minimum": 0}, "ephemeral_5m_input_tokens": {"type": "integer", "minimum": 0}}},
+                        "service_tier": {"type": "string", "maxLength": 48}
+                      }
+                    }
+                  }
+                },
+                "reviewer_status": {"enum": ["APPROVED", "CHANGES_REQUESTED", "BLOCKED"]},
+                "finding_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+                "report_reference": {"type": "string", "minLength": 1},
+                "evidence_reference": {"type": "string", "minLength": 1},
+                "invocation_attempts": {
+                  "type": "array",
+                  "maxItems": 2,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["attempt_number", "target_revision_id", "invocation_attempted_at", "review_manifest_sha256", "completed_at", "outcome", "process_exit_code", "failure_kind", "evidence_reference"],
+                    "properties": {
+                      "attempt_number": {"type": "integer", "enum": [1, 2]},
+                      "target_revision_id": {"type": "string", "pattern": "^content:[a-f0-9]{64}$"},
+                      "invocation_attempted_at": {"type": "string", "format": "date-time"},
+                      "review_manifest_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+                      "completed_at": {"type": "string", "format": "date-time"},
+                      "outcome": {"enum": ["INVOCATION_FAILED", "REVIEW_REJECTED", "REVIEW_COMPLETED"]},
+                      "process_exit_code": {"type": ["integer", "null"]},
+                      "failure_kind": {"type": ["string", "null"], "enum": ["process_launch_failure", "authentication_failure", "reviewer_execution_failure", "invalid_json", "empty_response", "invalid_reviewer_report", "stale_revision", "request_validation_failure", null]},
+                      "diagnostic": {"type": ["string", "null"], "maxLength": 1200},
+                      "validation_errors": {"type": "array", "maxItems": 32, "items": {"type": "string", "maxLength": 1200}},
+                      "response_metadata": {"$ref": "#/$defs/reviewResponseMetadata"},
+                      "evidence_reference": {"type": "string", "minLength": 1}
+                    }
+                  }
+                },
+                "recovery_transitions": {
+                  "type": "array",
+                  "maxItems": 1,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["transition_id", "round_number", "from_attempt_number", "to_attempt_number", "from_outcome", "prior_target_revision_id", "recovered_target_revision_id", "reason", "recovered_by", "recovered_by_identity_assurance", "recovered_at"],
+                    "properties": {
+                      "transition_id": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+                      "round_number": {"type": "integer", "enum": [1, 2]},
+                      "from_attempt_number": {"const": 1},
+                      "to_attempt_number": {"const": 2},
+                      "from_outcome": {"enum": ["INVOCATION_FAILED", "REVIEW_REJECTED"]},
+                      "prior_target_revision_id": {"type": "string", "pattern": "^content:[a-f0-9]{64}$"},
+                      "recovered_target_revision_id": {"type": "string", "pattern": "^content:[a-f0-9]{64}$"},
+                      "reason": {"type": "string", "minLength": 1},
+                      "recovered_by": {"type": "string", "minLength": 1},
+                      "recovered_by_identity_assurance": {"enum": ["declared", "externally_authenticated"]},
+                      "recovered_at": {"type": "string", "format": "date-time"}
+                    }
+                  }
+                },
+                "verification_evidence_references": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+                "prior_findings_reviewed": {"type": "array", "items": {"type": "object"}}
+              },
+              "allOf": [
+                {"if": {"properties": {"status": {"enum": ["completed", "failed"]}}, "required": ["status"]}, "then": {"required": ["completed_at", "invocation_attempted_at", "review_manifest_sha256"]}},
+                {"if": {"properties": {"status": {"const": "completed"}}, "required": ["status"]}, "then": {"required": ["process_exit_code", "reviewer_status", "report_reference", "evidence_reference"]}}
+              ]
+            }
+          },
+          "finding_decisions": {
+            "type": "array",
+            "items": {"$ref": "reviewer-finding-decision.schema.json"}
+          },
+          "unresolved_finding_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+          "human_escalation": {"type": "boolean"},
+          "human_escalation_reason": {"type": "string", "minLength": 1},
+          "evidence_needed": {"type": "array", "items": {"type": "string", "minLength": 1}}
+        }
+      },
+        "allOf": [
+          {
+            "if": {"properties": {"human_escalation": {"const": true}}, "required": ["human_escalation"]},
+            "then": {"required": ["human_escalation_reason"], "properties": {"human_escalation_reason": {"minLength": 1}}}
+          }
+        ],
+        "description": "Target-local Claude review history. round_count counts only valid schema-compliant completed reports. Failed or rejected attempts remain recorded and do not count; one explicit recovery transition may authorize a second attempt for that reserved round. A workflow-state scan prevents resetting review history. At most two completed rounds and one Claude cycle per target increment are allowed."
+    },
     "authorized_instruction_roots": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "description": "Canonical absolute directories; target root is required and ancestors need explicit authorization."}},
     "instruction_records": {
       "type": "array",
@@ -177,24 +348,88 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["authorization_id", "operation", "resource", "scope", "limits", "authorizer_identity", "authorizer_kind", "authorizer_role", "authorizer_identity_assurance", "authorizer_authentication_reference", "authority_reference", "authorized_at", "source_reference", "expires_or_revocation"],
+        "required": ["authorization_id", "operation", "resource", "scope", "limits", "authorizer_identity", "authorizer_kind", "authorizer_role", "authorizer_identity_assurance", "authorizer_authentication_reference", "authorizer_session_identity", "authority_reference", "authorized_at", "source_reference", "expires_or_revocation"],
         "properties": {
           "authorization_id": {"type": "string", "minLength": 1},
           "operation": {"type": "string", "minLength": 1},
           "resource": {"type": "string", "minLength": 1},
           "scope": {"type": "string", "minLength": 1},
+          "target_id": {"type": "string", "minLength": 1},
+          "workflow_id": {"type": "string", "minLength": 1},
+          "increment_id": {"type": "string", "minLength": 1},
+          "assignment_reference": {"type": "string", "minLength": 1},
+          "review_id": {"type": "string", "minLength": 1},
+          "reviewer": {"const": "Claude through Aily"},
+          "reviewer_role": {"type": "string", "minLength": 1},
+          "permitted_paths": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+          "permitted_data": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["task", "requirements", "acceptance_criteria", "reviewer_contract", "assigned_diff", "context_files", "verification_evidence", "workflow_identity", "revision_manifest"]}},
           "limits": {"type": "array", "items": {"type": "string"}},
           "authorizer_identity": {"type": "string", "minLength": 1},
           "authorizer_kind": {"const": "human"},
           "authorizer_role": {"type": "string", "minLength": 1},
-          "authorizer_identity_assurance": {"const": "externally_authenticated"},
-          "authorizer_authentication_reference": {"type": "string", "minLength": 1},
+          "authorizer_identity_assurance": {"enum": ["declared", "externally_authenticated"], "description": "Declared is appropriate when explicit user task authorization is the available provenance and the runtime cannot establish authenticated identity."},
+          "authorizer_authentication_reference": {"type": ["string", "null"], "minLength": 1},
+          "authorizer_session_identity": {"type": ["string", "null"], "minLength": 1, "description": "Session attribution from the current runtime when available; null means the runtime exposes no session identity."},
           "authority_reference": {"type": "string", "minLength": 1},
+          "operation_effects": {
+            "type": "object", "additionalProperties": false,
+            "required": ["may_mutate_state", "may_incur_cost", "cost_limit"],
+            "properties": {
+              "may_mutate_state": {"const": false},
+              "may_incur_cost": {"const": true},
+              "cost_limit": {"type": "string", "minLength": 1}
+            },
+            "description": "Prohibits remote mutation and explicitly acknowledges that the external review may incur cost, with a human-approved limit. The adapter cannot enforce a provider-side monetary ceiling."
+          },
           "authorized_at": {"type": "string", "format": "date-time"},
           "source_reference": {"type": "string", "minLength": 1},
-          "expires_or_revocation": {"type": "string", "minLength": 1}
-        }
+          "expires_at": {"type": "string", "format": "date-time"},
+          "expires_or_revocation": {"type": "string", "minLength": 1, "description": "Required compatibility field from the frozen authorization policy; expires_at and revoked provide machine-checkable enforcement."},
+          "revoked": {"type": "boolean"},
+          "workflow_owner_verification": {
+            "type": "object", "additionalProperties": false,
+            "required": ["verified_by", "verified_at", "source_reference", "identity_assurance", "verified_scope_sha256"],
+            "properties": {
+              "verified_by": {"type": "string", "minLength": 1},
+              "verified_at": {"type": "string", "format": "date-time"},
+              "source_reference": {"type": "string", "minLength": 1},
+              "identity_assurance": {"enum": ["declared", "externally_authenticated"]},
+              "verified_scope_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+            }
+          }
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"reviewer": {"const": "Claude through Aily"}}, "required": ["reviewer"]},
+            "then": {"required": ["target_id", "workflow_id", "increment_id", "assignment_reference", "review_id", "reviewer_role", "permitted_paths", "permitted_data", "operation_effects", "expires_at", "revoked", "workflow_owner_verification", "authorizer_session_identity"]}
+          },
+          {
+            "if": {"properties": {"authorizer_identity_assurance": {"const": "externally_authenticated"}}, "required": ["authorizer_identity_assurance"]},
+            "then": {"properties": {"authorizer_authentication_reference": {"type": "string", "minLength": 1}}}
+          },
+          {
+            "if": {"properties": {"authorizer_identity_assurance": {"const": "declared"}}, "required": ["authorizer_identity_assurance"]},
+            "then": {"properties": {"authorizer_authentication_reference": {"const": null}}}
+          }
+        ]
       }
+    },
+    "authorization_verifier": {
+      "type": "object", "additionalProperties": false,
+      "required": ["identity", "role", "identity_assurance", "source_reference"],
+      "properties": {
+        "identity": {"type": "string", "minLength": 1},
+        "role": {"type": "string", "minLength": 1},
+        "identity_assurance": {"enum": ["declared", "externally_authenticated"]},
+        "source_reference": {"type": "string", "minLength": 1},
+        "authentication_reference": {"type": ["string", "null"], "minLength": 1},
+        "authority_reference": {"type": ["string", "null"], "minLength": 1}
+      },
+      "allOf": [
+        {"if": {"properties": {"identity_assurance": {"const": "externally_authenticated"}}, "required": ["identity_assurance"]}, "then": {"properties": {"authentication_reference": {"type": "string", "minLength": 1}, "authority_reference": {"type": "string", "minLength": 1}}}},
+        {"if": {"properties": {"identity_assurance": {"const": "declared"}}, "required": ["identity_assurance"]}, "then": {"properties": {"authentication_reference": {"const": null}, "authority_reference": {"const": null}}}}
+      ],
+      "description": "Workflow owner attribution used to bind authorization verification to its actual source. Declared identity is an attestation, not authentication or an identity provider."
     },
     "pending_decisions": {
       "type": "array",
@@ -266,6 +501,10 @@
     "updated_at": {"type": "string", "format": "date-time"}
   },
   "allOf": [
+    {
+      "if": {"properties": {"authorizations": {"contains": {"properties": {"reviewer": {"const": "Claude through Aily"}}, "required": ["reviewer"]}}}, "required": ["authorizations"]},
+      "then": {"required": ["authorization_verifier"]}
+    },
     {
       "if": {"properties": {"status": {"const": "WAITING_FOR_HUMAN"}}, "required": ["status"]},
       "then": {"properties": {"pending_decisions": {"minItems": 1, "contains": {"properties": {"status": {"const": "open"}}, "required": ["status"]}}}}
