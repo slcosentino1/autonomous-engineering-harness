@@ -195,7 +195,7 @@
                 "round_number": {"type": "integer", "enum": [1, 2]},
                 "target_revision_id": {"type": "string", "pattern": "^content:[a-f0-9]{64}$"},
                 "started_at": {"type": "string", "format": "date-time"},
-                "attempt_number": {"type": "integer", "enum": [1, 2]},
+                "attempt_number": {"type": "integer", "enum": [1, 2, 3]},
                 "invocation_attempted_at": {"type": "string", "format": "date-time", "description": "Persisted one-shot claim written atomically immediately before the external invocation."},
                 "review_manifest_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$", "description": "Deterministic authorized-input manifest bound to target, workflow, revision, review assignment and round."},
                 "completed_at": {"type": "string", "format": "date-time"},
@@ -240,13 +240,13 @@
                 "evidence_reference": {"type": "string", "minLength": 1},
                 "invocation_attempts": {
                   "type": "array",
-                  "maxItems": 2,
+                  "maxItems": 3,
                   "items": {
                     "type": "object",
                     "additionalProperties": false,
                     "required": ["attempt_number", "target_revision_id", "invocation_attempted_at", "review_manifest_sha256", "completed_at", "outcome", "process_exit_code", "failure_kind", "evidence_reference"],
                     "properties": {
-                      "attempt_number": {"type": "integer", "enum": [1, 2]},
+                      "attempt_number": {"type": "integer", "enum": [1, 2, 3]},
                       "target_revision_id": {"type": "string", "pattern": "^content:[a-f0-9]{64}$"},
                       "invocation_attempted_at": {"type": "string", "format": "date-time"},
                       "review_manifest_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
@@ -263,7 +263,7 @@
                 },
                 "recovery_transitions": {
                   "type": "array",
-                  "maxItems": 1,
+                  "maxItems": 2,
                   "items": {
                     "type": "object",
                     "additionalProperties": false,
@@ -271,16 +271,20 @@
                     "properties": {
                       "transition_id": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
                       "round_number": {"type": "integer", "enum": [1, 2]},
-                      "from_attempt_number": {"const": 1},
-                      "to_attempt_number": {"const": 2},
+                      "from_attempt_number": {"type": "integer", "enum": [1, 2]},
+                      "to_attempt_number": {"type": "integer", "enum": [2, 3]},
                       "from_outcome": {"enum": ["INVOCATION_FAILED", "REVIEW_REJECTED"]},
                       "prior_target_revision_id": {"type": "string", "pattern": "^content:[a-f0-9]{64}$"},
                       "recovered_target_revision_id": {"type": "string", "pattern": "^content:[a-f0-9]{64}$"},
                       "reason": {"type": "string", "minLength": 1},
                       "recovered_by": {"type": "string", "minLength": 1},
                       "recovered_by_identity_assurance": {"enum": ["declared", "externally_authenticated"]},
-                      "recovered_at": {"type": "string", "format": "date-time"}
-                    }
+                      "recovered_at": {"type": "string", "format": "date-time"},
+                      "authorization_reference": {"type": "string", "minLength": 1}
+                    },
+                    "allOf": [
+                      {"if": {"properties": {"from_attempt_number": {"const": 2}}, "required": ["from_attempt_number"]}, "then": {"required": ["authorization_reference"]}}
+                    ]
                   }
                 },
                 "verification_evidence_references": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},

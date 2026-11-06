@@ -1,94 +1,37 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://example.invalid/autonomous-engineering-harness/claude-review-report.schema.json",
-  "title": "Claude independent reviewer report",
+  "title": "Claude review response",
   "type": "object",
   "additionalProperties": false,
-  "required": ["reviewer", "reviewer_role", "reviewer_identity_assurance", "status", "summary", "target_revision_id", "review_round", "scope_paths", "review_completion", "scope_completion_attested", "mandatory_checks_completed", "mandatory_checks_remaining", "findings", "requirements_reviewed", "criterion_coverage", "tests_reviewed", "files_modified", "limitations", "unverified_areas", "prior_findings_reviewed"],
+  "required": ["decision", "summary", "findings"],
   "properties": {
-    "reviewer": {"const": "Claude"},
-    "reviewer_role": {"type": "string", "minLength": 1},
-    "reviewer_identity_assurance": {"const": "declared"},
-    "status": {"enum": ["APPROVED", "CHANGES_REQUESTED", "BLOCKED"]},
+    "decision": {"enum": ["APPROVED", "CHANGES_REQUESTED"]},
     "summary": {"type": "string", "minLength": 1},
-    "target_revision_id": {"type": "string", "pattern": "^content:[a-f0-9]{64}$"},
-    "review_round": {"type": "integer", "enum": [1, 2]},
-    "scope_paths": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
-    "review_completion": {"enum": ["complete", "incomplete"]},
-    "scope_completion_attested": {"type": "boolean"},
-    "mandatory_checks_completed": {"type": "array", "items": {"type": "string", "minLength": 1}},
-    "mandatory_checks_remaining": {"type": "array", "items": {"type": "string", "minLength": 1}},
     "findings": {
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "severity", "classification", "file", "line", "title", "description", "recommendation", "evidence_references"],
+        "required": ["id", "severity", "file", "description", "recommendation"],
         "properties": {
           "id": {"type": "string", "minLength": 1},
           "severity": {"enum": ["critical", "high", "medium", "low", "info"]},
-          "classification": {"enum": ["confirmed_defect", "potential_risk", "test_coverage_suggestion", "documentation_editorial"]},
           "file": {"type": "string", "minLength": 1},
-          "line": {"type": ["integer", "null"], "minimum": 1},
-          "title": {"type": "string", "minLength": 1},
           "description": {"type": "string", "minLength": 1},
-          "recommendation": {"type": "string", "minLength": 1},
-          "evidence_references": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
-        }
-      }
-    },
-    "requirements_reviewed": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
-    "criterion_coverage": {
-      "type": "array",
-      "minItems": 1,
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["criterion_id", "status", "evidence_references", "gap"],
-        "properties": {
-          "criterion_id": {"type": "string", "minLength": 1},
-          "status": {"enum": ["PASS", "FAIL", "NEEDS_EVIDENCE", "NOT_APPLICABLE"]},
-          "evidence_references": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
-          "gap": {"type": "string"}
-        },
-        "allOf": [
-          {"if": {"properties": {"status": {"enum": ["PASS", "FAIL"]}}, "required": ["status"]}, "then": {"properties": {"evidence_references": {"minItems": 1}}}},
-          {"if": {"properties": {"status": {"enum": ["FAIL", "NEEDS_EVIDENCE", "NOT_APPLICABLE"]}}, "required": ["status"]}, "then": {"properties": {"gap": {"minLength": 1}}}}
-        ]
-      }
-    },
-    "tests_reviewed": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
-    "files_modified": {"type": "array", "maxItems": 0},
-    "limitations": {"type": "array", "items": {"type": "string"}},
-    "unverified_areas": {"type": "array", "items": {"type": "string"}},
-    "prior_findings_reviewed": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["id", "status", "evidence_references"],
-        "properties": {
-          "id": {"type": "string", "minLength": 1},
-          "status": {"enum": ["resolved", "unresolved", "not_reproducible", "disputed"]},
-          "evidence_references": {"type": "array", "items": {"type": "string", "minLength": 1}}
+          "recommendation": {"type": "string", "minLength": 1}
         }
       }
     }
   },
   "allOf": [
     {
-      "if": {"properties": {"review_completion": {"const": "complete"}}, "required": ["review_completion"]},
-      "then": {
-        "properties": {"scope_completion_attested": {"const": true}, "mandatory_checks_remaining": {"maxItems": 0}}
-      }
+      "if": {"properties": {"decision": {"const": "APPROVED"}}, "required": ["decision"]},
+      "then": {"properties": {"findings": {"maxItems": 0}}}
     },
     {
-      "if": {"properties": {"review_completion": {"const": "incomplete"}}, "required": ["review_completion"]},
-      "then": {"properties": {"status": {"const": "BLOCKED"}}}
-    },
-    {
-      "if": {"properties": {"status": {"const": "APPROVED"}}, "required": ["status"]},
-      "then": {"properties": {"criterion_coverage": {"not": {"contains": {"properties": {"status": {"enum": ["FAIL", "NEEDS_EVIDENCE"]}}, "required": ["status"]}}}}}
+      "if": {"properties": {"decision": {"const": "CHANGES_REQUESTED"}}, "required": ["decision"]},
+      "then": {"properties": {"findings": {"minItems": 1}}}
     }
   ]
 }

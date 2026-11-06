@@ -212,40 +212,22 @@ class ClaudeReviewerTests(unittest.TestCase):
         return {
             "id": finding_id,
             "severity": severity,
-            "classification": "confirmed_defect",
             "file": file,
-            "line": 2,
-            "title": "Return value does not meet the requirement",
             "description": "The implementation returns a value that disagrees with AC-1.",
             "recommendation": "Correct the return value and add a regression check.",
-            "evidence_references": ["EV-TEST-1"],
         }
 
     def report(self, cycle, findings=None, status="APPROVED", prior=None, revision=None):
+        findings = list(findings or [])
+        if prior:
+            for item in prior:
+                if item.get("status") in {"unresolved", "disputed"}:
+                    findings.append(self.finding(item["id"]))
+        decision = "CHANGES_REQUESTED" if findings else status
         return {
-            "reviewer": "Claude",
-            "reviewer_role": "Code Reviewer",
-            "reviewer_identity_assurance": "declared",
-            "status": status,
+            "decision": decision,
             "summary": "Reviewed the assigned paths against the task and evidence.",
-            "target_revision_id": revision or cycle["target_revision_id"],
-            "review_round": cycle["rounds"][-1]["round_number"] if cycle.get("rounds") else cycle["round_count"] + 1,
-            "scope_paths": cycle["scope_paths"],
-            "review_completion": "complete",
-            "scope_completion_attested": True,
-            "mandatory_checks_completed": ["Requirements and evidence reviewed."],
-            "mandatory_checks_remaining": [],
-            "findings": findings or [],
-            "requirements_reviewed": ["REQ-1", "AC-1"],
-            "criterion_coverage": [
-                {"criterion_id": "REQ-1", "status": "PASS", "evidence_references": ["EV-TEST-1"], "gap": ""},
-                {"criterion_id": "AC-1", "status": "PASS", "evidence_references": ["EV-TEST-1"], "gap": ""},
-            ],
-            "tests_reviewed": ["Inspected tests/test_app.py and EV-TEST-1; did not execute tests."],
-            "files_modified": [],
-            "limitations": [],
-            "unverified_areas": [],
-            "prior_findings_reviewed": prior or [],
+            "findings": findings,
         }
 
     @staticmethod
@@ -340,7 +322,8 @@ class ClaudeReviewerTests(unittest.TestCase):
             process_runner=self.mocked_runner(self.envelope(report)),
         )
         self.assertTrue(result["report_valid"])
-        self.assertEqual(result["report"]["reviewer"], "Claude")
+        self.assertEqual(result["report"]["decision"], "APPROVED")
+        self.assertEqual(set(result["report"]), {"decision", "summary", "findings"})
         self.assertEqual(result["process"]["reviewer_session_identity"], "claude-session-1")
         persisted_round = json.loads((self.workflow_dir / "workflow-state.json").read_text(encoding="utf-8"))["claude_review_cycles"][0]["rounds"][0]
         persisted_state = json.loads((self.workflow_dir / "workflow-state.json").read_text(encoding="utf-8"))
@@ -404,6 +387,109 @@ class ClaudeReviewerTests(unittest.TestCase):
                          ".engineering/workflows/workflow-1/evidence/failed-round-1.json")
         with self.assertRaises(ReviewError):
             recover_uncompleted_review_round(recovered, reason="duplicate recovery", recovered_by="Codex")
+
+    def test_new_user_authorization_allows_exactly_one_final_audited_attempt(self):
+        cycle = reserve_review_round(self.cycle(), target_revision_id=REVISION_1)
+        first_failure = {
+            "report_valid": False, "report_received": False, "envelope_valid": False,
+            "failure_kind": "process_launch_failure",
+            "process": {"exit_code": None, "invocation_attempted_at": "2026-11-06T10:00:00Z",
+                        "review_manifest_sha256": "a" * 64},
+        }
+        cycle = record_review_result(
+            cycle, first_failure, report_reference=None,
+            evidence_reference=".engineering/workflows/workflow-1/evidence/failed-1.json",
+            target_path=self.target, workflow_state_path=".engineering/workflows/workflow-1/workflow-state.json",
+        )
+        cycle = recover_uncompleted_review_round(
+            cycle, reason="Recover the original process launch failure.",
+            recovered_by="primary Codex session", recovered_at="2026-11-06T10:01:00Z",
+        )
+        second_failure = {
+            "report_valid": False, "report_received": True, "envelope_valid": True,
+            "failure_kind": "invalid_reviewer_report",
+            "process": {"exit_code": 0, "invocation_attempted_at": "2026-11-06T10:02:00Z",
+                        "review_manifest_sha256": "b" * 64},
+        }
+        cycle = record_review_result(
+            cycle, second_failure, report_reference=None,
+            evidence_reference=".engineering/workflows/workflow-1/evidence/rejected-2.json",
+            target_path=self.target, workflow_state_path=".engineering/workflows/workflow-1/workflow-state.json",
+        )
+        with self.assertRaisesRegex(ReviewError, "explicit user task authorization"):
+            recover_uncompleted_review_round(
+                cycle, reason="Attempt without new authorization.", recovered_by="Codex",
+            )
+
+        final = recover_uncompleted_review_round(
+            cycle, reason="The current user task explicitly authorizes one final call after parser tests.",
+            recovered_by="primary Codex session",
+            authorization_reference="current-user-task:Make Claude Review Work — Stop Overengineering",
+            recovered_at="2026-11-06T10:03:00Z",
+        )
+        round_record = final["rounds"][0]
+        self.assertEqual(final["round_count"], 0)
+        self.assertEqual(round_record["attempt_number"], 3)
+        self.assertEqual(len(round_record["invocation_attempts"]), 2)
+        self.assertEqual(round_record["recovery_transitions"][1]["from_outcome"], "REVIEW_REJECTED")
+        self.assertEqual(
+            round_record["recovery_transitions"][1]["authorization_reference"],
+            "current-user-task:Make Claude Review Work — Stop Overengineering",
+        )
+
+        final_failure = {
+            "report_valid": False, "report_received": True, "envelope_valid": True,
+            "failure_kind": "invalid_reviewer_report",
+            "process": {"exit_code": 0, "invocation_attempted_at": "2026-11-06T10:04:00Z",
+                        "review_manifest_sha256": "c" * 64},
+        }
+        terminal = record_review_result(
+            final, final_failure, report_reference=None,
+            evidence_reference=".engineering/workflows/workflow-1/evidence/rejected-3.json",
+            target_path=self.target, workflow_state_path=".engineering/workflows/workflow-1/workflow-state.json",
+        )
+        with self.assertRaisesRegex(ReviewError, "all permitted recovery transitions"):
+            recover_uncompleted_review_round(
+                terminal, reason="No retry beyond the explicit final attempt.", recovered_by="Codex",
+                authorization_reference="another-reference",
+            )
+
+    def test_final_attempt_recovery_reference_must_match_persisted_authorization(self):
+        cycle = reserve_review_round(self.cycle(), target_revision_id=REVISION_1)
+        first_failure = {
+            "report_valid": False, "report_received": False, "envelope_valid": False,
+            "failure_kind": "process_launch_failure",
+            "process": {"exit_code": None, "invocation_attempted_at": "2026-11-06T10:00:00Z",
+                        "review_manifest_sha256": "a" * 64},
+        }
+        cycle = record_review_result(
+            cycle, first_failure, report_reference=None,
+            evidence_reference=".engineering/workflows/workflow-1/evidence/failed-1.json",
+            target_path=self.target, workflow_state_path=".engineering/workflows/workflow-1/workflow-state.json",
+        )
+        cycle = recover_uncompleted_review_round(
+            cycle, reason="Recover first failed attempt.", recovered_by="Codex",
+            recovered_at="2026-11-06T10:01:00Z",
+        )
+        second_failure = {
+            "report_valid": False, "report_received": True, "envelope_valid": True,
+            "failure_kind": "invalid_reviewer_report",
+            "process": {"exit_code": 0, "invocation_attempted_at": "2026-11-06T10:02:00Z",
+                        "review_manifest_sha256": "b" * 64},
+        }
+        cycle = record_review_result(
+            cycle, second_failure, report_reference=None,
+            evidence_reference=".engineering/workflows/workflow-1/evidence/rejected-2.json",
+            target_path=self.target, workflow_state_path=".engineering/workflows/workflow-1/workflow-state.json",
+        )
+        cycle = recover_uncompleted_review_round(
+            cycle, reason="Current user task explicitly authorizes one final attempt.",
+            recovered_by="Codex", authorization_reference="task-prompt:another-section",
+            recovered_at="2026-11-06T10:03:00Z",
+        )
+        request = self.request(cycle)
+        with self.assertRaisesRegex(ReviewError, "must match the persisted explicit user authorization source"):
+            _validate_request(request)
 
     def test_rejected_report_does_not_consume_completed_round(self):
         cycle = reserve_review_round(self.cycle(), target_revision_id=REVISION_1)
@@ -488,7 +574,7 @@ class ClaudeReviewerTests(unittest.TestCase):
         self.assertEqual(_extract_report_diagnostics(json.dumps(envelope))[2], "invalid_json")
         report = dict(expected)
         report["uncontracted_field"] = "not accepted"
-        self.assertIn("report contains unsupported fields: uncontracted_field",
+        self.assertIn("unsupported report field: uncontracted_field",
                       validate_reviewer_report(report, self.request(cycle)))
 
     def test_02c_non_object_json_result_is_received_but_rejected(self):
@@ -514,7 +600,7 @@ class ClaudeReviewerTests(unittest.TestCase):
     def test_04_missing_required_reviewer_fields_is_invalid_report(self):
         cycle = reserve_review_round(self.cycle(), target_revision_id=REVISION_1)
         report = self.report(cycle)
-        report.pop("requirements_reviewed")
+        report.pop("summary")
         result = run_claude_review(
             self.request(cycle), aily_executable=self.fake_aily,
             process_runner=self.mocked_runner(self.envelope(report)),
@@ -522,7 +608,7 @@ class ClaudeReviewerTests(unittest.TestCase):
         self.assertEqual(result["failure_kind"], "invalid_reviewer_report")
         self.assertFalse(result["report_valid"])
         self.assertIsNone(result["report"])
-        self.assertIn("missing required report fields: requirements_reviewed", result["validation_errors"])
+        self.assertIn("missing required report field: summary", result["validation_errors"])
         self.assertEqual(result["response_metadata"]["response_field"], "result")
         self.assertEqual(result["process"]["model"], "claude-test-model")
         self.assertEqual(result["process"]["usage"]["input_tokens"], 123)
@@ -530,7 +616,7 @@ class ClaudeReviewerTests(unittest.TestCase):
     def test_invalid_report_diagnostics_survive_state_recording_and_evidence_errors(self):
         cycle = self.cycle()
         report = self.report(reserve_review_round(cycle, target_revision_id=REVISION_1))
-        report.pop("requirements_reviewed")
+        report.pop("summary")
         result, reserved, request = self.run_one(cycle, report)
         original_error = result["error"]
         self.assertTrue(result["validation_errors"])
@@ -767,7 +853,6 @@ class ClaudeReviewerTests(unittest.TestCase):
         request["source_state"] = "commit"
         request["commit_sha"] = current_head
         report = self.report(cycle)
-        report["target_revision_id"] = REVISION_1
 
         def move_head():
             (self.target / "src/app.py").write_text("def value():\n    return 9\n", encoding="utf-8")
@@ -880,44 +965,42 @@ class ClaudeReviewerTests(unittest.TestCase):
         self.assertNotIn("api_key", json.dumps(evidence["review_execution"]).lower())
         self.assertNotIn("password", json.dumps(evidence["review_execution"]).lower())
 
-    def test_incomplete_review_cannot_be_approved(self):
+    def test_approved_review_with_empty_findings_is_valid(self):
         cycle = reserve_review_round(self.cycle(), target_revision_id=REVISION_1)
         report = self.report(cycle)
-        report["review_completion"] = "incomplete"
-        report["scope_completion_attested"] = False
-        report["mandatory_checks_remaining"] = ["Acceptance criterion AC-1 not checked."]
+        result = run_claude_review(
+            self.request(cycle), aily_executable=self.fake_aily,
+            process_runner=self.mocked_runner(self.envelope(report)),
+        )
+        self.assertTrue(result["report_valid"], result.get("error"))
+        self.assertEqual(result["report"], {"decision": "APPROVED", "summary": report["summary"], "findings": []})
+
+    def test_invalid_decisions_fail_with_field_specific_diagnostics(self):
+        cycle = reserve_review_round(self.cycle(), target_revision_id=REVISION_1)
+        for decision in ("BLOCKED", [], None):
+            report = self.report(cycle)
+            report["decision"] = decision
+            result = run_claude_review(
+                self.request(cycle), aily_executable=self.fake_aily,
+                process_runner=self.mocked_runner(self.envelope(report)),
+            )
+            self.assertEqual(result["failure_kind"], "invalid_reviewer_report")
+            self.assertIn("decision must be APPROVED or CHANGES_REQUESTED", result["validation_errors"])
+
+    def test_malformed_findings_fail_with_exact_field_diagnostic(self):
+        cycle = reserve_review_round(self.cycle(), target_revision_id=REVISION_1)
+        report = self.report(cycle, [self.finding()])
+        report["findings"][0].pop("recommendation")
         result = run_claude_review(
             self.request(cycle), aily_executable=self.fake_aily,
             process_runner=self.mocked_runner(self.envelope(report)),
         )
         self.assertEqual(result["failure_kind"], "invalid_reviewer_report")
-        self.assertFalse(result["report_valid"])
+        self.assertIn("findings[0] missing required field: recommendation", result["validation_errors"])
 
-    def test_malformed_enum_values_fail_closed_without_exception(self):
+    def test_finding_outside_assigned_scope_is_rejected(self):
         cycle = reserve_review_round(self.cycle(), target_revision_id=REVISION_1)
-        report = self.report(cycle)
-        report["status"] = ["APPROVED"]
-        result = run_claude_review(
-            self.request(cycle), aily_executable=self.fake_aily,
-            process_runner=self.mocked_runner(self.envelope(report)),
-        )
-        self.assertEqual(result["failure_kind"], "invalid_reviewer_report")
-        self.assertFalse(result["report_valid"])
-
-    def test_criterion_coverage_must_be_complete_and_evidence_backed(self):
-        cycle = reserve_review_round(self.cycle(), target_revision_id=REVISION_1)
-        report = self.report(cycle)
-        report["criterion_coverage"].pop()
-        result = run_claude_review(
-            self.request(cycle), aily_executable=self.fake_aily,
-            process_runner=self.mocked_runner(self.envelope(report)),
-        )
-        self.assertEqual(result["failure_kind"], "invalid_reviewer_report")
-
-    def test_finding_must_reference_supplied_evidence_or_assigned_diff(self):
-        cycle = reserve_review_round(self.cycle(), target_revision_id=REVISION_1)
-        finding = self.finding()
-        finding["evidence_references"] = ["EV-NOT-IN-REQUEST"]
+        finding = self.finding(file="outside/app.py")
         result = run_claude_review(
             self.request(cycle), aily_executable=self.fake_aily,
             process_runner=self.mocked_runner(self.envelope(self.report(cycle, [finding]))),
@@ -990,13 +1073,15 @@ class ClaudeReviewerTests(unittest.TestCase):
         runner.assert_not_called()
 
         cycle = reserve_review_round(self.cycle(), target_revision_id=REVISION_1)
-        report = self.report(cycle, revision=REVISION_2)
+        report = self.report(cycle)
+        report["target_revision_id"] = REVISION_2
         result = run_claude_review(
             self.request(cycle), aily_executable=self.fake_aily,
             process_runner=self.mocked_runner(self.envelope(report)),
         )
         self.assertEqual(result["failure_kind"], "invalid_reviewer_report")
         self.assertFalse(result["report_valid"])
+        self.assertIn("unsupported report field: target_revision_id", result["validation_errors"])
 
     def test_external_authorization_requires_exact_live_workflow_scope(self):
         cases = (
@@ -1127,6 +1212,11 @@ class ClaudeReviewerTests(unittest.TestCase):
         blocked = apply_review_cycle_to_workflow_state(pending, blocked_cycle, recorded_at="2026-11-06T12:01:00Z")
         self.assertEqual(blocked["status"], "BLOCKED")
         self.assertEqual(blocked["blocker"]["affected_phase"], "INDEPENDENT_VERIFICATION")
+        rejected_cycle = dict(cycle, status="review_rejected", human_escalation=False)
+        rejected = apply_review_cycle_to_workflow_state(pending, rejected_cycle, recorded_at="2026-11-06T12:01:30Z")
+        self.assertEqual(rejected["status"], "BLOCKED")
+        self.assertIn("valid report", rejected["blocker"]["reason"])
+        self.assertIn("explicitly authorized recovery", rejected["blocker"]["safe_recovery_path"])
         complete = dict(cycle, status="complete", human_escalation=False)
         gate_ready = apply_review_cycle_to_workflow_state(pending, complete, recorded_at="2026-11-06T12:02:00Z")
         self.assertEqual(gate_ready["phase"], "VERIFICATION_GATE")
