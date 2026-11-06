@@ -954,7 +954,7 @@ class Preflight:
             self.add("scope.validation", "PASS", "Configured paths are normalized and contained; classifications are disjoint, exclusions deny descendant writes, and revision paths are authorized.",
                      evidence=scopes,
                      limitations=["An empty included_paths list authorizes zero writes.",
-                                  "Preflight validates a scope description; a future writer must re-resolve and safely bind every write to verified filesystem handles."])
+                                  "Preflight remains read-only; safe_writer.py re-runs preflight and binds its own writes to verified filesystem handles."])
         except (OSError, PreflightError) as exc:
             self.add("scope.validation", "FAIL", str(exc), evidence={"config_keys": sorted(self.config.keys())})
 
@@ -1140,7 +1140,7 @@ class Preflight:
                  limitations=(["VCS metadata, dependency, and generated-build directories were excluded; configured scope paths are checked separately."] + (["The list is capped at 500 entries."] if len(symlinks) > 500 else []) + scan_limits + ([f"Some entries could not be inspected: {errors[:20]}"] if errors else [])))
         self.add("filesystem.hardlinks", fs_status, "Existing regular files with link count greater than one were inventoried outside excluded VCS, dependency, and generated-build directories.",
                  evidence={"count": len(hardlinks), "entries": hardlinks[:500]},
-                 limitations=["VCS metadata, dependency, and generated-build directories were excluded; configured scope paths are checked separately.", "This is observation only. A future writer must recheck file identity/link count and must reject mutation of multiply linked files."] + (["The list is capped at 500 entries."] if len(hardlinks) > 500 else []) + scan_limits + ([f"Some entries could not be inspected: {errors[:20]}"] if errors else []))
+                 limitations=["VCS metadata, dependency, and generated-build directories were excluded; configured scope paths are checked separately.", "This is observation only. safe_writer.py rechecks file identity/link count and rejects mutation of multiply linked files."] + (["The list is capped at 500 entries."] if len(hardlinks) > 500 else []) + scan_limits + ([f"Some entries could not be inspected: {errors[:20]}"] if errors else []))
 
     def run(self) -> dict[str, Any]:
         self.load_config()

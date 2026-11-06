@@ -367,7 +367,7 @@ class PreflightTests(unittest.TestCase):
         row = next(row for row in report["checks"] if row["check_id"] == "filesystem.hardlinks")
         self.assertEqual(row["status"], "PASS")
         self.assertGreaterEqual(row["evidence"]["count"], 2)
-        self.assertIn("future writer", " ".join(row["limitations"]))
+        self.assertIn("safe_writer.py", " ".join(row["limitations"]))
 
     def test_missing_instructions_and_skills_are_not_errors(self):
         _, report = self.invoke()
