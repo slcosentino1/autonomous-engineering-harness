@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -21,7 +21,10 @@ from claude_reviewer import (  # noqa: E402
     _extract_report_diagnostics,
     _capture_diff,
     _authorized_review_paths,
+    _aily_read_only_command,
     _git_environment,
+    _parse_usd_limit,
+    _recorded_review_spend,
     _read_context,
     _read_verified_evidence_artifacts,
     _review_manifest,
@@ -325,6 +328,46 @@ class ClaudeReviewerTests(unittest.TestCase):
         self.assertEqual(result["report"]["decision"], "APPROVED")
         self.assertEqual(set(result["report"]), {"decision", "summary", "findings"})
         self.assertEqual(result["process"]["reviewer_session_identity"], "claude-session-1")
+
+    def test_total_claude_budget_is_parsed_and_remaining_cost_is_aggregated(self):
+        self.assertEqual(_parse_usd_limit("USD 2.00 total for this workflow"), 2.0)
+        spent, known = _recorded_review_spend({
+            "claude_review_cycles": [{"rounds": [{"invocation_attempts": [
+                {"response_metadata": {"cost_usd": 0.63}},
+                {"response_metadata": {"cost_usd": 0.12}},
+            ]}]}]
+        })
+        self.assertEqual(spent, 0.75)
+        self.assertTrue(known)
+        unknown_spent, known = _recorded_review_spend({
+            "claude_review_cycles": [{"rounds": [{"invocation_attempts": [
+                {"response_metadata": {}},
+            ]}]}]
+        })
+        self.assertEqual(unknown_spent, 0.0)
+        self.assertFalse(known)
+
+    def test_aily_invocation_accepts_a_hard_per_invocation_budget(self):
+        command = _aily_read_only_command("/usr/bin/aily", "review prompt", 1.25)
+        index = command.index("--max-budget-usd")
+        self.assertEqual(command[index + 1], "1.25")
+
+    def test_request_uses_lower_of_user_budget_and_authorized_cost_limit(self):
+        cycle = reserve_review_round(self.cycle(), target_revision_id=REVISION_1)
+        request = self.request(cycle)
+        request["max_budget_usd"] = 2.0
+        with patch.dict(os.environ, {"HARNESS_CLAUDE_TOTAL_BUDGET_USD": "0.75"}):
+            validated, _, _ = _validate_request(request)
+        self.assertEqual(validated["_aily_max_budget_usd"], 0.75)
+
+    def test_workflow_round_persists_review_cost_and_token_metadata(self):
+        reserved = reserve_review_round(self.cycle(), target_revision_id=REVISION_1)
+        cycle, result, state = self.invoke_cycle(reserved, self.report(reserved), "budget-review.json")
+        self.assertEqual(result["process"]["cost_usd"], 0.0123)
+        self.assertEqual(result["process"]["usage"], {"input_tokens": 123, "output_tokens": 45})
+        metadata = cycle["rounds"][0]["invocation_attempts"][0]["response_metadata"]
+        self.assertEqual(metadata["cost_usd"], 0.0123)
+        self.assertEqual(metadata["usage"]["input_tokens"], 123)
         persisted_round = json.loads((self.workflow_dir / "workflow-state.json").read_text(encoding="utf-8"))["claude_review_cycles"][0]["rounds"][0]
         persisted_state = json.loads((self.workflow_dir / "workflow-state.json").read_text(encoding="utf-8"))
         persisted_auth = persisted_state["authorizations"][0]

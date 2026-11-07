@@ -14,6 +14,7 @@ import argparse
 import copy
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -545,12 +546,12 @@ def record_review_result(cycle: dict[str, Any], result: dict[str, Any], *,
         "process_exit_code": process.get("exit_code"),
         "failure_kind": result.get("failure_kind"),
         "evidence_reference": evidence_reference,
+        "response_metadata": copy.deepcopy(response_metadata),
     }
     if not report_valid:
         attempt_record.update({
             "diagnostic": diagnostic,
             "validation_errors": validation_errors,
-            "response_metadata": copy.deepcopy(response_metadata),
         })
     invocation_attempts.append(attempt_record)
     round_record["invocation_attempted_at"] = attempted_at
@@ -564,12 +565,12 @@ def record_review_result(cycle: dict[str, Any], result: dict[str, Any], *,
         "report_valid": bool(result.get("report_valid")),
         "failure_kind": result.get("failure_kind"),
         "evidence_reference": evidence_reference,
+        "response_metadata": copy.deepcopy(response_metadata),
     })
     if not report_valid:
         round_record.update({
             "diagnostic": diagnostic,
             "validation_errors": validation_errors,
-            "response_metadata": copy.deepcopy(response_metadata),
         })
     report = result.get("report") if result.get("report_valid") else None
     if report is None:
@@ -849,6 +850,22 @@ def _validate_request(request: Any) -> tuple[dict[str, Any], Path, dict[str, str
             operation_effects.get("may_incur_cost") is not True or
             not isinstance(operation_effects.get("cost_limit"), str) or not operation_effects["cost_limit"].strip()):
         raise ReviewError("Authorization must prohibit remote mutation and explicitly authorize possible cost with a recorded limit")
+    budget_values: list[float] = []
+    requested_budget = request.get("max_budget_usd")
+    if requested_budget is not None:
+        if (isinstance(requested_budget, bool) or not isinstance(requested_budget, (int, float)) or
+                not math.isfinite(float(requested_budget)) or requested_budget <= 0):
+            raise ReviewError("max_budget_usd must be a finite positive number")
+        budget_values.append(float(requested_budget))
+    environment_budget = os.environ.get("HARNESS_CLAUDE_TOTAL_BUDGET_USD")
+    if environment_budget is not None:
+        try:
+            env_amount = float(environment_budget)
+        except ValueError as exc:
+            raise ReviewError("HARNESS_CLAUDE_TOTAL_BUDGET_USD must be a finite positive number") from exc
+        if not math.isfinite(env_amount) or env_amount <= 0:
+            raise ReviewError("HARNESS_CLAUDE_TOTAL_BUDGET_USD must be a finite positive number")
+        budget_values.append(env_amount)
     for field in ("task", "target_id", "workflow_id", "increment_id", "assignment_reference", "review_id", "reviewer_role",
                   "reviewer_contract_reference", "reviewer_contract"):
         if not isinstance(request[field], str) or not request[field].strip():
@@ -974,7 +991,19 @@ def _validate_request(request: Any) -> tuple[dict[str, Any], Path, dict[str, str
         raise ReviewError("Authorization permitted_paths must exactly name every file sent from this target/workflow")
     request["authorized_input_paths"] = permitted_paths
     request["changed_paths"] = changed_paths
-    _validate_persisted_workflow(request, target, cycle, authorization)
+    _state_path, _workflow_dir, persisted_state = _validate_persisted_workflow(
+        request, target, cycle, authorization
+    )
+    if budget_values:
+        authorized_limit = _parse_usd_limit(operation_effects["cost_limit"])
+        total_limit = min([authorized_limit, *budget_values])
+        spent, known_spend = _recorded_review_spend(persisted_state)
+        if not known_spend:
+            raise ReviewError("Cannot enforce the remaining Claude budget because a prior invocation has no recorded cost")
+        remaining = total_limit - spent
+        if remaining <= 0:
+            raise ReviewError("The authorized total Claude budget has been exhausted")
+        request["_aily_max_budget_usd"] = remaining
     _read_verified_evidence_artifacts(request, target)
     return request, target, env
 
@@ -1067,7 +1096,7 @@ def _load_json_file(path: Path, description: str) -> dict[str, Any]:
 
 
 def _validate_persisted_workflow(request: dict[str, Any], target: Path,
-                                 cycle: dict[str, Any], authorization: dict[str, Any]) -> tuple[Path, Path]:
+                                 cycle: dict[str, Any], authorization: dict[str, Any]) -> tuple[Path, Path, dict[str, Any]]:
     state_relative = _safe_relative_path(request["workflow_state_path"], "workflow_state_path")
     states_root_relative = _safe_relative_path(request["workflow_states_root"], "workflow_states_root")
     state_path = _safe_target_file(target, state_relative)
@@ -1152,7 +1181,7 @@ def _validate_persisted_workflow(request: dict[str, Any], target: Path,
             raise ReviewError("Prior workflow has malformed Claude review history")
         if any(_cycle_has_review_history(item) for item in prior_cycles):
             raise ReviewError("A Claude review cycle already consumed rounds for this target increment in another workflow")
-    return state_path, workflow_dir
+    return state_path, workflow_dir, state
 
 
 def _claim_round_attempt(state_path: Path, cycle_id: str, round_number: int,
@@ -1718,6 +1747,46 @@ def _redact_diagnostic(text: str) -> str:
     return result[:1200]
 
 
+def _parse_usd_limit(value: Any) -> float:
+    if not isinstance(value, str):
+        raise ReviewError("A numeric USD authorization limit is required to enforce the review budget")
+    match = re.search(r"(?i)\bUSD\s*([0-9]+(?:\.[0-9]{1,2})?)\b", value)
+    if not match:
+        raise ReviewError("The external authorization cost_limit must contain a numeric USD amount")
+    amount = float(match.group(1))
+    if not math.isfinite(amount) or amount <= 0:
+        raise ReviewError("The authorized USD amount must be greater than zero")
+    return amount
+
+
+def _recorded_review_spend(state: dict[str, Any]) -> tuple[float, bool]:
+    """Return known Aily costs and whether every prior attempted invocation is priced."""
+    total = 0.0
+    known = True
+    for cycle in state.get("claude_review_cycles", []):
+        if not isinstance(cycle, dict):
+            known = False
+            continue
+        for round_record in cycle.get("rounds", []):
+            if not isinstance(round_record, dict):
+                known = False
+                continue
+            attempts = round_record.get("invocation_attempts", [])
+            if not isinstance(attempts, list):
+                known = False
+                continue
+            for attempt in attempts:
+                metadata = attempt.get("response_metadata") if isinstance(attempt, dict) else None
+                cost = metadata.get("cost_usd") if isinstance(metadata, dict) else None
+                if isinstance(cost, (int, float)) and not isinstance(cost, bool) and math.isfinite(float(cost)) and cost >= 0:
+                    total += float(cost)
+                else:
+                    known = False
+            if round_record.get("invocation_attempted_at") and not attempts:
+                known = False
+    return total, known
+
+
 def _looks_like_auth_failure(text: str) -> bool:
     return bool(re.search(
         r"(?i)(authentication failed|unauthorized|not authenticated|login required|please log in|invalid api key|401 unauthorized|403 forbidden)",
@@ -1729,9 +1798,10 @@ def _contains_secret(text: str) -> bool:
     return any(pattern.search(text) for pattern in SECRET_PATTERNS)
 
 
-def _aily_read_only_command(aily_executable: str, prompt: str) -> list[str]:
+def _aily_read_only_command(aily_executable: str, prompt: str,
+                            max_budget_usd: float | None = None) -> list[str]:
     """Use Claude's restricted read-only file tools with MCP configuration disabled."""
-    return [
+    command = [
         aily_executable, "claude", "-p", prompt,
         "--output-format", "json",
         "--no-session-persistence",
@@ -1742,6 +1812,9 @@ def _aily_read_only_command(aily_executable: str, prompt: str) -> list[str]:
         "--strict-mcp-config",
         "--disable-slash-commands",
     ]
+    if max_budget_usd is not None:
+        command.extend(["--max-budget-usd", f"{max_budget_usd:.2f}"])
+    return command
 
 
 def run_aily_connection_check(*, aily_executable: str = AILY_EXECUTABLE,
@@ -1848,6 +1921,8 @@ def run_claude_review(request: dict[str, Any], *, aily_executable: str = AILY_EX
     }
     try:
         request, target, git_env = _validate_request(request)
+        if request.get("_aily_max_budget_usd") is not None:
+            metadata["command_template"] += " --max-budget-usd <remaining-total-budget>"
         metadata["review_cycle_id"] = request["review_cycle"]["cycle_id"]
         metadata["review_round"] = request["review_cycle"]["rounds"][-1]["round_number"]
         metadata["review_id"] = request["review_id"]
@@ -1899,7 +1974,9 @@ def run_claude_review(request: dict[str, Any], *, aily_executable: str = AILY_EX
         if _contains_secret(prompt):
             raise ReviewError("Sensitive credential-like content detected in the review packet; invocation refused")
         metadata["prompt_sha256"] = _sha256(prompt.encode("utf-8"))
-        command = _aily_read_only_command(aily_executable, prompt)
+        command = _aily_read_only_command(
+            aily_executable, prompt, request.get("_aily_max_budget_usd")
+        )
         process_env = os.environ.copy()
         process_env["UV_OFFLINE"] = "1"
         snapshot_files = _snapshot_files(

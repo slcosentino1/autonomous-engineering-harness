@@ -2,11 +2,19 @@
 
 ## Operating contract
 
-This is the operating contract for the primary Codex session; it is not an executable runner. Start an assignment with `harness/prompts/06-autonomous-single-agent.md`, the task, and an explicit absolute `target_path`. The target path is never inferred from the harness working directory. The default policy is `harness/config/verification-policy.yaml`; a target may add stricter rules but cannot widen its authorization boundaries. The primary session owns all authorized lifecycle phases and increments and does not pause for routine implementation choices.
+This is the operating contract for the primary Codex session. `harness/runner.py` is the shell entrypoint: it runs read-only preflight, starts one ephemeral `codex exec` session with Prompt 06 and the policy, and verifies target-local completion state before returning success. Codex remains the phase orchestrator and the target workflow state remains the resume record. The launcher does not implement stage-by-stage transitions or a cross-record policy evaluator. The target path is always explicit and is never inferred from the harness working directory. The default policy is `harness/config/verification-policy.yaml`; a target may add stricter rules but cannot widen its authorization boundaries.
 
 ## Start a new task with Codex
 
-Start Codex with this harness repository's `AGENTS.md` instructions in scope. Use [`harness/prompts/06-autonomous-single-agent.md`](../harness/prompts/06-autonomous-single-agent.md) as the exact top-level operating prompt, then provide a completed copy of this task template. The harness has no general execution command or autonomous runner; the primary Codex session performs the documented phases using the existing project tools.
+From a shell, submit a task and absolute target path with:
+
+```sh
+python3 /absolute/path/to/autonomous-engineering-harness/harness/runner.py \
+  --target /absolute/path/to/target-repository \
+  --task-file /absolute/path/to/task.md
+```
+
+The runner derives a stable workflow ID from the canonical target and task text. Re-run the same command after interruption to let Codex resume from target-local state; use `--workflow-id` to select an existing workflow explicitly. The runner requires an authenticated local Codex CLI. For an already active Codex session, use [`harness/prompts/06-autonomous-single-agent.md`](../harness/prompts/06-autonomous-single-agent.md) directly and provide the same task template. The primary Codex session performs the documented phases using the existing project tools.
 
 ```text
 Target repository root (absolute path):
@@ -105,7 +113,7 @@ The operational statuses are `ACTIVE`, `WAITING_FOR_HUMAN`, `BLOCKED`, and `COMP
 
 ### Policy-required independent review and gate authority
 
-When the policy requires independent review, self-review is additional evidence only. Native subagents and `codex exec` are not required workflow dependencies. For a Medium-risk review, `harness/claude_reviewer.py` may invoke a separate read-only Claude session through Aily. Its report is a reviewer recommendation, never a gate decision.
+When the policy requires independent review, self-review is additional evidence only. The runner's `codex exec` child is the primary implementation session, not an independent reviewer. Native subagents are not required. For a Medium-risk review, `harness/claude_reviewer.py` may invoke a separate read-only Claude session through Aily. Its report is a reviewer recommendation, never a gate decision.
 
 Before invocation, the workflow state must contain a human `contact_external_services` authorization that names the exact target ID, workflow ID, Claude through Aily, concrete permitted file paths, and permitted data categories. It must include an expiry, revocation state, limits, no remote mutation, and explicit permission for possible provider costs with an approved limit. An explicit user task prompt is a valid authorization source when it states those terms; persist its exact reference, authorizer attribution, and the actual identity assurance available. If the runtime does not expose the user's authenticated identity or session ID, record the authorizer as declared and leave unavailable session/authentication references null. The primary Codex session records its own declared workflow-owner attribution and verifies that the persisted authorization matches the explicit task source and exact scope fingerprint. This is a traceable workflow attestation, not cryptographic proof or an identity-provider check. It makes the user's explicit operation authorization actionable without claiming stronger identity assurance. It does not satisfy any policy requirement for externally authenticated human review, risk acceptance, or gate approval. An ordinary engineering assignment without explicit external-transmission terms is never authorization.
 

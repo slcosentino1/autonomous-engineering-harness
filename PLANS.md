@@ -2,7 +2,7 @@
 
 ## Current status
 
-**Codex single-session workflow, read-only preflight, and bounded Claude reviewer adapter implemented.** One primary Codex session owns orchestration and product changes. The Aily adapter can perform a policy-required Medium-risk read-only review after target-specific external-service authorization; it does not approve gates or replace High-risk human reviewers. The workflow remains instruction-driven, not a general orchestrator: there is no state store, write broker, identity provider, cross-record evaluator, or automatic gate evaluator. Self-review is not independent review or approval.
+**Codex task launcher, single-session operating procedure, read-only preflight, and bounded Claude reviewer adapter implemented; full autonomous completion remains blocked.** The launcher starts one primary Codex CLI session and checks target workflow completion state. Codex still interprets lifecycle transitions; the runner is not a stage engine or automatic cross-record gate evaluator. In the isolated demo, Codex implemented a Python function, wrote focused tests and documentation, ran 3 passing tests, performed self-review, and recorded READY scoped preflight evidence. The integrated Aily call then failed before returning a Claude report because its wrapper could not create a temporary file under `~/.cache/uv`; workflow state remains `BLOCKED` at `INDEPENDENT_VERIFICATION`. No gate approval, commit, or PR was recorded. The Aily attempt has no model, token, or cost metadata, so aggregate spend cannot be established and no retry was made. The earlier standalone CLI probe with user config ignored returned 401; the final task launcher succeeded after normal local filesystem permission escalation.
 
 ## Roadmap
 
@@ -25,12 +25,14 @@
 - Define a target-local default workflow-state location without replacing target conventions or creating a custom state engine.
 - Keep approval and external-operation boundaries from the existing policy.
 
-### 4. Executable single-agent workflow orchestration — planned
+### 4. Executable single-agent workflow orchestration — partial; E2E blocked
 
-- Implement invocation, target resolution, state persistence, and scoped access using the documented contracts in `docs/workflow.md` and `harness/config/verification-policy.yaml` only if a future task authorizes an execution component.
+- `harness/runner.py` implements explicit-target preflight, one ephemeral Codex CLI invocation, resume ID selection, and a fail-closed final workflow-state check.
+- Still required: runner-managed stage transitions and durable state updates, technically scoped write access beyond the target-root CLI sandbox, and a successful real Codex → validation → Aily/Claude → correction → gate demonstration.
 - Automate evidence collection and selected policy checks only after the manual workflow is stable.
 - Enforce command execution, working directory, approvals, and failure handling against the documented contracts.
-- No custom execution engine or orchestration framework is part of the current operating-procedure increment.
+- An earlier standalone CLI probe failed before task execution with an API `401 Unauthorized` due to a missing bearer credential; a later runner invocation did start Codex after normal local filesystem permission escalation and reached the Aily cache-write failure described above. Do not mark this roadmap item complete until the real E2E succeeds and the remaining authority boundaries are preserved.
+- No custom execution framework was introduced.
 
 ### 5. Bounded Claude reviewer integration — complete
 
