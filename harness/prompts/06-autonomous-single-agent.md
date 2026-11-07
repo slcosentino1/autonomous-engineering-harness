@@ -1,5 +1,7 @@
 # Autonomous Single-Agent Operating Prompt
 
+This prompt defines the **direct interactive Codex mode**. For shell-controlled execution, use [`harness/orchestrator.py`](../orchestrator.py) and [`docs/orchestrator.md`](../../docs/orchestrator.md): the controller owns transitions and each ephemeral Codex process performs only its assigned bounded stage. A Codex child must return the requested structured result and must not take over orchestration or write target files directly.
+
 Use this as the top-level instruction for a complete assignment. The user supplies:
 
 - The task or desired outcome.

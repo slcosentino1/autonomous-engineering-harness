@@ -4,7 +4,7 @@ Repository: `autonomous-engineering-harness`
 
 A reusable foundation for working through software assignments in an existing or new target repository. It defines an evidence-based engineering lifecycle, review contracts, quality gates, reusable project-document templates, and a read-only target preflight CLI. It is designed to be language- and architecture-neutral.
 
-The current release provides an **executable Codex task launcher, the single-session operating procedure, a read-only target preflight CLI, and a bounded Claude-through-Aily reviewer adapter**. The launcher runs one primary `codex exec` session with Prompt 06 and the immutable policy, and checks that the target records a completed `APPROVE` gate before returning success. Codex still performs the lifecycle phases and persists target workflow state; the launcher is not a stage-by-stage execution engine, scoped write broker, or automatic policy evaluator. The adapter can support policy-required Medium-risk read-only review after target-specific external-service authorization has been verified. Self-review and reviewer recommendations are not gate approval. High-risk human review and approval authorities remain required; unavailable reviewers or gate authorities leave the workflow incomplete or blocked.
+The current release provides an **explicit stage controller, a single-session Codex launcher, a read-only target preflight CLI, a scope-checked safe writer, and a bounded Claude-through-Aily reviewer adapter**. `harness/orchestrator.py` controls planning, implementation, configured validations, Claude review, correction, revalidation, and target-local workflow state. Codex child sessions are read-only and return structured file changes; the controller applies them through `safe_writer.py`. `harness/runner.py` remains a simpler single-session launcher and does not control individual stages. Neither entrypoint implements the complete cross-record verification gate evaluator or a commit authorization workflow. High-risk tasks stop at `WAITING_FOR_HUMAN` until the policy-required authenticated human reviewer and distinct final gate approver are recorded. The controller does not stage, commit, push, merge, publish, or create PRs.
 
 ## Repository boundary
 
@@ -32,7 +32,7 @@ flowchart LR
 ## Start here
 
 1. Start a Codex session with this repository's `AGENTS.md` instructions available. Give Codex the task and the **absolute repository-root path** of the target. If the target path is missing or ambiguous, Codex must ask for it; it never guesses from the harness working directory.
-2. Start a task from a shell with the executable entrypoint below. It requires an authenticated local Codex CLI. The runner performs read-only preflight, starts one ephemeral Codex session in the target-root `workspace-write` sandbox, supplies Prompt 06 and the policy, and validates the final target workflow-state gate. Codex remains the phase orchestrator; use Prompt 06 directly when already working in a primary Codex session.
+2. For automatic stage control, start the task with `harness/orchestrator.py` using an absolute target, exact branch, task file, and a configuration containing inspected validation commands. The controller launches Codex using `--sandbox read-only` for each plan, implementation, and correction stage; the outer controller is the only process that writes target files, using `safe_writer.py`. See [the orchestrator guide](docs/orchestrator.md) for the full command and configuration. For the older single-session flow, use `harness/runner.py` below. Use Prompt 06 directly when working in an interactive Codex session without the stage controller.
 
 ```sh
 python3 /absolute/path/to/autonomous-engineering-harness/harness/runner.py \
@@ -56,8 +56,9 @@ See the [workflow guide](docs/workflow.md), [engineering lifecycle](harness/work
 - `harness/prompts/`: phase prompts `00`–`05` and canonical top-level single-agent entrypoint `06`.
 - `harness/verification/`: reviewer contracts and evidence rules.
 - `harness/gates/`: stage-gate policy.
-- `harness/schemas/`: JSON Schema contracts for workflow state, traceability, evidence, findings, and gate decisions.
+- `harness/schemas/`: JSON Schema contracts for workflow state, orchestrator plans/results/configuration, traceability, evidence, findings, and gate decisions.
 - `harness/preflight.py`: dependency-free read-only target identity, isolation, state, instruction, scope, and filesystem inspection.
+- `harness/orchestrator.py`: bounded stage controller for plan, implement, validate, Claude review, correction, revalidation, and target-local workflow state.
 - `harness/runner.py`: explicit-target Codex CLI launcher with preflight and final-gate completion checks.
 - `harness/safe_writer.py`: narrow scope-checked target directory creation and file creation/replacement helper; re-runs preflight and emits JSON operation evidence under the documented single-writer assumption.
 - `harness/claude_reviewer.py`: bounded Aily/Claude read-only review invocation, evidence and manifest validation, one-shot persisted two-round enforcement, isolated snapshot, report validation, and review-evidence mapping. Explicit user authorization can be persisted with declared identity assurance when external identity is unavailable.
@@ -65,6 +66,7 @@ See the [workflow guide](docs/workflow.md), [engineering lifecycle](harness/work
 - `harness/config/`: default verification policy.
 - `harness/templates/`: starting points for target-repository documents.
 - `docs/`: architecture, workflow, decisions, and generalized lessons.
+- `docs/orchestrator.md`: stage-controller CLI, config, resume, and approval boundaries.
 
 ## Read-only target preflight
 

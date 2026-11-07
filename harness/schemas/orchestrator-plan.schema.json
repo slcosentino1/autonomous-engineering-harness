@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/autonomous-engineering-harness/orchestrator-plan.schema.json",
+  "title": "Codex orchestration plan response",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["decision", "summary", "requirements", "acceptance_criteria", "risk_band", "architecture_context", "documentation_context", "capabilities_used", "increments"],
+  "properties": {
+    "decision": {"enum": ["READY", "NEEDS_HUMAN_INPUT"]},
+    "summary": {"type": "string", "minLength": 1},
+    "requirements": {"type": "array", "items": {"$ref": "#/$defs/sourceRecord"}},
+    "acceptance_criteria": {"type": "array", "items": {"$ref": "#/$defs/sourceRecord"}},
+    "risk_band": {"enum": ["low", "medium", "high"]},
+    "architecture_context": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "documentation_context": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "capabilities_used": {"type": "array", "items": {"$ref": "#/$defs/capability"}},
+    "increments": {"type": "array", "items": {"$ref": "#/$defs/increment"}}
+  },
+  "$defs": {
+    "sourceRecord": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "text", "source"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "text": {"type": "string", "minLength": 1},
+        "source": {"type": "string", "minLength": 1}
+      }
+    },
+    "increment": {
+      "type": "object", "additionalProperties": false,
+      "required": ["increment_id", "title", "code_paths", "artifact_paths", "revision_paths", "acceptance_criteria_ids", "validation_ids"],
+      "properties": {
+        "increment_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"},
+        "title": {"type": "string", "minLength": 1},
+        "code_paths": {"$ref": "#/$defs/paths"},
+        "artifact_paths": {"$ref": "#/$defs/paths"},
+        "revision_paths": {"$ref": "#/$defs/paths"},
+        "acceptance_criteria_ids": {"$ref": "#/$defs/ids"},
+        "validation_ids": {"$ref": "#/$defs/ids"}
+      }
+    },
+    "paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "capability": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "kind", "source_reference", "phases", "use_rationale"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "kind": {"enum": ["skill", "agent_instruction", "tool_guidance", "workflow"]},
+        "source_reference": {"type": "string", "minLength": 1},
+        "phases": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["DISCOVERY", "REQUIREMENTS", "ARCHITECTURE", "PLANNING", "IMPLEMENTATION", "TESTING", "INDEPENDENT_VERIFICATION", "CORRECTION", "VERIFICATION_GATE", "COMMIT", "NEXT_INCREMENT"]}},
+        "use_rationale": {"type": "string", "minLength": 1},
+        "limitations": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"decision": {"const": "READY"}}, "required": ["decision"]},
+      "then": {"properties": {"requirements": {"minItems": 1}, "acceptance_criteria": {"minItems": 1}, "increments": {"minItems": 1}}}
+    }
+  ]
+}

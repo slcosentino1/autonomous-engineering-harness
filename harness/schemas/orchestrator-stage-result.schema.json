@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/autonomous-engineering-harness/orchestrator-stage-result.schema.json",
+  "title": "Codex orchestration stage response",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "summary", "changes"],
+  "properties": {
+    "status": {"enum": ["COMPLETED", "BLOCKED"]},
+    "summary": {"type": "string", "minLength": 1},
+    "changes": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["path", "content"],
+        "properties": {
+          "path": {"type": "string", "minLength": 1},
+          "content": {"type": "string"}
+        }
+      }
+    },
+    "finding_decisions": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["finding_id", "decision", "reason", "evidence_references"],
+        "properties": {
+          "finding_id": {"type": "string", "minLength": 1},
+          "decision": {"enum": ["ACCEPT", "REJECT", "DEFER"]},
+          "reason": {"type": "string", "minLength": 1},
+          "evidence_references": {"type": "array", "items": {"type": "string", "minLength": 1}}
+        }
+      }
+    }
+  }
+}

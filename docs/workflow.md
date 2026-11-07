@@ -2,11 +2,22 @@
 
 ## Operating contract
 
-This is the operating contract for the primary Codex session. `harness/runner.py` is the shell entrypoint: it runs read-only preflight, starts one ephemeral `codex exec` session with Prompt 06 and the policy, and verifies target-local completion state before returning success. Codex remains the phase orchestrator and the target workflow state remains the resume record. The launcher does not implement stage-by-stage transitions or a cross-record policy evaluator. The target path is always explicit and is never inferred from the harness working directory. The default policy is `harness/config/verification-policy.yaml`; a target may add stricter rules but cannot widen its authorization boundaries.
+This guide supports two execution modes. `harness/orchestrator.py` is the automatic stage controller: it runs preflight, records target-local workflow state, starts bounded read-only Codex stages, runs configured validations, invokes Claude through the adapter, and loops through corrections. `harness/runner.py` remains a single-session Codex launcher and does not control individual stages. Neither entrypoint implements the complete cross-record gate evaluator. The target path is always explicit and is never inferred from the harness working directory. The default policy is `harness/config/verification-policy.yaml`; a target may add stricter rules but cannot widen its authorization boundaries.
 
 ## Start a new task with Codex
 
-From a shell, submit a task and absolute target path with:
+For automatic stage control, use the orchestrator CLI with an absolute target, exact existing branch, task file, and validation configuration:
+
+```sh
+python3 /absolute/path/to/autonomous-engineering-harness/harness/orchestrator.py \
+  --target /absolute/path/to/target-repository \
+  --branch existing-branch \
+  --task-file /absolute/path/to/task.md \
+  --config /absolute/path/to/workflow-config.json \
+  --workflow-id stable-task-id
+```
+
+See [the orchestrator guide](orchestrator.md) for config fields, supported stage behavior, resume rules, and approval limits. Re-run with the same target, branch, task text, and workflow ID to resume. For the older single-session runner, use:
 
 ```sh
 python3 /absolute/path/to/autonomous-engineering-harness/harness/runner.py \
@@ -14,7 +25,7 @@ python3 /absolute/path/to/autonomous-engineering-harness/harness/runner.py \
   --task-file /absolute/path/to/task.md
 ```
 
-The runner derives a stable workflow ID from the canonical target and task text. Re-run the same command after interruption to let Codex resume from target-local state; use `--workflow-id` to select an existing workflow explicitly. The runner requires an authenticated local Codex CLI. For an already active Codex session, use [`harness/prompts/06-autonomous-single-agent.md`](../harness/prompts/06-autonomous-single-agent.md) directly and provide the same task template. The primary Codex session performs the documented phases using the existing project tools.
+The runner derives a stable workflow ID from the canonical target and task text. It requires an authenticated local Codex CLI and checks final target state, but stage transitions remain in that Codex session. For an already active Codex session, use [`harness/prompts/06-autonomous-single-agent.md`](../harness/prompts/06-autonomous-single-agent.md) directly and provide the same task template.
 
 ```text
 Target repository root (absolute path):
@@ -42,11 +53,11 @@ Completion:
 Continue through all authorized increments, verification, correction loops, documentation updates, and closeout without routine check-ins. Ask only for material product ambiguity, a decision or operation requiring human authorization, a policy-required human review/approval, or a blocker that cannot be safely resolved.
 ```
 
-After the task starts, Codex follows the discovery, requirements, architecture/planning, and implementation prompts (`00`–`05`) and the lifecycle sections below. Those procedures define how it records requirements/assumptions/criteria, plans increments, validates and reviews changes, stores target-local evidence, and resumes only phases whose inputs are stale. Routine engineering choices remain with the primary Codex session.
+After the task starts in orchestrator mode, the controller owns transitions and each ephemeral Codex process receives one bounded planning, implementation, or correction task. It returns structured JSON; the controller validates paths and writes changes through `safe_writer.py`. In direct-session mode, the primary Codex session follows the discovery, requirements, architecture/planning, and implementation prompts (`00`–`05`) and lifecycle sections below.
 
 Claude review is optional and is not authorized merely because the template mentions it. The user must explicitly authorize Claude through Aily for the exact target, permitted data/path scope, read-only behavior, possible cost, and cost limit. The workflow owner records that authorization and its actual identity assurance in target state before invoking the adapter. Claude returns a recommendation; Codex evaluates findings and performs corrections. Claude does not approve a gate or replace High-risk human review or approval.
 
-For human-readable outcomes, `ACTIVE` means authorized work is progressing; `WAITING_FOR_HUMAN` means a required decision, reviewer, or approver is pending; `BLOCKED` means a prerequisite or safe continuation is unavailable; `COMPLETED` means every planned increment has a valid gate outcome and required evidence. A waiting or blocked workflow is not approved or complete.
+For human-readable outcomes, `ACTIVE` means authorized work is progressing; `WAITING_FOR_HUMAN` means a required decision, reviewer, or approver is pending; `BLOCKED` means a prerequisite or safe continuation is unavailable; `COMPLETED` means every planned increment has a valid gate outcome and required evidence. The orchestrator leaves High-risk tasks at `WAITING_FOR_HUMAN` for the policy-required authenticated reviewer and distinct gate approver. The current release does not create commits or complete a human gate. A waiting or blocked workflow is not approved or complete.
 
 ### Read-only preflight CLI
 
