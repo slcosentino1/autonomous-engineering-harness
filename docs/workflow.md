@@ -2,7 +2,7 @@
 
 ## Operating contract
 
-This guide supports two execution modes. `harness/orchestrator.py` is the automatic stage controller: it runs preflight, records target-local workflow state, starts bounded read-only Codex stages, runs configured validations, invokes Claude through the adapter, and loops through corrections. `harness/runner.py` remains a single-session Codex launcher and does not control individual stages. Neither entrypoint implements the complete cross-record gate evaluator. The target path is always explicit and is never inferred from the harness working directory. The default policy is `harness/config/verification-policy.yaml`; a target may add stricter rules but cannot widen its authorization boundaries.
+`harness/orchestrator.py` is the sole supported workflow execution entrypoint. It runs preflight, records target-local workflow state, starts bounded read-only Codex stages, runs configured validations, invokes Claude through the adapter, and loops through corrections. `harness/runner.py` is deprecated and retained only for legacy compatibility; it does not control workflow stages. The orchestrator does not implement the complete cross-record gate evaluator. The target path is always explicit and is never inferred from the harness working directory. The default policy is `harness/config/verification-policy.yaml`; a target may add stricter rules but cannot widen its authorization boundaries.
 
 ## Start a new task with Codex
 
@@ -17,15 +17,7 @@ python3 /absolute/path/to/autonomous-engineering-harness/harness/orchestrator.py
   --workflow-id stable-task-id
 ```
 
-See [the orchestrator guide](orchestrator.md) for config fields, supported stage behavior, resume rules, and approval limits. Re-run with the same target, branch, task text, and workflow ID to resume. For the older single-session runner, use:
-
-```sh
-python3 /absolute/path/to/autonomous-engineering-harness/harness/runner.py \
-  --target /absolute/path/to/target-repository \
-  --task-file /absolute/path/to/task.md
-```
-
-The runner derives a stable workflow ID from the canonical target and task text. It requires an authenticated local Codex CLI and checks final target state, but stage transitions remain in that Codex session. For an already active Codex session, use [`harness/prompts/06-autonomous-single-agent.md`](../harness/prompts/06-autonomous-single-agent.md) directly and provide the same task template.
+See [the orchestrator guide](orchestrator.md) for config fields, supported stage behavior, resume rules, and approval limits. Re-run with the same target, branch, task text, configuration, and workflow ID to resume. For an already active Codex session, use [`harness/prompts/06-autonomous-single-agent.md`](../harness/prompts/06-autonomous-single-agent.md) directly and provide the same task template; this is not a separate CLI execution path.
 
 ```text
 Target repository root (absolute path):
@@ -120,7 +112,7 @@ The lifecycle phases are:
 | `COMMIT` | Authorization record, staged diff review, commit hash, and final repository state. | A local commit is created only with separate authorization for the exact staged diff; otherwise this phase is skipped and the uncommitted state is reported. |
 | `NEXT_INCREMENT` | Updated target state and next increment selection. | Start the next planned increment only after the prior gate; return to `IMPLEMENTATION`, or mark `COMPLETED` if scope is done. |
 
-The operational statuses are `ACTIVE`, `WAITING_FOR_HUMAN`, `BLOCKED`, and `COMPLETED`. A human-dependent issue creates a pending-decision record containing its ID, question/action, impact, options or recommendation, required authority, affected phase, and evidence. For human-required decisions, record externally authenticated identity evidence and verify it against the required authority. While waiting, continue only independent work. Use `BLOCKED` for unavailable tools, failed prerequisites, or interrupted work that cannot safely continue; preserve the last valid state and record the cause, partial artifacts, and safe recovery path. On response or recovery, record the decision/authority or recovery result and time, then resume at the affected phase. Revalidate target identity, current status, applicable instructions, write scope, and evidence freshness. Reuse completed phase artifacts only if their inputs, target, increment, revision, and exact scope remain valid. Mark stale records as stale and retain them for history. If requirements, decisions, target instructions, or scope changed, reopen the earliest affected phase and its downstream work. If `revision_paths` or its content changed, prior evidence and review reports cannot satisfy the new gate identity; rerun checks selected by impact analysis, create current evidence for every required criterion, and obtain all required reviewer reports on the final identity. Do not replay unrelated discovery or planning work whose inputs remain valid.
+The operational statuses are `ACTIVE`, `WAITING_FOR_HUMAN`, `BLOCKED`, and `COMPLETED`. A pending decision records its ID and workflow, category, requesting stage, exact question, proposal and alternatives, reason, applicable policy/skill reference, required authority, creation time, and append-only responses. Functional decisions may use a declared interactive response only when the cited target instruction permits it; this is not external authentication. External data-transfer authorization, restricted operations, security-risk acceptance, High-risk review and gate approval, and criterion waivers retain their separate authorization and authentication requirements. See [the orchestrator decision commands](orchestrator.md#inspect-and-answer-a-pending-decision). While waiting, continue only independent work. Use `BLOCKED` for unavailable tools, failed prerequisites, or interrupted work that cannot safely continue; preserve the last valid state and record the cause, partial artifacts, and safe recovery path. After a valid response, append its provenance and time, close only the decision that the response can satisfy, then resume the same workflow at its affected phase. Revalidate target identity, current status, applicable instructions, write scope, and evidence freshness. Reuse completed phase artifacts only if their inputs, target, increment, revision, and exact scope remain valid. Mark stale records as stale and retain them for history. If requirements, decisions, target instructions, or scope changed, reopen the earliest affected phase and its downstream work. If `revision_paths` or its content changed, prior evidence and review reports cannot satisfy the new gate identity; rerun checks selected by impact analysis, create current evidence for every required criterion, and obtain all required reviewer reports on the final identity. Do not replay unrelated discovery or planning work whose inputs remain valid.
 
 ### Policy-required independent review and gate authority
 

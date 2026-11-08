@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/autonomous-engineering-harness/orchestrator-self-review.schema.json",
+  "title": "Codex implementation self-review response",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["decision", "summary", "findings", "changes"],
+  "properties": {
+    "decision": {"enum": ["PASS", "CORRECTED", "BLOCKED"]},
+    "summary": {"type": "string"},
+    "findings": {"type": "array", "items": {"$ref": "#/$defs/finding"}},
+    "changes": {"type": "array", "items": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "content"],
+      "properties": {"path": {"type": "string"}, "content": {"type": "string"}}
+    }}
+  },
+  "$defs": {
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "severity", "file", "description", "recommendation"],
+      "properties": {
+        "id": {"type": "string"},
+        "severity": {"enum": ["critical", "high", "medium", "low"]},
+        "file": {"type": "string"},
+        "description": {"type": "string"},
+        "recommendation": {"type": "string"}
+      }
+    }
+  }
+}

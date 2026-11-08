@@ -30,7 +30,32 @@
       "type": "object", "additionalProperties": false,
       "properties": {
         "enabled": {"const": true},
-        "context_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+        "context_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "authorization": {
+          "type": "object", "additionalProperties": false,
+          "required": ["authorization_id", "provider", "destination", "permitted_repositories", "permitted_paths", "mode", "max_budget_usd", "sensitive_exclusions", "authorized_at", "expires_at", "revoked", "authorization_reference", "authorizer_identity", "identity_assurance", "authorizer_authentication_reference"],
+          "properties": {
+            "authorization_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"},
+            "provider": {"const": "aily"},
+            "destination": {"const": "Claude through Aily"},
+            "permitted_repositories": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "pattern": "^/"}},
+            "permitted_paths": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+            "mode": {"const": "read_only"},
+            "max_budget_usd": {"type": "number", "exclusiveMinimum": 0},
+            "sensitive_exclusions": {"type": "array", "uniqueItems": true, "allOf": [{"contains": {"const": "credentials"}}, {"contains": {"const": "environment_files"}}, {"contains": {"const": "private_configuration"}}, {"contains": {"const": "unrelated_files"}}], "items": {"enum": ["credentials", "environment_files", "private_configuration", "unrelated_files", "personal_data", "secrets", "untracked_files"]}},
+            "authorized_at": {"type": "string", "format": "date-time"},
+            "expires_at": {"type": "string", "format": "date-time"},
+            "revoked": {"type": "boolean"},
+            "authorization_reference": {"type": "string", "minLength": 1},
+            "authorizer_identity": {"type": "string", "minLength": 1},
+            "identity_assurance": {"enum": ["declared", "externally_authenticated"]},
+            "authorizer_authentication_reference": {"type": ["string", "null"], "minLength": 1}
+          },
+          "allOf": [
+            {"if": {"properties": {"identity_assurance": {"const": "externally_authenticated"}}, "required": ["identity_assurance"]}, "then": {"properties": {"authorizer_authentication_reference": {"type": "string", "minLength": 1}}}},
+            {"if": {"properties": {"identity_assurance": {"const": "declared"}}, "required": ["identity_assurance"]}, "then": {"properties": {"authorizer_authentication_reference": {"const": null}}}}
+          ]
+        }
       }
     },
     "commit": {"const": false},

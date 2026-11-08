@@ -4,17 +4,17 @@
   "title": "Codex orchestration stage response",
   "type": "object",
   "additionalProperties": false,
-  "required": ["status", "summary", "changes"],
+  "required": ["status", "summary", "changes", "finding_decisions"],
   "properties": {
     "status": {"enum": ["COMPLETED", "BLOCKED"]},
-    "summary": {"type": "string", "minLength": 1},
+    "summary": {"type": "string"},
     "changes": {
       "type": "array",
       "items": {
         "type": "object", "additionalProperties": false,
         "required": ["path", "content"],
         "properties": {
-          "path": {"type": "string", "minLength": 1},
+          "path": {"type": "string"},
           "content": {"type": "string"}
         }
       }
@@ -25,10 +25,10 @@
         "type": "object", "additionalProperties": false,
         "required": ["finding_id", "decision", "reason", "evidence_references"],
         "properties": {
-          "finding_id": {"type": "string", "minLength": 1},
+          "finding_id": {"type": "string"},
           "decision": {"enum": ["ACCEPT", "REJECT", "DEFER"]},
-          "reason": {"type": "string", "minLength": 1},
-          "evidence_references": {"type": "array", "items": {"type": "string", "minLength": 1}}
+          "reason": {"type": "string"},
+          "evidence_references": {"type": "array", "items": {"type": "string"}}
         }
       }
     }

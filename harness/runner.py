@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Launch one autonomous Codex workflow for an explicit target repository.
+"""Deprecated legacy launcher; use :mod:`harness.orchestrator` for new work.
 
-Codex remains the phase orchestrator. This entrypoint performs the read-only
-preflight, supplies the canonical operating contract and assignment to
-``codex exec``, and refuses to report success unless the target workflow state
-records a completed APPROVE gate for the same target and workflow ID.
+This compatibility entrypoint launches one Codex session and does not control
+workflow stages. It remains temporarily available to existing callers, but is
+not a supported workflow execution path.
 """
 
 from __future__ import annotations
@@ -374,7 +373,10 @@ def run_task(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog="Deprecated: use harness/orchestrator.py. This legacy launcher may be removed in a future release.",
+    )
     parser.add_argument("--target", required=True, help="Absolute target Git repository root")
     task = parser.add_mutually_exclusive_group(required=True)
     task.add_argument("--task", help="Engineering task text")
@@ -384,6 +386,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--claude-budget-usd", type=float,
                         help="Optional aggregate USD ceiling passed to the Aily reviewer adapter")
     args = parser.parse_args(argv)
+    print("DEPRECATED: harness/runner.py is a legacy compatibility launcher; use harness/orchestrator.py.",
+          file=sys.stderr)
     try:
         assignment = args.task if args.task is not None else Path(args.task_file).read_text(encoding="utf-8")
         result = run_task(args.target, assignment, workflow_id=args.workflow_id,

@@ -1,9 +1,12 @@
 import json
+import io
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +23,7 @@ from runner import (  # noqa: E402
     operating_prompt,
     run_task,
 )
+import runner  # noqa: E402
 
 
 class WorkflowRunnerTests(unittest.TestCase):
@@ -32,6 +36,16 @@ class WorkflowRunnerTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_legacy_runner_cli_warns_and_points_to_orchestrator(self):
+        stderr = io.StringIO()
+        with patch.object(runner, "run_task", return_value={"status": "COMPLETED"}), \
+                redirect_stderr(stderr):
+            result = runner.main(["--target", str(self.target), "--task", "Example task"])
+
+        self.assertEqual(result, 0)
+        self.assertIn("DEPRECATED", stderr.getvalue())
+        self.assertIn("harness/orchestrator.py", stderr.getvalue())
 
     def state(self, *, status="COMPLETED", phase="COMPLETED", outcome="APPROVE", root=None):
         self.state_path.parent.mkdir(parents=True, exist_ok=True)

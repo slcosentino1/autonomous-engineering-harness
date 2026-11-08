@@ -41,8 +41,8 @@ These decisions govern the reusable harness repository. They do not dictate a ta
 ## DEC-H-007 — Risk-based gate authority
 - **Status:** Accepted
 - **Context:** Requiring a human for every small increment is unnecessary, but an implementer cannot approve their own work.
-- **Decision:** A deterministic policy evaluator may approve eligible low-risk work; medium-risk work needs a separate agent/session review; high-risk work needs an externally authenticated human reviewer and designated externally authenticated human gate authority. Human authorization is required for risk acceptance and consequential decisions.
-- **Consequences:** The target must identify its gate authority and provide verifiable authentication evidence for human decisions. Missing authority or authentication escalates rather than being inferred from repository access or unequal strings.
+- **Decision:** A deterministic policy evaluator may approve eligible low-risk work; medium-risk work needs a separate agent/session review; high-risk work needs an externally authenticated human reviewer and designated externally authenticated human gate authority. Functional/product decisions require an explicit human response when project instructions say so; that response may have declared provenance. External data-transfer authorization, restricted operations, security-risk acceptance, criterion waivers, High-risk review, and gate approval retain their separate authorization and authentication requirements.
+- **Consequences:** Record the decision category, applicable project instruction, response provenance, and actual identity assurance. Missing required external authority or authentication escalates rather than being inferred from repository access or unequal strings. A declared functional response never satisfies a High-risk gate.
 
 ## DEC-H-008 — Continuous, change-based product documentation
 - **Status:** Accepted
@@ -60,7 +60,7 @@ These decisions govern the reusable harness repository. They do not dictate a ta
 ## DEC-H-010 — Identity strings are declarations, not authentication
 - **Status:** Accepted
 - **Context:** Reviewer and authority records need identity and session information, but a schema cannot authenticate a person or prove two different strings represent different people.
-- **Decision:** Record declared identity and session separately from external authentication evidence. Where policy requires a human reviewer, authorization, risk acceptance, or gate approval, require a verifiable reference to a trusted external authentication source. If that evidence cannot be verified, do not treat the approval as authenticated; escalate. Do not select or implement an identity provider in the document-only harness.
+- **Decision:** Record declared identity and session separately from external authentication evidence. Where policy requires a human reviewer, operational authorization, risk acceptance, or gate approval, require a verifiable reference to a trusted external authentication source. A functional/product decision may use declared provenance when the applicable target instruction permits explicit interactive acceptance; it does not grant operational authority or satisfy a High-risk gate. If required authentication evidence cannot be verified, do not treat the approval as authenticated; escalate. Do not select or implement an identity provider in the document-only harness.
 - **Consequences:** Current policies and schemas describe required evidence but cannot verify it. Selecting an identity source is a future implementation decision.
 
 ## Open questions

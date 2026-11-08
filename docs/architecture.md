@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The harness is a reusable process and contract repository. Product code is owned by a separate target repository. The workflow remains document-first and dependency-free; its first executable component is a read-only target preflight CLI.
+The harness is a reusable process and contract repository. Product code is owned by a separate target repository. Its supported workflow execution entrypoint is the dependency-free Python stage orchestrator; read-only preflight remains a standalone diagnostic CLI.
 
 ## Repository boundary
 
@@ -30,10 +30,12 @@ The harness does not contain a target product or receive copied target source. A
 - **Contract layer:** JSON Schemas for workflow state, evidence, traceability, findings, and gate decisions.
 - **Template layer:** project-specific documents to adapt in the target repository.
 - **Read-only preflight:** `harness/preflight.py`, a Python 3.10+ standard-library CLI with a JSON report and optional JSON scope configuration. It does not execute discovered instructions or write target artifacts.
+- **Stage orchestrator:** `harness/orchestrator.py`, the sole supported workflow execution entrypoint for planning, scoped implementation, configured validation, review coordination, correction, and target-local state.
+- **Legacy launcher:** `harness/runner.py`, deprecated and retained temporarily for compatibility; it is not a supported workflow path.
 
 The Verification Gate binds to an immutable content fingerprint over explicit `revision_paths`; a later commit SHA is provenance and must be shown to represent the same content. Reviewer completion reports and assigned scopes are reconciled, but no schema can prove a reviewer disclosed every substantive observation. Identity/session strings are declared data. Human approvals that policy requires need verifiable external authentication evidence; no identity provider is selected or implemented.
 
-The lifecycle, state, evidence, identity, and gate contracts are not enforced by an orchestrator. The preflight CLI remains read-only. The safe writer enforces only its own target/scope/path/directory and file checks; it does not force the primary agent to use the helper, authenticate humans, persist workflow state, validate evidence, or make gate decisions. Its single-writer concurrency assumption is operational and does not provide protection against a non-cooperating race after the last check.
+The stage orchestrator controls the phases it implements and persists target-local state, but it does not enforce every lifecycle, evidence, identity, or gate contract. In particular, it does not authenticate humans or implement the complete cross-record gate evaluator. The preflight CLI remains read-only. The safe writer enforces only its own target/scope/path/directory and file checks; it does not force the primary agent to use the helper or make gate decisions. Its single-writer concurrency assumption is operational and does not provide protection against a non-cooperating race after the last check.
 
 ## Future-compatible role boundaries
 
