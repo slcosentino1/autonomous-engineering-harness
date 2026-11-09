@@ -27,6 +27,11 @@ HARNESS_ROOT = Path(__file__).resolve().parent.parent
 REQUIRED_DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+SENSITIVE_WORKSPACE_PATH = re.compile(
+    r"(?i)(?:^|/)(?:\.env(?:\.[^/]*)?|\.aws|\.ssh|\.netrc|\.npmrc|\.pypirc|\.dockercfg|"
+    r"id_(?:rsa|dsa|ecdsa|ed25519)(?:_sk)?|secrets?(?:[-_.][^/]*)?|credentials?(?:[-_.][^/]*)?|"
+    r"[^/]*\.(?:pem|key|p12|pfx|secret|token))(?:/|$)"
+)
 
 
 class SafeWriteError(Exception):
@@ -66,10 +71,39 @@ def _normalize_destination(value: str) -> str:
         raise SafeWriteError(str(exc)) from exc
     if ".git" in PurePosixPath(normalized).parts:
         raise SafeWriteError("Git metadata paths are never writable")
+    if SENSITIVE_WORKSPACE_PATH.search(normalized):
+        raise SafeWriteError("Credential and sensitive configuration paths are never writable")
     return normalized
 
 
 def _scope_allows(target: Path, relative_path: str, config: dict[str, Any]) -> None:
+    workspace_policy = config.get("execution_policy")
+    if workspace_policy is not None:
+        if (not isinstance(workspace_policy, dict) or
+                set(workspace_policy) != {"version", "mode", "workspace_root", "workflow_id"} or
+                workspace_policy.get("version") != 1 or workspace_policy.get("mode") != "workspace" or
+                not isinstance(workspace_policy.get("workflow_id"), str) or
+                not workspace_policy["workflow_id"]):
+            raise SafeWriteError("execution_policy must identify version 1 workspace mode and its workflow")
+        try:
+            workspace = canonical(workspace_policy["workspace_root"])
+        except (OSError, TypeError) as exc:
+            raise SafeWriteError("Workspace root cannot be resolved") from exc
+        if workspace != target:
+            raise SafeWriteError("Workspace execution policy differs from the explicit target")
+        if ".git" in PurePosixPath(relative_path).parts:
+            raise SafeWriteError("Git metadata paths are never writable")
+        excluded = config.get("workspace_excluded_paths", [])
+        if not isinstance(excluded, list):
+            raise SafeWriteError("workspace_excluded_paths must be an array")
+        try:
+            excluded = [config_relative(value, "workspace_excluded_paths") for value in excluded]
+        except PreflightError as exc:
+            raise SafeWriteError(str(exc)) from exc
+        if any(is_path_or_child(relative_path, prefix) for prefix in excluded):
+            raise SafeWriteError("Destination is excluded from the workspace policy")
+        return
+
     lists: dict[str, list[str]] = {}
     for name in ("included_paths", "code_paths", "artifact_paths", "excluded_paths"):
         raw = config.get(name, [])
@@ -258,76 +292,6 @@ def _open_existing(parent_fd: int, name: str) -> tuple[int, os.stat_result, str]
     except BaseException:
         os.close(fd)
         raise
-
-
-def remove_ohpen_finder_metadata(target: str | Path, config_path: str | Path,
-                                 relative_path: str, *, expected_sha256: str,
-                                 workflow_id: str) -> dict[str, Any]:
-    """Remove only the explicitly authorized Ohpen src/.DS_Store metadata file."""
-    exact_path = "src/.DS_Store"
-    if workflow_id != "migration-jobs-api-harness-v2" or relative_path != exact_path:
-        raise SafeWriteError("Finder metadata removal is limited to the exact Ohpen workflow path")
-    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
-        raise SafeWriteError("expected_sha256 must be a lowercase SHA-256 digest")
-    root, config_file, relative, report, config_digest = _prepare_preflight(
-        target, config_path, relative_path
-    )
-    parts = tuple(PurePosixPath(relative).parts)
-    parent_parts, name = parts[:-1], parts[-1]
-    root_fd, parent_fd = _open_root_and_parent(root, parent_parts)
-    file_fd: int | None = None
-    try:
-        _verify_parent_still_named(root, parent_parts, root_fd, parent_fd)
-        file_fd, original_info, digest = _open_existing(parent_fd, name)
-        signature = os.pread(file_fd, 8, 0)
-        if signature != b"\x00\x00\x00\x01Bud1":
-            raise SafeWriteError("The exact src/.DS_Store path is not confirmed Finder metadata")
-        if digest != expected_sha256:
-            raise SafeWriteError("Finder metadata content differs from its recorded fingerprint")
-
-        def is_indexed() -> bool:
-            env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-            env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
-                        "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"})
-            result = subprocess.run(
-                ["git", "-c", "core.fsmonitor=false", "-C", str(root),
-                 "ls-files", "--error-unmatch", "--", exact_path],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, check=False,
-            )
-            if result.returncode not in {0, 1}:
-                raise SafeWriteError("Could not safely determine whether Finder metadata is tracked or staged")
-            return result.returncode == 0
-
-        if is_indexed():
-            raise SafeWriteError("Tracked or staged Finder metadata remains protected")
-        _assert_config_unchanged(config_file, config_digest)
-        _verify_parent_still_named(root, parent_parts, root_fd, parent_fd)
-        current_entry = _stat_destination(parent_fd, name)
-        current_info = os.fstat(file_fd)
-        current_digest = _sha256_fd(file_fd)
-        if (_identity(current_entry) != _identity(original_info) or
-                _identity(current_info) != _identity(original_info) or
-                current_digest != expected_sha256 or is_indexed()):
-            raise SafeWriteError("Finder metadata identity, index status, or content changed before removal")
-        os.unlink(name, dir_fd=parent_fd)
-        os.fsync(parent_fd)
-        try:
-            _stat_destination(parent_fd, name)
-        except FileNotFoundError:
-            pass
-        else:
-            raise SafeWriteError("Finder metadata removal completed but the path remains present")
-        evidence = _evidence_context(root, config_digest, report, root_fd, parent_fd)
-        return {**evidence, "operation": "remove_ohpen_finder_metadata", "path": exact_path,
-                "before_sha256": digest, "device": original_info.st_dev,
-                "inode": original_info.st_ino, "link_count": original_info.st_nlink,
-                "mode": stat.S_IMODE(original_info.st_mode)}
-    finally:
-        if file_fd is not None:
-            os.close(file_fd)
-        if parent_fd != root_fd:
-            os.close(parent_fd)
-        os.close(root_fd)
 
 
 def create_file(target: str | Path, config_path: str | Path, relative_path: str,
@@ -648,29 +612,154 @@ def replace_file(target: str | Path, config_path: str | Path, relative_path: str
         os.close(root_fd)
 
 
+def _require_workflow_created(config_file: Path, relative: str) -> None:
+    try:
+        config = json.loads(config_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SafeWriteError("Workspace ownership record is unavailable") from exc
+    created = config.get("workflow_created_paths") if isinstance(config, dict) else None
+    if (not isinstance(created, list) or
+            any(not isinstance(item, str) for item in created) or relative not in created):
+        raise SafeWriteError("Only files recorded as created by this workflow may be deleted or renamed")
+
+
+def delete_file(target: str | Path, config_path: str | Path, relative_path: str,
+                expected_sha256: str) -> dict[str, Any]:
+    """Delete one regular file created by this workflow after content recheck."""
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        raise SafeWriteError("expected_sha256 must be a lowercase SHA-256 digest")
+    root, config_file, relative, report, config_digest = _prepare_preflight(target, config_path, relative_path)
+    _require_workflow_created(config_file, relative)
+    parts = tuple(PurePosixPath(relative).parts)
+    parent_parts, name = parts[:-1], parts[-1]
+    root_fd, parent_fd = _open_root_and_parent(root, parent_parts)
+    file_fd: int | None = None
+    try:
+        _verify_parent_still_named(root, parent_parts, root_fd, parent_fd)
+        file_fd, original, digest = _open_existing(parent_fd, name)
+        if digest != expected_sha256:
+            raise SafeWriteError("Workflow-created file changed since the deletion was requested")
+        _assert_config_unchanged(config_file, config_digest)
+        _verify_parent_still_named(root, parent_parts, root_fd, parent_fd)
+        entry = _stat_destination(parent_fd, name)
+        if _identity(entry) != _identity(original) or _identity(os.fstat(file_fd)) != _identity(original):
+            raise SafeWriteError("Workflow-created file identity changed before deletion")
+        os.unlink(name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        try:
+            _stat_destination(parent_fd, name)
+        except FileNotFoundError:
+            pass
+        else:
+            raise SafeWriteError("File deletion completed but the destination remains present")
+        evidence = _evidence_context(root, config_digest, report, root_fd, parent_fd)
+        return {**evidence, "operation": "delete", "path": relative, "before_sha256": digest,
+                "device": original.st_dev, "inode": original.st_ino, "link_count": original.st_nlink}
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        if parent_fd != root_fd:
+            os.close(parent_fd)
+        os.close(root_fd)
+
+
+def rename_file(target: str | Path, config_path: str | Path, source_path: str,
+                destination_path: str, expected_sha256: str) -> dict[str, Any]:
+    """Atomically rename a workflow-created regular file within the workspace."""
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        raise SafeWriteError("expected_sha256 must be a lowercase SHA-256 digest")
+    root, config_file, source, report, config_digest = _prepare_preflight(target, config_path, source_path)
+    destination = _normalize_destination(destination_path)
+    _scope_allows(root, destination, json.loads(config_file.read_text(encoding="utf-8")))
+    if source == destination:
+        raise SafeWriteError("Source and destination paths are identical")
+    _require_workflow_created(config_file, source)
+    source_parts, destination_parts = tuple(PurePosixPath(source).parts), tuple(PurePosixPath(destination).parts)
+    source_parent_parts, source_name = source_parts[:-1], source_parts[-1]
+    destination_parent_parts, destination_name = destination_parts[:-1], destination_parts[-1]
+    source_root_fd, source_parent_fd = _open_root_and_parent(root, source_parent_parts)
+    destination_root_fd, destination_parent_fd = _open_root_and_parent(root, destination_parent_parts)
+    source_fd: int | None = None
+    try:
+        _verify_parent_still_named(root, source_parent_parts, source_root_fd, source_parent_fd)
+        _verify_parent_still_named(root, destination_parent_parts, destination_root_fd, destination_parent_fd)
+        source_fd, original, digest = _open_existing(source_parent_fd, source_name)
+        if digest != expected_sha256:
+            raise SafeWriteError("Workflow-created file changed since the rename was requested")
+        try:
+            _stat_destination(destination_parent_fd, destination_name)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(destination)
+        _assert_config_unchanged(config_file, config_digest)
+        _verify_parent_still_named(root, source_parent_parts, source_root_fd, source_parent_fd)
+        _verify_parent_still_named(root, destination_parent_parts, destination_root_fd, destination_parent_fd)
+        source_entry = _stat_destination(source_parent_fd, source_name)
+        if _identity(source_entry) != _identity(original) or _identity(os.fstat(source_fd)) != _identity(original):
+            raise SafeWriteError("Workflow-created file identity changed before rename")
+        os.rename(source_name, destination_name, src_dir_fd=source_parent_fd, dst_dir_fd=destination_parent_fd)
+        os.fsync(source_parent_fd)
+        if (source_parent_parts, source_parent_fd) != (destination_parent_parts, destination_parent_fd):
+            os.fsync(destination_parent_fd)
+        result_fd, result_info, result_digest = _open_existing(destination_parent_fd, destination_name)
+        try:
+            if result_digest != expected_sha256 or result_info.st_nlink != 1:
+                raise SafeWriteError("Rename completed but destination verification failed")
+        finally:
+            os.close(result_fd)
+        try:
+            _stat_destination(source_parent_fd, source_name)
+        except FileNotFoundError:
+            pass
+        else:
+            raise SafeWriteError("Rename completed but the source remains present")
+        evidence = _evidence_context(root, config_digest, report, source_root_fd, source_parent_fd)
+        return {**evidence, "operation": "rename", "source": source, "destination": destination,
+                "sha256": digest, "device": result_info.st_dev, "inode": result_info.st_ino}
+    finally:
+        if source_fd is not None:
+            os.close(source_fd)
+        if destination_parent_fd != destination_root_fd:
+            os.close(destination_parent_fd)
+        os.close(destination_root_fd)
+        if source_parent_fd != source_root_fd:
+            os.close(source_parent_fd)
+        os.close(source_root_fd)
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Scope-checked target directory/file write helper")
-    parser.add_argument("operation", choices=("mkdir", "create", "replace"))
+    parser = argparse.ArgumentParser(description="Workspace-scoped target file helper")
+    parser.add_argument("operation", choices=("mkdir", "create", "replace", "delete", "rename"))
     parser.add_argument("--target", required=True, help="Explicit canonical target repository root")
     parser.add_argument("--config", required=True, help="Existing JSON preflight scope configuration")
     parser.add_argument("--path", required=True, help="Authorized repository-relative destination")
+    parser.add_argument("--destination", help="Destination path for rename")
     parser.add_argument("--expected-sha256", help="Required baseline content hash for replacement")
     args = parser.parse_args(argv)
     try:
         if args.operation == "mkdir":
-            if args.expected_sha256 is not None:
-                raise SafeWriteError("--expected-sha256 is valid only for replacement")
+            if args.expected_sha256 is not None or args.destination is not None:
+                raise SafeWriteError("mkdir does not accept a hash or destination")
             result = create_directories(args.target, args.config, args.path)
         elif args.operation == "create":
             data = sys.stdin.buffer.read()
-            if args.expected_sha256 is not None:
-                raise SafeWriteError("--expected-sha256 is valid only for replacement")
+            if args.expected_sha256 is not None or args.destination is not None:
+                raise SafeWriteError("create does not accept a hash or destination")
             result = create_file(args.target, args.config, args.path, data)
-        else:
+        elif args.operation == "replace":
             data = sys.stdin.buffer.read()
-            if args.expected_sha256 is None:
-                raise SafeWriteError("Replacement requires --expected-sha256 from the recorded baseline")
+            if args.expected_sha256 is None or args.destination is not None:
+                raise SafeWriteError("Replacement requires --expected-sha256 and no destination")
             result = replace_file(args.target, args.config, args.path, data, args.expected_sha256)
+        elif args.operation == "delete":
+            if args.expected_sha256 is None or args.destination is not None:
+                raise SafeWriteError("Delete requires --expected-sha256 and no destination")
+            result = delete_file(args.target, args.config, args.path, args.expected_sha256)
+        else:
+            if args.expected_sha256 is None or not args.destination:
+                raise SafeWriteError("Rename requires --expected-sha256 and --destination")
+            result = rename_file(args.target, args.config, args.path, args.destination, args.expected_sha256)
         json.dump({"status": "PASS", "evidence": result}, sys.stdout, sort_keys=True)
         sys.stdout.write("\n")
         return 0

@@ -7,7 +7,6 @@ target-local workflow-state.json remains the durable workflow record.
 from __future__ import annotations
 
 import argparse
-import base64
 import copy
 import getpass
 import hashlib
@@ -31,40 +30,21 @@ from typing import Any, Callable
 HARNESS_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HARNESS_ROOT / "harness"))
 from preflight import Preflight, PreflightError, canonical  # noqa: E402
-from safe_writer import (create_directories, create_file, remove_ohpen_finder_metadata,
-                         replace_file)  # noqa: E402
+from safe_writer import (create_directories, create_file, delete_file,
+                         rename_file, replace_file)  # noqa: E402
 import claude_reviewer as claude  # noqa: E402
 from runner import _runtime_bundle_files, _runtime_bundle_unchanged  # noqa: E402
 
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 RISK = {"low": 0, "medium": 1, "high": 2}
-SECRET_PATH = re.compile(r"(?i)(^|/)(\.env(?:\..*)?|id_rsa|id_ed25519|.*\.(?:pem|key))$")
-DS_STORE_BASENAME = ".DS_Store"
+SECRET_PATH = re.compile(
+    r"(?i)(?:^|/)(?:\.env(?:\.[^/]*)?|\.aws|\.ssh|\.netrc|\.npmrc|\.pypirc|\.dockercfg|"
+    r"id_(?:rsa|dsa|ecdsa|ed25519)(?:_sk)?|secrets?(?:[-_.][^/]*)?|credentials?(?:[-_.][^/]*)?|"
+    r"[^/]*\.(?:pem|key|p12|pfx|secret|token))(?:/|$)"
+)
 PROCESS_EVIDENCE_PATH = "docs/ai-process.md"
 PROCESS_EVIDENCE_START = "<!-- harness-process-evidence:start -->"
 PROCESS_EVIDENCE_END = "<!-- harness-process-evidence:end -->"
-SNAPSHOT_POLICY_UNTRACKED_DS_STORE = "untracked_ds_store_v1"
-SNAPSHOT_MIGRATION_ID = "untracked_ds_store_root_v1"
-SNAPSHOT_MIGRATION_WORKFLOW_ID = "migration-jobs-api-harness-v2"
-SNAPSHOT_MIGRATION_OLD_HASH_PREFIX = "a13f09c3"
-SNAPSHOT_MIGRATION_CURRENT_HASH_PREFIX = "95bafdcf"
-SNAPSHOT_MIGRATION_AUTHORIZATION_SCOPE = (
-    "Append one root .DS_Store snapshot migration and its explicit authorization record; "
-    "preserve all existing workflow evidence and fingerprints."
-)
-SNAPSHOT_MIGRATION_AUTHORIZATION_LIMITS = [
-    "Only the root .DS_Store baseline entry is excluded while it remains an untracked regular file.",
-    "No other workflow path, baseline hash, implementation artifact, review record, or evidence may be changed.",
-]
-OHPEN_RECOVERY_WORKFLOW_ID = "migration-jobs-api-harness-v2"
-OHPEN_RECOVERY_BLOCKER_SHA256 = "158828cddd275fb5eae34934810e3ea88653d311ee0c446b61bea663aa4ee6e9"
-OHPEN_RECOVERY_EXPECTED_ATTEMPTS = 14
-OHPEN_FINDER_METADATA_PATH = "src/.DS_Store"
-OHPEN_FINDER_METADATA_SIGNATURE = b"\x00\x00\x00\x01Bud1"
-OHPEN_FINDER_METADATA_REASON = "Claude CR-3 confirmed this untracked file is macOS Finder metadata and the user authorized its removal."
-OHPEN_CORRECTION_RESUME_SOURCE = (
-    "conversation: Fix correction-stage restrictions and authorization ledger — finish Ohpen workflow"
-)
 
 
 class OrchestratorError(ValueError):
@@ -577,11 +557,9 @@ def _observe_git_references(target: Path, tracking: dict[str, Any],
     return changed
 
 
-def _status(target: Path, *, exclude_untracked_ds_store: bool = False,
-            preserve_untracked_paths: set[str] | None = None) -> dict[str, dict[str, Any]]:
+def _status(target: Path) -> dict[str, dict[str, Any]]:
     raw = _git(target, "status", "--porcelain=v1", "-z", "--untracked-files=all")
     rows, result, i = raw.split(b"\0"), {}, 0
-    preserved = preserve_untracked_paths or set()
     while i < len(rows):
         row = rows[i]
         i += 1
@@ -599,146 +577,35 @@ def _status(target: Path, *, exclude_untracked_ds_store: bool = False,
             result[source] = {"index_state": "renamed", "working_tree_state": "renamed",
                               "worktree_sha256": None, "index_sha256": None}
         file = target / path
-        if (exclude_untracked_ds_store and x == "?" and
-                PurePosixPath(path).name == DS_STORE_BASENAME and path not in preserved):
-            try:
-                metadata = file.lstat()
-            except FileNotFoundError:
-                metadata = None
-            if metadata is not None and stat.S_ISREG(metadata.st_mode):
-                continue
         # Never open secret/config paths while recording the Git baseline.
         if SECRET_PATH.search(path):
             content_hash = None
+            try:
+                info = file.lstat()
+                worktree_metadata = {"device": info.st_dev, "inode": info.st_ino,
+                    "mode": stat.S_IFMT(info.st_mode) | stat.S_IMODE(info.st_mode),
+                    "links": info.st_nlink, "size": info.st_size,
+                    "mtime_ns": info.st_mtime_ns, "ctime_ns": info.st_ctime_ns}
+            except FileNotFoundError:
+                worktree_metadata = None
         elif file.is_symlink():
             content_hash = _sha(os.readlink(file).encode("utf-8", "surrogateescape"))
+            worktree_metadata = None
         elif file.is_file():
             content_hash = _sha(file.read_bytes())
+            worktree_metadata = None
         else:
             content_hash = "missing"
+            worktree_metadata = None
         staged = b"" if SECRET_PATH.search(path) else _git(target, "show", f":{path}", check=False)
         result[path] = {
             "index_state": "unchanged" if x == " " else ("added" if x in "A?" else "modified"),
             "working_tree_state": "untracked" if x == "?" else ("unchanged" if y == " " else ("deleted" if y == "D" else "modified")),
             "worktree_sha256": content_hash,
+            "worktree_metadata": worktree_metadata,
             "index_sha256": _sha(staged) if staged else None,
         }
     return result
-
-
-def _snapshot_migration_rows(state: dict[str, Any]) -> list[dict[str, Any]]:
-    orchestration = state.get("orchestration")
-    if not isinstance(orchestration, dict):
-        raise OrchestratorError("Workflow has no valid orchestration record")
-    rows = orchestration.get("snapshot_migrations", [])
-    if not isinstance(rows, list):
-        raise OrchestratorError("Workflow snapshot migration history is malformed")
-    if not rows:
-        return []
-    if orchestration.get("snapshot_policy") != SNAPSHOT_POLICY_UNTRACKED_DS_STORE:
-        raise OrchestratorError("A snapshot migration exists without its corresponding snapshot policy")
-    if len(rows) != 1:
-        raise OrchestratorError("Workflow contains duplicate or unsupported snapshot migrations")
-    row = rows[0]
-    required = {"migration_id", "policy_id", "path", "old_sha256", "current_sha256", "reason",
-                "recorded_at", "original_bytes_recovered", "original_bytes_note", "authorization_id"}
-    if (not isinstance(row, dict) or set(row) != required or
-            row.get("migration_id") != SNAPSHOT_MIGRATION_ID or
-            row.get("policy_id") != SNAPSHOT_POLICY_UNTRACKED_DS_STORE or
-            row.get("path") != DS_STORE_BASENAME or
-            not isinstance(row.get("old_sha256"), str) or not re.fullmatch(r"[a-f0-9]{64}", row["old_sha256"]) or
-            not isinstance(row.get("current_sha256"), str) or not re.fullmatch(r"[a-f0-9]{64}", row["current_sha256"]) or
-            not isinstance(row.get("reason"), str) or not row["reason"].strip() or
-            not isinstance(row.get("original_bytes_recovered"), bool) or row["original_bytes_recovered"] is not False or
-            not isinstance(row.get("original_bytes_note"), str) or not row["original_bytes_note"].strip() or
-            not isinstance(row.get("authorization_id"), str) or not row["authorization_id"].strip()):
-        raise OrchestratorError("Workflow snapshot migration record is malformed")
-    try:
-        timestamp = datetime.fromisoformat(row["recorded_at"].replace("Z", "+00:00"))
-        if timestamp.tzinfo is None:
-            raise ValueError("timezone is required")
-    except (AttributeError, TypeError, ValueError) as exc:
-        raise OrchestratorError("Workflow snapshot migration timestamp is invalid") from exc
-    baseline_hashes = orchestration.get("preexisting_hashes")
-    matches = [item for item in baseline_hashes if isinstance(item, dict) and item.get("path") == row["path"]] \
-        if isinstance(baseline_hashes, list) else []
-    baseline_rows = state.get("baseline", {}).get("preexisting_changes", [])
-    status_matches = [item for item in baseline_rows if isinstance(item, dict) and item.get("path") == row["path"]] \
-        if isinstance(baseline_rows, list) else []
-    if (len(matches) != 1 or matches[0].get("worktree_sha256") != row["old_sha256"] or
-            matches[0].get("index_sha256") is not None or len(status_matches) != 1 or
-            status_matches[0].get("working_tree_state") != "untracked"):
-        raise OrchestratorError("Snapshot migration no longer matches the preserved original baseline")
-    authorizations = state.get("authorizations")
-    auth_matches = [item for item in authorizations if isinstance(item, dict) and
-                    item.get("authorization_id") == row["authorization_id"]] if isinstance(authorizations, list) else []
-    workflow_id = state.get("workflow_id")
-    expected_resource = f".engineering/workflows/{workflow_id}/workflow-state.json"
-    target = state.get("target")
-    expected_target_id = target.get("target_id") if isinstance(target, dict) else None
-    if (len(auth_matches) != 1 or auth_matches[0].get("operation") != "modify_workflow_state" or
-            auth_matches[0].get("workflow_id") != workflow_id or
-            auth_matches[0].get("resource") != expected_resource or
-            auth_matches[0].get("target_id") != expected_target_id or
-            auth_matches[0].get("scope") != SNAPSHOT_MIGRATION_AUTHORIZATION_SCOPE or
-            auth_matches[0].get("limits") != SNAPSHOT_MIGRATION_AUTHORIZATION_LIMITS or
-            auth_matches[0].get("authorizer_kind") != "human" or
-            auth_matches[0].get("authorizer_role") != "Requesting user" or
-            auth_matches[0].get("authorizer_identity_assurance") != "declared" or
-            auth_matches[0].get("authorizer_authentication_reference") is not None or
-            not isinstance(auth_matches[0].get("source_reference"), str) or
-            not auth_matches[0]["source_reference"].strip() or
-            auth_matches[0].get("authority_reference") != auth_matches[0].get("source_reference")):
-        raise OrchestratorError("Snapshot migration has no matching scoped workflow-state authorization")
-    return rows
-
-
-def _snapshot_policy(state: dict[str, Any]) -> str | None:
-    orchestration = state.get("orchestration")
-    if not isinstance(orchestration, dict):
-        raise OrchestratorError("Workflow has no valid orchestration record")
-    policy = orchestration.get("snapshot_policy")
-    rows = _snapshot_migration_rows(state)
-    if policy is None:
-        if rows:
-            raise OrchestratorError("Legacy workflow cannot contain a migrated snapshot exclusion")
-        return None
-    if policy != SNAPSHOT_POLICY_UNTRACKED_DS_STORE:
-        raise OrchestratorError("Workflow uses an unsupported snapshot policy")
-    return policy
-
-
-def _preexisting_untracked_ds_store_paths(state: dict[str, Any]) -> set[str]:
-    baseline_rows = state.get("baseline", {}).get("preexisting_changes", [])
-    if not isinstance(baseline_rows, list):
-        raise OrchestratorError("Workflow pre-existing baseline is malformed")
-    migrated = {row["path"] for row in _snapshot_migration_rows(state)}
-    return {row["path"] for row in baseline_rows if isinstance(row, dict) and
-            row.get("working_tree_state") == "untracked" and
-            PurePosixPath(row.get("path", "")).name == DS_STORE_BASENAME and
-            row["path"] not in migrated}
-
-
-def _status_for_workflow(target: Path, state: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    policy = _snapshot_policy(state)
-    return _status(target,
-                   exclude_untracked_ds_store=policy == SNAPSHOT_POLICY_UNTRACKED_DS_STORE,
-                   preserve_untracked_paths=_preexisting_untracked_ds_store_paths(state))
-
-
-def _index_has_path(target: Path, relative: str) -> bool:
-    return bool(_git(target, "ls-files", "--stage", "--", relative).strip())
-
-
-def _is_regular_untracked_ds_store(target: Path, relative: str) -> bool:
-    if PurePosixPath(relative).name != DS_STORE_BASENAME or _index_has_path(target, relative):
-        return False
-    path = target / relative
-    try:
-        info = path.lstat()
-    except FileNotFoundError:
-        return False
-    return stat.S_ISREG(info.st_mode)
 
 
 class WorkflowStore:
@@ -746,19 +613,20 @@ class WorkflowStore:
 
     def __init__(self, target: Path, workflow_id: str) -> None:
         self.target = target
+        self.workflow_id = workflow_id
         self.directory = f".engineering/workflows/{workflow_id}"
         self.state_path = f"{self.directory}/workflow-state.json"
 
     @staticmethod
-    def _config(directory: Path, target: Path, path: str, *, classification: str = "artifact") -> Path:
-        if classification not in {"code", "artifact"}:
-            raise OrchestratorError("Write scope classification must be code or artifact")
+    def _config(directory: Path, target: Path, path: str, *, classification: str = "artifact",
+                workflow_id: str = "internal-write", workflow_created_paths: list[str] | None = None) -> Path:
         body = {
             "target_path": str(target),
             "authorized_working_directories": [str(target)],
-            "included_paths": [path], "code_paths": [path] if classification == "code" else [],
-            "artifact_paths": [path] if classification == "artifact" else [],
-            "revision_paths": [], "excluded_paths": [],
+            "execution_policy": {"version": 1, "mode": "workspace", "workspace_root": str(target),
+                                 "workflow_id": workflow_id},
+            "workspace_excluded_paths": [],
+            "workflow_created_paths": workflow_created_paths or [],
         }
         file = directory / "scope.json"
         file.write_text(json.dumps(body), encoding="utf-8")
@@ -777,7 +645,7 @@ class WorkflowStore:
                 continue
             rel = PurePosixPath(*parts[:index + 1]).as_posix()
             with tempfile.TemporaryDirectory(prefix="harness-scope-") as temp:
-                cfg = self._config(Path(temp), self.target, rel)
+                cfg = self._config(Path(temp), self.target, rel, workflow_id=self.workflow_id)
                 create_directories(self.target, cfg, rel)
 
     def read_state(self) -> dict[str, Any] | None:
@@ -832,13 +700,13 @@ class WorkflowStore:
                         raise OrchestratorError("Workflow artifact parent is not a directory")
                     continue
                 with tempfile.TemporaryDirectory(prefix="harness-scope-") as temp:
-                    cfg = self._config(Path(temp), self.target, current.as_posix())
+                    cfg = self._config(Path(temp), self.target, current.as_posix(), workflow_id=self.workflow_id)
                     create_directories(self.target, cfg, current.as_posix())
         if file.is_symlink():
             raise OrchestratorError("Workflow artifact is a symlink")
         content = _json_bytes(value)
         with tempfile.TemporaryDirectory(prefix="harness-scope-") as temp:
-            cfg = self._config(Path(temp), self.target, relative)
+            cfg = self._config(Path(temp), self.target, relative, workflow_id=self.workflow_id)
             if file.exists():
                 if not file.is_file():
                     raise OrchestratorError("Workflow artifact is not a regular file")
@@ -847,125 +715,6 @@ class WorkflowStore:
 
     def save(self, state: dict[str, Any]) -> None:
         self.write(self.state_path, state)
-
-
-def migrate_untracked_ds_store(target: str, workflow_id: str, *, expected_old_sha256: str,
-                               expected_current_sha256: str,
-                               authorization_reference: str) -> dict[str, Any]:
-    """Append the one explicit root .DS_Store migration to an existing workflow."""
-    if workflow_id != SNAPSHOT_MIGRATION_WORKFLOW_ID:
-        raise OrchestratorError("This migration is limited to the explicitly named Ohpen workflow")
-    if (not isinstance(target, str) or not Path(target).is_absolute() or
-            not isinstance(expected_old_sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", expected_old_sha256) or
-            not isinstance(expected_current_sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", expected_current_sha256) or
-            not isinstance(authorization_reference, str) or not authorization_reference.strip()):
-        raise OrchestratorError("Migration requires an absolute target, exact fingerprints, and authorization provenance")
-    root = Path(canonical(target))
-    if root != Path(target):
-        raise OrchestratorError("Migration target must be the canonical repository root")
-    report = Preflight(str(root), str(HARNESS_ROOT), None, None).run()
-    if report.get("overall_result") != "READY":
-        raise OrchestratorError(f"Target preflight is {report.get('overall_result')}: {report.get('blockers', [])}")
-    store = WorkflowStore(root, workflow_id)
-    state = store.read_state()
-    if not isinstance(state, dict):
-        raise OrchestratorError("The explicitly named existing workflow state is missing")
-    if (state.get("workflow_id") != workflow_id or not isinstance(state.get("target"), dict) or
-            state["target"].get("git_root") != str(root) or
-            state["target"].get("resolved_input_path") != str(root)):
-        raise OrchestratorError("Workflow state identifies another target or workflow")
-    orchestration = state.get("orchestration")
-    if (not isinstance(orchestration, dict) or orchestration.get("current_stage") != "SELF_REVIEW" or
-            state.get("phase") != "IMPLEMENTATION" or state.get("status") != "BLOCKED"):
-        raise OrchestratorError("The migration applies only to the existing BLOCKED IMPLEMENTATION/SELF_REVIEW workflow")
-    existing_rows = _snapshot_migration_rows(state)
-    if existing_rows:
-        row = existing_rows[0]
-        if row["old_sha256"] != expected_old_sha256:
-            raise OrchestratorError("The existing migration record does not match the requested original fingerprint")
-        return {"status": "MIGRATED", "changed": False, "workflow_id": workflow_id,
-                "migration": copy.deepcopy(row)}
-
-    baseline_hashes = orchestration.get("preexisting_hashes")
-    baseline_rows = state.get("baseline", {}).get("preexisting_changes")
-    matches = [row for row in baseline_hashes if isinstance(row, dict) and row.get("path") == DS_STORE_BASENAME] \
-        if isinstance(baseline_hashes, list) else []
-    status_matches = [row for row in baseline_rows if isinstance(row, dict) and row.get("path") == DS_STORE_BASENAME] \
-        if isinstance(baseline_rows, list) else []
-    if (len(matches) != 1 or len(status_matches) != 1 or
-            matches[0].get("worktree_sha256") != expected_old_sha256 or
-            matches[0].get("index_sha256") is not None or
-            status_matches[0].get("working_tree_state") != "untracked"):
-        raise OrchestratorError("Original root .DS_Store baseline does not match the explicitly supplied fingerprint")
-    if orchestration.get("snapshot_policy") is not None:
-        raise OrchestratorError("Workflow already has a snapshot policy but no matching migration record")
-    raw_status = _status(root)
-    current_row = raw_status.get(DS_STORE_BASENAME)
-    file = root / DS_STORE_BASENAME
-    try:
-        file_info = file.lstat()
-    except OSError as exc:
-        raise OrchestratorError("Current root .DS_Store cannot be inspected") from exc
-    if (current_row is None or current_row.get("working_tree_state") != "untracked" or
-            current_row.get("index_sha256") is not None or not stat.S_ISREG(file_info.st_mode)):
-        raise OrchestratorError("Current root .DS_Store is no longer an untracked regular file")
-    current_hash = _sha(file.read_bytes())
-    if current_hash != expected_current_sha256:
-        raise OrchestratorError("Current root .DS_Store fingerprint differs from the explicitly supplied fingerprint")
-    if (not expected_old_sha256.startswith(SNAPSHOT_MIGRATION_OLD_HASH_PREFIX) or
-            not expected_current_sha256.startswith(SNAPSHOT_MIGRATION_CURRENT_HASH_PREFIX)):
-        raise OrchestratorError("Fingerprints do not match the documented Ohpen workflow migration")
-
-    authorizations = state.get("authorizations")
-    if not isinstance(authorizations, list):
-        raise OrchestratorError("Workflow authorization history is malformed")
-    if not isinstance(state["target"].get("target_id"), str) or not state["target"]["target_id"].strip():
-        raise OrchestratorError("Workflow target identity is malformed")
-    now = _now()
-    authorization_id = f"AUTH-SNAPSHOT-{workflow_id}"
-    if any(isinstance(row, dict) and row.get("authorization_id") == authorization_id for row in authorizations):
-        raise OrchestratorError("A conflicting authorization record already uses this migration authorization ID")
-    resource = store.state_path
-    authorization = {
-        "authorization_id": authorization_id,
-        "operation": "modify_workflow_state",
-        "resource": resource,
-        "scope": SNAPSHOT_MIGRATION_AUTHORIZATION_SCOPE,
-        "target_id": state["target"].get("target_id"),
-        "workflow_id": workflow_id,
-        "limits": copy.deepcopy(SNAPSHOT_MIGRATION_AUTHORIZATION_LIMITS),
-        "authorizer_identity": "Requesting user (declared in the explicit task instruction)",
-        "authorizer_kind": "human",
-        "authorizer_role": "Requesting user",
-        "authorizer_identity_assurance": "declared",
-        "authorizer_authentication_reference": None,
-        "authorizer_session_identity": None,
-        "authority_reference": authorization_reference.strip(),
-        "authorized_at": now,
-        "source_reference": authorization_reference.strip(),
-        "expires_or_revocation": "Single use; consumed by the snapshot migration record with the same authorization_id.",
-    }
-    migration = {
-        "migration_id": SNAPSHOT_MIGRATION_ID,
-        "policy_id": SNAPSHOT_POLICY_UNTRACKED_DS_STORE,
-        "path": DS_STORE_BASENAME,
-        "old_sha256": expected_old_sha256,
-        "current_sha256": current_hash,
-        "reason": ("The workflow captured a volatile, untracked macOS metadata file and its bytes changed after initialization. "
-                   "The original bytes could not be recovered from the investigation artifacts. "
-                   "The explicit untracked .DS_Store policy excludes this exact path; every other original path and fingerprint remains enforced."),
-        "recorded_at": now,
-        "original_bytes_recovered": False,
-        "original_bytes_note": "Original file bytes could not be recovered from the investigation artifacts; the old SHA-256 is retained as historical evidence.",
-        "authorization_id": authorization_id,
-    }
-    authorizations.append(authorization)
-    orchestration["snapshot_policy"] = SNAPSHOT_POLICY_UNTRACKED_DS_STORE
-    orchestration["snapshot_migrations"] = [migration]
-    state["updated_at"] = now
-    store.save(state)
-    return {"status": "MIGRATED", "changed": True, "workflow_id": workflow_id,
-            "migration": copy.deepcopy(migration), "authorization_id": authorization_id}
 
 
 def _interaction_store(target: str, workflow_id: str) -> tuple[WorkflowStore, dict[str, Any]]:
@@ -1047,6 +796,19 @@ def record_decision_response(store: WorkflowStore, state: dict[str, Any], decisi
         isinstance(decision.get("policy_or_skill_reference"), str) and
         bool(decision["policy_or_skill_reference"].strip())
     )
+    partial_plan_decision = (
+        decision.get("stage") == "PLANNING" and
+        isinstance(state.get("orchestration"), dict) and
+        isinstance(state["orchestration"].get("plan_reference"), str) and
+        any(isinstance(row, dict) and row.get("blocked_by_decision") is True
+            for row in state["orchestration"].get("increments", []))
+    )
+    if interactive_allowed and partial_plan_decision and action != "APPROVE":
+        store.save(state)
+        return {"workflow_id": state["workflow_id"], "decision_id": decision_id,
+                "decision_status": "open", "workflow_status": "WAITING_FOR_HUMAN",
+                "response_id": response_record["response_id"], "resolved": False,
+                "requires_requirement_update": True, "identity_assurance": "declared"}
     resolved = False
     if interactive_allowed:
         decision["status"] = "resolved"
@@ -1157,18 +919,16 @@ def validate_config(value: Any) -> dict[str, Any]:
             base_ref.startswith("-") or any(char.isspace() or ord(char) < 32 for char in base_ref) or
             not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", base_ref)):
         raise OrchestratorError("base_ref must be an unambiguous Git ref name such as origin/main")
-    authorized_code_paths = value.get("authorized_code_paths")
-    authorized_artifact_paths = value.get("authorized_artifact_paths")
-    if not isinstance(authorized_code_paths, list) or not authorized_code_paths:
-        raise OrchestratorError("authorized_code_paths must explicitly authorize at least one code path")
-    if not isinstance(authorized_artifact_paths, list):
-        raise OrchestratorError("authorized_artifact_paths must be an explicit array (empty when no product artifacts are allowed)")
+    authorized_code_paths = value.get("authorized_code_paths", [])
+    authorized_artifact_paths = value.get("authorized_artifact_paths", [])
+    if not isinstance(authorized_code_paths, list) or not isinstance(authorized_artifact_paths, list):
+        raise OrchestratorError("Legacy authorized path fields, when supplied, must be arrays")
     authorized_code_paths = sorted({_relative(path, "authorized code path") for path in authorized_code_paths})
     authorized_artifact_paths = sorted({_relative(path, "authorized artifact path") for path in authorized_artifact_paths})
     if any(_contained(path, [other]) or _contained(other, [path])
            for path in authorized_code_paths for other in authorized_artifact_paths):
         raise OrchestratorError("Authorized code and artifact paths cannot overlap")
-    extensions = value.get("code_file_extensions")
+    extensions = value.get("code_file_extensions", [])
     if not isinstance(extensions, list) or any(not isinstance(ext, str) or
             not re.fullmatch(r"\.[A-Za-z0-9]+", ext) for ext in extensions):
         raise OrchestratorError("code_file_extensions must be an explicit array of dot-prefixed extensions")
@@ -1259,22 +1019,85 @@ def _legacy_plan_config_sha256(config: dict[str, Any]) -> str:
     return _sha(_json_bytes(legacy_config))
 
 
-def _plan_valid(plan: Any, config: dict[str, Any], *, controller_artifact_paths: list[str] | None = None) -> dict[str, Any]:
+def _plan_valid(plan: Any, config: dict[str, Any], *, controller_artifact_paths: list[str] | None = None,
+                require_discovery: bool = False) -> dict[str, Any]:
     required = {"decision", "summary", "requirements", "acceptance_criteria", "risk_band",
                 "architecture_context", "documentation_context", "capabilities_used", "increments",
-                "decision_context", "dependencies", "blockers"}
-    legacy_required = required - {"decision_context", "dependencies", "blockers"}
+                "decision_context", "dependencies", "blockers", "engineering_discovery"}
+    prior_required = required - {"engineering_discovery"}
+    prior_legacy = prior_required - {"decision_context", "dependencies", "blockers"}
     if (controller_artifact_paths is not None and isinstance(plan, dict) and
-            frozenset(plan) in {frozenset(legacy_required), frozenset(legacy_required | {"decision_context"})}):
+            frozenset(plan) in {frozenset(prior_legacy), frozenset(prior_legacy | {"decision_context"})}):
         plan["decision_context"] = None
         plan.setdefault("dependencies", [])
         plan.setdefault("blockers", [])
+    if isinstance(plan, dict) and set(plan) == prior_required and not require_discovery:
+        plan["engineering_discovery"] = {"quality_requirements": [], "constraints_and_dependencies": [],
+            "ambiguities": [], "scenarios": [{"id": "SC-LEGACY", "scenario": "Existing stored plan",
+                "expected_behavior": "Preserve prior plan behavior", "verification": "Use its existing criteria",
+                "requirement_ids": []}], "assumptions": [], "decisions": []}
+    if isinstance(plan, dict) and not require_discovery and isinstance(plan.get("increments"), list):
+        for increment in plan["increments"]:
+            if isinstance(increment, dict) and "blocked_by_decision" not in increment:
+                increment["blocked_by_decision"] = False
     if not isinstance(plan, dict) or set(plan) != required:
         raise OrchestratorError("Codex plan does not match the plan response contract")
     if not isinstance(plan["decision"], str) or plan["decision"] not in {"READY", "NEEDS_HUMAN_INPUT"}:
         raise OrchestratorError("Plan decision must be READY or NEEDS_HUMAN_INPUT")
     if not isinstance(plan["summary"], str) or not plan["summary"].strip():
         raise OrchestratorError("Plan summary must be a non-empty string")
+    discovery = plan["engineering_discovery"]
+    discovery_fields = {"quality_requirements", "constraints_and_dependencies", "ambiguities", "scenarios", "assumptions", "decisions"}
+    if not isinstance(discovery, dict) or set(discovery) != discovery_fields:
+        raise OrchestratorError("Plan engineering_discovery does not match the discovery contract")
+    for field in ("quality_requirements", "constraints_and_dependencies"):
+        if not isinstance(discovery[field], list):
+            raise OrchestratorError(f"Discovery {field} must be an array")
+        for item in discovery[field]:
+            if not isinstance(item, dict) or set(item) != {"id", "text", "source"} or any(
+                    not isinstance(item[key], str) or not item[key].strip() for key in item):
+                raise OrchestratorError(f"Discovery {field} records require id, text, and source")
+    for field in ("ambiguities", "scenarios", "assumptions", "decisions"):
+        if not isinstance(discovery[field], list):
+            raise OrchestratorError(f"Discovery {field} must be an array")
+    if not discovery["scenarios"]:
+        raise OrchestratorError("Engineering discovery must identify at least one relevant scenario")
+    for item in discovery["ambiguities"]:
+        if (not isinstance(item, dict) or set(item) != {"id", "question", "impact", "recommendation", "requires_human_input"} or
+                any(not isinstance(item[key], str) or not item[key].strip()
+                    for key in ("id", "question", "impact", "recommendation")) or
+                not isinstance(item["requires_human_input"], bool)):
+            raise OrchestratorError("Discovery ambiguity record is incomplete")
+    for item in discovery["scenarios"]:
+        if (not isinstance(item, dict) or set(item) != {"id", "scenario", "expected_behavior", "verification", "requirement_ids"} or
+                any(not isinstance(item[key], str) or not item[key].strip()
+                    for key in ("id", "scenario", "expected_behavior", "verification")) or
+                not isinstance(item["requirement_ids"], list)):
+            raise OrchestratorError("Discovery scenario must include observable behavior and verification")
+    for item in discovery["assumptions"]:
+        if (not isinstance(item, dict) or set(item) != {"id", "description", "rationale", "impact_if_wrong", "reversible", "requires_confirmation"} or
+                any(not isinstance(item[key], str) or not item[key].strip()
+                    for key in ("id", "description", "rationale", "impact_if_wrong")) or
+                not isinstance(item["reversible"], bool) or not isinstance(item["requires_confirmation"], bool)):
+            raise OrchestratorError("Discovery assumption must state rationale, impact, reversibility, and confirmation needs")
+    for item in discovery["decisions"]:
+        if (not isinstance(item, dict) or set(item) != {"id", "category", "decision", "rationale", "alternatives", "requires_human_input"} or
+                item.get("category") not in {"engineering", "technical_tradeoff", "product_business"} or
+                any(not isinstance(item[key], str) or not item[key].strip()
+                    for key in ("id", "decision", "rationale")) or
+                not isinstance(item["alternatives"], list) or
+                any(not isinstance(value, str) or not value.strip() for value in item["alternatives"]) or
+                not isinstance(item["requires_human_input"], bool)):
+            raise OrchestratorError("Discovery decision must identify category, alternatives, rationale, and authority")
+        if item["category"] == "engineering" and item["requires_human_input"]:
+            raise OrchestratorError("Routine engineering decisions must be decided and documented without human approval")
+    unresolved_discovery_items = (
+        any(item["requires_human_input"] for item in discovery["ambiguities"]) or
+        any(item["requires_confirmation"] for item in discovery["assumptions"]) or
+        any(item["requires_human_input"] for item in discovery["decisions"])
+    )
+    if unresolved_discovery_items and plan["decision"] != "NEEDS_HUMAN_INPUT":
+        raise OrchestratorError("Plan cannot be READY while engineering discovery still requires human input")
     if not isinstance(plan["risk_band"], str) or plan["risk_band"] not in RISK:
         raise OrchestratorError("Plan risk_band must be low, medium, or high")
     plan["risk_band"] = max((plan["risk_band"], config["minimum_risk_band"]), key=RISK.get)
@@ -1308,15 +1131,19 @@ def _plan_valid(plan: Any, config: dict[str, Any], *, controller_artifact_paths:
     elif decision_context is not None:
         raise OrchestratorError("A ready plan cannot include a pending decision context")
     if plan["decision"] == "NEEDS_HUMAN_INPUT":
-        if any(plan[field] for field in ("requirements", "acceptance_criteria", "increments")):
-            raise OrchestratorError("A blocked plan cannot include requirements, criteria, or increments")
         if any(not isinstance(plan[field], list) for field in
                ("requirements", "acceptance_criteria", "architecture_context", "documentation_context", "capabilities_used", "increments", "dependencies", "blockers")):
             raise OrchestratorError("Plan collections must be arrays")
         if any(not isinstance(value, str) or not value.strip()
                for field in ("dependencies", "blockers") for value in plan[field]):
             raise OrchestratorError("Plan dependencies and blockers must be non-empty strings")
-        return plan
+        has_requirements = bool(plan["requirements"])
+        has_criteria = bool(plan["acceptance_criteria"])
+        has_increments = bool(plan["increments"])
+        if not any((has_requirements, has_criteria, has_increments)):
+            return plan
+        if not all((has_requirements, has_criteria, has_increments)):
+            raise OrchestratorError("A plan with independent work must include requirements, criteria, and increments")
     for field in ("requirements", "acceptance_criteria", "increments"):
         if not isinstance(plan[field], list) or not plan[field]:
             raise OrchestratorError(f"Plan {field} must be non-empty")
@@ -1330,13 +1157,19 @@ def _plan_valid(plan: Any, config: dict[str, Any], *, controller_artifact_paths:
             if item["id"] in criteria:
                 raise OrchestratorError("Plan IDs must be unique")
             criteria.add(item["id"])
+    requirement_ids = {item["id"] for item in plan["requirements"]}
+    scenario_ids: set[str] = set()
+    for item in discovery["scenarios"]:
+        if item["id"] in scenario_ids or not set(item["requirement_ids"]) <= requirement_ids:
+            raise OrchestratorError("Discovery scenario IDs must be unique and link to known requirements")
+        scenario_ids.add(item["id"])
     for field in ("architecture_context", "documentation_context"):
         if not isinstance(plan[field], list) or any(not isinstance(x, str) or not x.strip() for x in plan[field]):
             raise OrchestratorError(f"Plan {field} must be an array of non-empty strings")
     for field in ("dependencies", "blockers"):
         if not isinstance(plan[field], list) or any(not isinstance(x, str) or not x.strip() for x in plan[field]):
             raise OrchestratorError(f"Plan {field} must be an array of non-empty strings")
-    if plan["blockers"]:
+    if plan["blockers"] and plan["decision"] == "READY":
         raise OrchestratorError("A READY plan cannot contain unresolved blockers")
     if not isinstance(plan["capabilities_used"], list):
         raise OrchestratorError("Plan capabilities_used must be an array")
@@ -1362,12 +1195,16 @@ def _plan_valid(plan: Any, config: dict[str, Any], *, controller_artifact_paths:
     validation_ids = {x["id"] for x in config["validations"]}
     increment_ids = set()
     expected = {"increment_id", "title", "code_paths", "artifact_paths", "revision_paths",
-                "acceptance_criteria_ids", "validation_ids"}
+                "acceptance_criteria_ids", "validation_ids", "blocked_by_decision"}
     for inc in plan["increments"]:
         if not isinstance(inc, dict) or set(inc) != expected:
             raise OrchestratorError("Increment does not match the increment contract")
         if not isinstance(inc["increment_id"], str) or not SAFE_ID.fullmatch(inc["increment_id"]) or inc["increment_id"] in increment_ids:
             raise OrchestratorError("Increment IDs must be unique safe identifiers")
+        if not isinstance(inc["blocked_by_decision"], bool):
+            raise OrchestratorError("Increment blocked_by_decision must be boolean")
+        if inc["blocked_by_decision"] and plan["decision"] != "NEEDS_HUMAN_INPUT":
+            raise OrchestratorError("Only a plan with an unresolved user decision may defer increments")
         increment_ids.add(inc["increment_id"])
         for field in ("code_paths", "artifact_paths", "revision_paths", "acceptance_criteria_ids", "validation_ids"):
             if not isinstance(inc[field], list):
@@ -1382,11 +1219,16 @@ def _plan_valid(plan: Any, config: dict[str, Any], *, controller_artifact_paths:
                     raise OrchestratorError(f"Increment {field} values must be non-empty strings")
                 if len(set(inc[field])) != len(inc[field]):
                     raise OrchestratorError(f"Increment {field} values must be unique")
-        if not all(_contained(path, config["authorized_code_paths"]) for path in inc["code_paths"]):
-            raise OrchestratorError("Plan code_paths exceed the explicitly authorized code paths")
-        allowed_artifact_paths = config["authorized_artifact_paths"] + (controller_artifact_paths or [])
-        if not all(_contained(path, allowed_artifact_paths) for path in inc["artifact_paths"]):
-            raise OrchestratorError("Plan artifact_paths exceed the explicitly authorized artifact paths")
+        for path in inc["code_paths"] + inc["artifact_paths"] + inc["revision_paths"]:
+            controller_artifact = path in (controller_artifact_paths or []) and path in inc["artifact_paths"]
+            if (".git" in PurePosixPath(path).parts or SECRET_PATH.search(path) or
+                    ((path == ".engineering/workflows" or path.startswith(".engineering/workflows/"))
+                     and not controller_artifact)):
+                raise OrchestratorError(f"Plan path is reserved or sensitive: {path}")
+        if controller_artifact_paths and not all(
+                not (path == self_path or path.startswith(self_path + "/"))
+                for path in inc["code_paths"] for self_path in controller_artifact_paths):
+            raise OrchestratorError("Plan code paths cannot overlap controller-owned workflow artifacts")
         for code_path in inc["code_paths"]:
             if any(_contained(code_path, [artifact]) or _contained(artifact, [code_path])
                    for artifact in inc["artifact_paths"]):
@@ -1418,9 +1260,20 @@ def _stage_valid(result: Any, *, correction: bool = False) -> dict[str, Any]:
     if not isinstance(result["changes"], list):
         raise OrchestratorError("Codex stage changes must be an array")
     for change in result["changes"]:
-        if (not isinstance(change, dict) or set(change) != {"path", "content"} or
-                not isinstance(change["path"], str) or not isinstance(change["content"], str)):
-            raise OrchestratorError("Each Codex change must contain a string path and UTF-8 content")
+        if not isinstance(change, dict) or not isinstance(change.get("path"), str):
+            raise OrchestratorError("Each Codex change must name a workspace-relative path")
+        operation = change.get("operation")
+        if operation is None:
+            if set(change) != {"path", "content"} or not isinstance(change.get("content"), str):
+                raise OrchestratorError("Workspace file writes require path and UTF-8 content")
+        elif operation == "delete":
+            if set(change) != {"path", "operation"}:
+                raise OrchestratorError("Delete changes require only path and operation")
+        elif operation == "rename":
+            if set(change) != {"path", "operation", "destination"} or not isinstance(change.get("destination"), str):
+                raise OrchestratorError("Rename changes require source path, operation, and destination")
+        else:
+            raise OrchestratorError("Workspace file operation is unsupported")
     decisions = result["finding_decisions"]
     if not isinstance(decisions, list):
         raise OrchestratorError("Codex finding_decisions must be an array")
@@ -1440,29 +1293,167 @@ def _stage_valid(result: Any, *, correction: bool = False) -> dict[str, Any]:
     return result
 
 
-def _run_command(argv: list[str], cwd: Path, timeout: int,
-                 process_runner: Callable[..., Any]) -> dict[str, Any]:
+PACKAGE_COMMANDS = {
+    "pip": {"install", "list", "check", "show"},
+    "pip3": {"install", "list", "check", "show"},
+    "uv": {"sync", "install", "add", "run", "pip", "lock"},
+    "npm": {"install", "ci", "update", "run", "test", "build", "list"},
+    "pnpm": {"install", "add", "update", "run", "test", "build", "list"},
+    "yarn": {"install", "add", "upgrade", "run", "test", "build", "list"},
+    "poetry": {"install", "add", "update", "run", "lock", "check"},
+    "cargo": {"build", "test", "check", "clippy", "fmt", "fetch"},
+    "go": {"test", "build", "vet", "mod"},
+    "dotnet": {"test", "build", "restore", "format"},
+}
+PACKAGE_MANAGER_ENV = re.compile(
+    r"(?i)^(?:PIP_(?:INDEX_URL|EXTRA_INDEX_URL|TRUSTED_HOST|CONFIG_FILE)|"
+    r"UV_(?:INDEX|EXTRA_INDEX_URL|INDEX_URL)|NPM_CONFIG_(?:REGISTRY|USERCONFIG)|"
+    r"YARN_(?:REGISTRY|NPM_REGISTRY)|POETRY_REPOSITORIES_.*|"
+    r"(?:HTTP|HTTPS|ALL|NO)_PROXY)$"
+)
+PACKAGE_MANAGER_FORBIDDEN_OPTIONS = {
+    "--index-url", "--extra-index-url", "--trusted-host", "--registry", "--config",
+    "--global", "-g", "--user", "--prefix", "--root", "--target", "--force",
+    "--force-reinstall", "--location", "--system",
+}
+
+
+def _package_manager_invocation(argv: list[str]) -> tuple[str, str, list[str]] | None:
+    """Recognize direct package managers and the common ``python -m pip`` form."""
     executable = Path(argv[0]).name.lower()
-    denied = {"sh", "bash", "zsh", "fish", "cmd", "powershell", "pwsh", "curl", "wget",
-              "git", "codex", "aily", "claude", "ssh", "scp", "gh", "aws", "az", "gcloud",
-              "kubectl", "helm", "terraform", "tofu", "docker", "podman", "brew", "pip", "pip3",
-              "uv", "npm", "pnpm", "yarn"}
+    command_index = 1
+    if executable in {"python", "python3"} or re.fullmatch(r"python3?\.\d+", executable):
+        if len(argv) >= 4 and argv[1:3] == ["-m", "pip"]:
+            executable, command_index = "pip", 3
+        else:
+            return None
+    elif re.fullmatch(r"pip3?\.\d+", executable):
+        executable = "pip3" if executable.startswith("pip3") else "pip"
+    if executable not in PACKAGE_COMMANDS or len(argv) <= command_index:
+        return None
+    return executable, argv[command_index].lower(), argv[command_index + 1:]
+
+
+def _argument_escapes_workspace(argument: str, cwd: Path, workspace_root: Path) -> bool:
+    value = argument.split("=", 1)[1] if argument.startswith("--") and "=" in argument else argument
+    if not value or value.startswith("-") or "://" in value:
+        return False
+    if SECRET_PATH.search(value):
+        return True
+    path_like = (Path(value).is_absolute() or value in {"..", "."} or
+                 value.startswith(("./", "../", ".\\", "..\\")) or "/../" in value or "\\..\\" in value)
+    if not path_like:
+        return False
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = cwd / candidate
+    try:
+        resolved = candidate.resolve(strict=False)
+    except OSError:
+        return True
+    return resolved != workspace_root and workspace_root not in resolved.parents
+
+
+def _validate_local_git_command(argv: list[str], cwd: Path, workspace_root: Path,
+                                stageable_paths: set[str] | None) -> None:
+    """Permit local inspection and exact-path staging; reject Git state transitions.
+
+    Git's top-level subcommand alone is not enough to establish that a command is
+    read-only (for example, ``git branch new-name`` creates a ref). Keep the
+    automatic set small and make staging explicit and workspace-relative.
+    """
+    args = argv[1:]
+    if not args:
+        raise OrchestratorError("Git command needs an explicit local operation")
+    subcommand = args[0].lower()
+    args = args[1:]
+    path_overrides = {"-C", "--git-dir", "--work-tree", "--namespace", "--exec-path", "-c", "--config-env"}
+    if any(arg in path_overrides or arg.startswith(("--git-dir=", "--work-tree=", "--namespace="))
+           for arg in args):
+        raise OrchestratorError("Git commands cannot select another repository or override local configuration")
+
+    if subcommand == "add":
+        if not args or args[0] != "--" or len(args) == 1:
+            raise OrchestratorError("Automatic git add requires -- followed by exact workspace-relative paths")
+        if stageable_paths is None:
+            raise OrchestratorError("Automatic git add is limited to paths changed by the active workflow increment")
+        for value in args[1:]:
+            path = PurePosixPath(value)
+            if (path.is_absolute() or path.as_posix() != value or value in {".", ".."} or
+                    any(part in {".", "..", ".git"} for part in path.parts) or
+                    any(char in value for char in "*?[]:") or "\\" in value or
+                    SECRET_PATH.search(value) or _argument_escapes_workspace(value, cwd, workspace_root)):
+                raise OrchestratorError("Automatic git add accepts only exact, non-sensitive paths inside the workspace")
+            relative = (Path(cwd) / value).resolve(strict=False).relative_to(workspace_root).as_posix()
+            if relative not in stageable_paths:
+                raise OrchestratorError("Automatic git add cannot stage pre-existing or out-of-increment paths")
+        return
+
+    if subcommand in {"status", "diff", "log", "show", "rev-parse", "ls-files", "check-ignore"}:
+        return
+    if subcommand == "branch" and (not args or args in (["--show-current"], ["--list"])):
+        return
+    raise OrchestratorError(
+        "Git mutation beyond exact-path staging, including commit, checkout, branch creation, reset, clean, merge, and remote operations, needs separate authorization"
+    )
+
+
+def _run_command(argv: list[str], cwd: Path, timeout: int,
+                 process_runner: Callable[..., Any], *, workspace_root: Path | None = None,
+                 stageable_paths: set[str] | None = None) -> dict[str, Any]:
+    executable = Path(argv[0]).name.lower()
     subcommand = argv[1].lower() if len(argv) > 1 else ""
-    dangerous_arguments = any(arg.lower().startswith(("http://", "https://", "--force", "--dangerous"))
-                              for arg in argv[1:])
-    if executable in denied or dangerous_arguments or subcommand in {"install", "restore", "clean", "push", "publish"}:
-        raise OrchestratorError(f"Validation {argv[0]} has a prohibited install, network, Git, or destructive shape")
-    if executable == "dotnet" and len(argv) > 1 and argv[1] in {"test", "build"} and "--no-restore" not in argv:
+    shell_or_remote = {"sh", "bash", "zsh", "fish", "cmd", "powershell", "pwsh", "curl", "wget",
+                       "codex", "aily", "claude", "ssh", "scp", "gh", "aws", "az", "gcloud",
+                       "kubectl", "helm", "terraform", "tofu", "docker", "podman", "brew", "env",
+                       "nohup", "nice", "timeout", "xargs", "sudo", "doas", "su", "runas",
+                       "pkexec", "osascript", "systemctl", "launchctl", "service"}
+    direct_delete_commands = {"rm", "rmdir", "unlink", "shred", "srm", "truncate"}
+    if executable.startswith("git-"):
+        raise OrchestratorError("Direct Git transport and helper executables are prohibited")
+    if executable in direct_delete_commands:
+        raise OrchestratorError(
+            "Direct destructive filesystem commands are prohibited; remove workflow-created files through Safe Writer"
+        )
+    package_invocation = _package_manager_invocation(argv)
+    if executable in shell_or_remote:
+        raise OrchestratorError(f"Validation command {argv[0]} is prohibited by the local workspace execution policy")
+    if (executable in {"python", "python3", "node", "ruby", "perl", "php"} and
+            any(arg in {"-c", "-e", "-r", "-"} for arg in argv[1:])):
+        raise OrchestratorError("Inline-code and stdin command execution are prohibited by the local workspace policy")
+    target_root = Path(workspace_root or cwd).resolve()
+    resolved_cwd = Path(cwd).resolve()
+    if resolved_cwd != target_root and target_root not in resolved_cwd.parents:
+        raise OrchestratorError("Validation command working directory is outside the authorized workspace")
+    if executable == "git":
+        _validate_local_git_command(argv, resolved_cwd, target_root, stageable_paths)
+    if package_invocation is not None:
+        manager, manager_subcommand, manager_args = package_invocation
+        forbidden_option_prefixes = tuple(option + "=" for option in PACKAGE_MANAGER_FORBIDDEN_OPTIONS
+                                          if option.startswith("--"))
+        external_reference = re.compile(r"(?i)(?:[a-z][a-z0-9+.-]*://|(?:file|link|workspace):|\bgit@[^:/]+:)")
+        if (manager_subcommand not in PACKAGE_COMMANDS[manager] or
+                any(arg.lower() in PACKAGE_MANAGER_FORBIDDEN_OPTIONS or
+                    arg.lower().startswith(forbidden_option_prefixes) or external_reference.search(arg)
+                    for arg in manager_args)):
+            raise OrchestratorError("Package manager command is outside the approved local dependency workflow")
+    elif any(arg.lower().startswith(("http://", "https://", "--force", "--dangerous"))
+             for arg in argv[1:]):
+        raise OrchestratorError("Validation command includes an external or destructive argument")
+    if any(_argument_escapes_workspace(arg, resolved_cwd, target_root) for arg in argv[1:]):
+        raise OrchestratorError("Validation command argument references a sensitive or out-of-workspace path")
+    if executable == "dotnet" and subcommand in {"test", "build"} and "--no-restore" not in argv:
+        # A target may put restore and build in separate configured commands.
         raise OrchestratorError("dotnet test/build validations must include --no-restore")
     started = _now()
     begin = time.monotonic()
     secret_env = re.compile(r"(?i)(secret|token|password|credential|private.?key|api.?key|auth)")
     env = {k: v for k, v in os.environ.items()
-           if not k.startswith("GIT_") and not secret_env.search(k)}
+           if not k.startswith("GIT_") and not secret_env.search(k) and not PACKAGE_MANAGER_ENV.search(k)}
     env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
-                "GIT_TERMINAL_PROMPT": "0", "UV_OFFLINE": "1", "PIP_NO_INDEX": "1",
+                "GIT_TERMINAL_PROMPT": "0",
                 "NUGET_XMLDOC_MODE": "skip", "DOTNET_CLI_TELEMETRY_OPTOUT": "1",
-                "DOTNET_NOLOGO": "1", "npm_config_offline": "true"})
+                "DOTNET_NOLOGO": "1"})
     try:
         result = process_runner(argv, cwd=str(cwd), env=env, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, timeout=timeout, check=False)
@@ -1484,8 +1475,7 @@ class Orchestrator:
     def __init__(self, target: str, task: str, config: dict[str, Any], workflow_id: str,
                  *, codex: str = "codex", aily: str | None = None,
                  process_runner: Callable[..., Any] = subprocess.run,
-                 update_requirements_reason: str | None = None,
-                 self_review_recovery_authorization_reference: str | None = None) -> None:
+                 update_requirements_reason: str | None = None) -> None:
         if not Path(target).is_absolute() or not task.strip() or not SAFE_ID.fullmatch(workflow_id):
             raise OrchestratorError("An absolute target, non-empty task, and safe workflow ID are required")
         self.target = canonical(target)
@@ -1494,7 +1484,6 @@ class Orchestrator:
         self.workflow_id, self.codex, self.aily = workflow_id, codex, aily
         self.process_runner = process_runner
         self.update_requirements_reason = update_requirements_reason
-        self.self_review_recovery_authorization_reference = self_review_recovery_authorization_reference
         self._codex_version: str | None = None
         self._codex_model: str | None = None
         self._codex_provider: str | None = None
@@ -1522,8 +1511,7 @@ class Orchestrator:
             raise OrchestratorError(f"Target preflight is {report['overall_result']}: {report.get('blockers', [])}")
         self.store.ensure_directory()
         existing = self.store.read_state()
-        current = (_status_for_workflow(self.target, existing) if existing is not None else
-                   _status(self.target, exclude_untracked_ds_store=True))
+        current = _status(self.target)
         if existing:
             status = existing.get("status")
             target_record = existing.get("target")
@@ -1568,18 +1556,16 @@ class Orchestrator:
                     not isinstance(orchestration.get("increments"), list) or
                     not isinstance(orchestration.get("validation_results"), list)):
                 raise OrchestratorError("Existing workflow state has malformed baseline, authorization, or history records")
-            migrated_snapshot_paths = {row["path"] for row in _snapshot_migration_rows(existing)}
             for item in preexisting_hashes:
                 if (not isinstance(item, dict) or not isinstance(item.get("path"), str) or
                         not isinstance(item.get("protected_path"), bool) or
                         item.get("worktree_sha256") is not None and not isinstance(item.get("worktree_sha256"), str) or
                         item.get("index_sha256") is not None and not isinstance(item.get("index_sha256"), str)):
                     raise OrchestratorError("Existing workflow state contains a malformed pre-existing path record")
-                if item["path"] in migrated_snapshot_paths and \
-                        _is_regular_untracked_ds_store(self.target, item["path"]):
-                    continue
                 latest = current.get(item["path"])
                 if (not latest or latest["index_sha256"] != item["index_sha256"] or
+                        (item.get("protected_path") and "worktree_metadata" in item and
+                         latest.get("worktree_metadata") != item["worktree_metadata"]) or
                         (not item.get("protected_path") and latest["worktree_sha256"] != item["worktree_sha256"])):
                     raise OrchestratorError(f"Pre-existing change changed since workflow start: {item['path']}")
             task_changed = orchestration.get("task_sha256") != _sha(self.task.encode())
@@ -1647,6 +1633,13 @@ class Orchestrator:
             "baseline": {"commit": head, "status_captured_at": _now(), "working_tree_fingerprint": status_fp,
                          "preexisting_changes": preexisting},
             "phase": "DISCOVERY", "status": "ACTIVE", "phase_records": [], "artifact_references": [task_reference, preflight_reference],
+            "execution_policy": {"version": 1, "mode": "workspace", "workspace_root": str(self.target),
+                "workflow_id": self.workflow_id, "authorized_at": _now(),
+                "source_reference": f"task:{self.workflow_id}",
+                "allowed": ["workspace file operations", "development commands", "approved package managers",
+                    "local Git inspection and exact-path staging", "workflow evidence and recovery"],
+                "retained_protections": ["outside workspace", "Git metadata", "secrets", "pre-existing dirty user changes",
+                    "commit/push/merge/deploy/publish", "external writes", "paid services without authorization"]},
             "findings_register_reference": f"{self.store.directory}/findings-register.json",
             "review_assignments": [], "authorized_instruction_roots": report.get("authorized_instruction_roots", [str(self.target)]),
             "instruction_records": instructions, "applied_capabilities": [], "authorizations": [],
@@ -1654,18 +1647,18 @@ class Orchestrator:
                 "identity_assurance": "declared", "source_reference": f"task:{self.workflow_id}",
                 "authentication_reference": None, "authority_reference": None},
             "claude_review_cycles": [], "pending_decisions": [], "updated_at": _now(),
-            "orchestration": {"version": 1, "snapshot_policy": SNAPSHOT_POLICY_UNTRACKED_DS_STORE,
-                "snapshot_migrations": [], "task_sha256": _sha(self.task.encode()),
+            "orchestration": {"version": 1, "task_sha256": _sha(self.task.encode()),
                 "config_sha256": _sha(_json_bytes(self.config)),
                 "branch": branch, "current_stage": "PLANNING", "max_iterations": self.config["max_iterations"],
                 "git_tracking": git_tracking,
                 "iteration": 0, "current_increment_id": None, "plan_reference": None, "increments": [],
                 "attempts": [], "validation_results": [], "review_results": [], "correction_status": [],
+                "workflow_created_paths": [],
                 "current_requirement_version": 1,
                 "requirement_history": [{"version": 1, "task_sha256": _sha(self.task.encode()),
                     "task_reference": f"{self.store.directory}/requirements-v1.json", "reason": "initial requirement snapshot",
                     "created_at": _now(), "status": "current"}],
-                "invalidations": [], "self_reviews": [], "self_review_recovery_authorizations": [],
+                "invalidations": [], "self_reviews": [],
                 "config_snapshot": copy.deepcopy(self.config),
                 "claude_authorization": copy.deepcopy(self.config["review"].get("authorization")),
                 "claude_authorization_history": ([{"authorization_id": self.config["review"]["authorization"]["authorization_id"],
@@ -1674,7 +1667,9 @@ class Orchestrator:
                     "authorization_sha256": _sha(_json_bytes(self.config["review"]["authorization"]))}]
                     if self.config["review"].get("authorization") else []),
                 "claude_authorization_uses": [],
-                "preexisting_hashes": [{"path": p, "worktree_sha256": row["worktree_sha256"], "index_sha256": row["index_sha256"],
+                "preexisting_hashes": [{"path": p, "worktree_sha256": row["worktree_sha256"],
+                                         "worktree_metadata": row.get("worktree_metadata"),
+                                         "index_sha256": row["index_sha256"],
                                          "protected_path": bool(SECRET_PATH.search(p))}
                                        for p, row in sorted(current.items())],
                 "commit_authorization_fingerprint": None},
@@ -2089,46 +2084,6 @@ class Orchestrator:
                 return True
         return False
 
-    def _authorize_ohpen_self_review_recovery(self, blocker_hash: str) -> dict[str, Any] | None:
-        reference = self.self_review_recovery_authorization_reference
-        if reference is None:
-            return None
-        orchestration = self.state["orchestration"]
-        blocker = self.state.get("blocker", {})
-        attempts = orchestration.get("attempts", [])
-        if (not isinstance(reference, str) or not reference.strip() or len(reference) > 1000 or
-                self.workflow_id != OHPEN_RECOVERY_WORKFLOW_ID or self.state.get("status") != "BLOCKED" or
-                orchestration.get("current_stage") != "SELF_REVIEW" or
-                blocker_hash != OHPEN_RECOVERY_BLOCKER_SHA256 or
-                blocker.get("reason") != "Self-review findings remain after the bounded correction loop" or
-                len(attempts) != OHPEN_RECOVERY_EXPECTED_ATTEMPTS):
-            raise OrchestratorError("One-use recovery authorization does not match the recorded Ohpen workflow state")
-        rows = orchestration.setdefault("self_review_recovery_authorizations", [])
-        if rows:
-            raise OrchestratorError("The one-use Ohpen self-review recovery authorization was already recorded")
-        authorization = {"authorization_id": f"AUTH-SELF-REVIEW-{self.workflow_id}-{blocker_hash[:12]}",
-            "operation": "resume_blocked_self_review_once", "target_id": self.state["target"]["target_id"],
-            "workflow_id": self.workflow_id, "stage": "SELF_REVIEW", "blocker_sha256": blocker_hash,
-            "reason": "User authorized one recovery to exercise the controller-managed process-evidence lifecycle.",
-            "source_reference": reference.strip(), "authorizer_identity": "Requesting user",
-            "identity_assurance": "declared", "authorized_at": _now(), "status": "authorized",
-            "consumed_at": None, "resume_attempt_number": None}
-        rows.append(authorization)
-        self._save()
-        return authorization
-
-    def _available_ohpen_self_review_recovery(self, blocker_hash: str) -> dict[str, Any] | None:
-        rows = self.state["orchestration"].get("self_review_recovery_authorizations", [])
-        if not isinstance(rows, list):
-            raise OrchestratorError("Self-review recovery authorization history is malformed")
-        matches = [row for row in rows if isinstance(row, dict) and
-                   row.get("workflow_id") == self.workflow_id and row.get("blocker_sha256") == blocker_hash]
-        if len(matches) > 1:
-            raise OrchestratorError("Workflow contains duplicate one-use self-review recovery authorizations")
-        if matches and matches[0].get("status") == "authorized":
-            return matches[0]
-        return None
-
     def _codex_runtime_metadata(self, binary: str) -> dict[str, Any]:
         if self._codex_version is None:
             self._codex_version = "unavailable"
@@ -2354,14 +2309,14 @@ class Orchestrator:
                "applies. Set interactive_resolution_allowed true only for a functional decision where the cited target "
                "instruction explicitly accepts an interactive user response; this never authorizes external operations "
                "or High-risk approvals. Otherwise set it false. When the plan is READY, decision_context must be null. "
-               "Re-evaluate the current architecture classification and rationale from the target repository patterns, including DataView/non-DataView where applicable. Reassess applicable capabilities/skills, dependencies, write scopes, acceptance criteria, and validations from the current requirement version. Do not carry forward superseded decisions as approvals. Return only JSON matching the schema.\n"
+               "Complete engineering_discovery before finalizing the plan: classify requirements and quality constraints, enumerate proportionate failure/concurrency/recovery/security scenarios with expected behavior and verification, document assumptions and their impact/reversibility, and categorize decisions. Decide routine engineering matters autonomously; require user input only for consequential product/business choices or separately restricted operations. If one decision blocks only some increments, return the complete plan with decision=NEEDS_HUMAN_INPUT and mark only dependent increments blocked_by_decision=true; independent increments may proceed while the answer is pending. If no work is safely independent, return a decision-only response. Batch related questions when practical. Re-evaluate architecture, capabilities, dependencies, acceptance criteria, and validations from the current requirement version. Workspace paths describe review scope and do not require separate approval. Do not carry forward superseded decisions as approvals. Return only JSON matching the schema.\n"
                if stage == "PLANNING" else
                "Perform a read-only self-review of the exact current implementation increment against the current requirement, approved decisions, architecture context, selected skills and their repository patterns, acceptance criteria, and authorized review scope. Report every concrete implementation deviation. Use only workflow records available at the evidence_cutoff in Stage context; assess no record created after that cutoff. The controller-managed process evidence file is excluded from review and must not be required to describe this or any future self-review execution. If implementation findings exist, provide the minimal safe corrections as complete UTF-8 file contents in changes; do not claim unresolved findings are corrected. Do not write files directly. Return only JSON matching the self-review schema.\n"
                if stage == "SELF_REVIEW" else
                "Implement only the current increment by returning complete UTF-8 text for changed/new files in the JSON changes array. "
-               "You are read-only and must not write target files directly. Every changed path must be beneath exactly one supplied code_paths or artifact_paths entry. "
-               "Do not modify workflow state, environment files, credentials, unrelated files, or Git index. Do not install, download, access network services, deploy, commit, or push. "
-               "Do not return deletions or binary files. Always include finding_decisions; use an empty array outside correction. "
+               "You are read-only and must not write target files directly. Return changed files anywhere inside the initialized workspace_root; the controller enforces workspace containment, preserves dirty pre-existing user changes, and excludes Git metadata, sensitive paths, and controller-owned workflow records. Increment paths are review guidance, not additional authorization. "
+               "You may modify relevant existing source, tests, configuration, and documentation. Do not modify workflow state, environment files, credentials, unrelated files, or Git index. Do not install or download skills, contact external services, deploy, commit, or push. Configured local validations and approved package-manager operations run through the controller. "
+               "Return text writes for workspace files. A delete or rename operation is available only for paths listed in workflow_created_paths; never remove or rename a pre-existing file. Always include finding_decisions; use an empty array outside correction. "
                "Return only JSON matching the schema.\n")
         )
         with tempfile.TemporaryDirectory(prefix="codex-stage-") as temp:
@@ -2464,60 +2419,12 @@ class Orchestrator:
             self._save()
             return result
 
-    def _resolve_authorized_ohpen_correction_deferral(self) -> None:
-        """Record the user's explicit instruction to retry this correction with controller support."""
-        assert self.state is not None
-        orchestration = self.state.get("orchestration", {})
-        if (self.workflow_id != OHPEN_RECOVERY_WORKFLOW_ID or
-                self.state.get("status") != "WAITING_FOR_HUMAN" or
-                self.state.get("phase") != "CORRECTION" or
-                orchestration.get("current_stage") != "CORRECTION"):
-            return
-        matches = [row for row in self.state.get("pending_decisions", [])
-                   if isinstance(row, dict) and row.get("decision_id") == "CLAUDE-FINDING-DECISION" and
-                   row.get("status") == "open"]
-        if len(matches) != 1:
-            return
-        expected_findings = {"CR-1", "CR-2", "CR-3", "CR-4", "CR-5"}
-        cycles = [row for row in self.state.get("claude_review_cycles", [])
-                  if isinstance(row, dict) and row.get("increment_id") == orchestration.get("current_increment_id")]
-        if len(cycles) != 1 or not cycles[0].get("rounds"):
-            return
-        latest = cycles[0]["rounds"][-1]
-        if latest.get("status") != "completed" or set(latest.get("finding_ids", [])) != expected_findings:
-            return
-        decision = matches[0]
-        if (decision.get("decision_category") != "unclassified_human_decision" or
-                decision.get("reason") != "Codex could not safely determine or correct this issue within the authorized scope."):
-            return
-        now = _now()
-        response = (
-            "I authorize the existing correction attempt to continue: the controller will refresh its managed "
-            "process evidence and remove only the confirmed untracked src/.DS_Store metadata; Codex will address "
-            "the remaining reviewed findings within the existing correction limit."
-        )
-        decision.setdefault("response_history", []).append({
-            "response_id": f"USER-CORRECTION-RESUME-{self.workflow_id}-{_sha(response.encode())[:12]}",
-            "action": "REQUEST_CHANGES", "response": response, "responded_at": now,
-            "source": "conversation_user_message", "source_reference": OHPEN_CORRECTION_RESUME_SOURCE,
-            "operator_identity": "Requesting user", "identity_assurance": "declared",
-        })
-        decision.update({
-            "status": "resolved", "resolution_action": "REQUEST_CHANGES", "resolution": response,
-            "resolved_by": "Requesting user", "resolved_by_kind": "human",
-            "resolved_by_identity_assurance": "declared", "resolved_at": now,
-        })
-        self.state["status"] = "ACTIVE"
-        self.state.pop("blocker", None)
-        self._save()
-
     def run(self) -> dict[str, Any]:
         try:
             self.initialize()
             assert self.state is not None
             if self.state["status"] == "COMPLETED":
                 return self._result()
-            self._resolve_authorized_ohpen_correction_deferral()
             invalidated_decision_ids = {row.get("decision_id") for row in self.state.get("pending_decisions", [])
                                         if isinstance(row, dict) and row.get("invalidated_by_requirement_version") is not None}
             pending = [row for row in self.state.get("pending_decisions", [])
@@ -2542,12 +2449,6 @@ class Orchestrator:
                 attempts = self.state["orchestration"].get("attempts", [])
                 prior = [row for row in attempts
                          if row.get("stage") == "RESUME" and row.get("blocker_sha256") == blocker_hash]
-                authorization = self._authorize_ohpen_self_review_recovery(blocker_hash)
-                authorization = authorization or self._available_ohpen_self_review_recovery(blocker_hash)
-                recorded_recovery_auths = self.state["orchestration"].get("self_review_recovery_authorizations", [])
-                if any(isinstance(row, dict) and row.get("blocker_sha256") == blocker_hash and
-                       row.get("status") == "consumed" for row in recorded_recovery_auths):
-                    return self._result()
                 changed_validation_revision = self._changed_validation_revision(blocker)
                 recovery_context = self._recovery_context(blocker_hash)
                 recovery_context_sha256 = _sha(_jcs(recovery_context))
@@ -2559,8 +2460,7 @@ class Orchestrator:
                     else:
                         changed_execution_context = self._legacy_resume_context_changed(
                             attempts, prior[-1], recovery_context)
-                    if (changed_validation_revision is None and not changed_execution_context and
-                            authorization is None):
+                    if changed_validation_revision is None and not changed_execution_context:
                         return self._result()
                 resume_attempt = {
                     "stage": "RESUME", "schema": None, "started_at": _now(), "finished_at": _now(),
@@ -2574,13 +2474,7 @@ class Orchestrator:
                         "previous_revision_id": changed_validation_revision[0],
                         "current_revision_id": changed_validation_revision[1],
                     })
-                if authorization is not None:
-                    authorization["status"] = "consumed"
-                    authorization["consumed_at"] = _now()
-                    authorization["resume_attempt_number"] = len(attempts) + 1
-                    resume_attempt["resume_basis"] = "authorized_self_review_recovery"
-                    resume_attempt["recovery_authorization_id"] = authorization["authorization_id"]
-                elif changed_execution_context:
+                if changed_execution_context:
                     resume_attempt["resume_basis"] = "changed_execution_context"
                 self.state["orchestration"]["attempts"].append(resume_attempt)
                 self.state["status"] = "ACTIVE"
@@ -2593,9 +2487,20 @@ class Orchestrator:
                 if plan is None:
                     return self._result()
                 for increment in plan["increments"]:
+                    if increment.get("blocked_by_decision") and any(
+                            row.get("status") == "open" for row in self.state.get("pending_decisions", [])
+                            if isinstance(row, dict)):
+                        continue
                     self._increment(plan, increment, runtime)
                     if self.state["status"] != "ACTIVE":
                         return self._result()
+                if any(row.get("status") == "open" for row in self.state.get("pending_decisions", [])
+                       if isinstance(row, dict)):
+                    self.state["status"] = "WAITING_FOR_HUMAN"
+                    self.state["phase"] = "PLANNING"
+                    self.state["orchestration"]["current_stage"] = "PLANNING"
+                    self._save()
+                    return self._result()
                 self._finalize_revision(plan)
                 if not _runtime_bundle_unchanged(runtime, manifest):
                     raise OrchestratorError("Ephemeral harness tool snapshot changed")
@@ -2665,9 +2570,11 @@ class Orchestrator:
              "previous_plan_reference": orchestration.get("plan_reference"),
              "requirement_update_history": copy.deepcopy(orchestration.get("invalidations", [])),
              "superseded_decisions_not_reusable": superseded_decisions,
-             "authorized_code_paths": self.config["authorized_code_paths"],
-             "authorized_artifact_paths": self.config["authorized_artifact_paths"],
-             "code_file_extensions": self.config["code_file_extensions"],
+             "execution_policy": copy.deepcopy(self.state.get("execution_policy")),
+             "workspace_root": str(self.target),
+             "legacy_path_hints": {"code": self.config["authorized_code_paths"],
+                 "artifacts": self.config["authorized_artifact_paths"],
+                 "extensions": self.config["code_file_extensions"]},
              "configured_validations": [
                  {"id": item["id"], "argv": item["argv"], "cwd": item.get("cwd", ".")}
                  for item in self.config["validations"]
@@ -2675,32 +2582,38 @@ class Orchestrator:
              "resolved_decisions": current_decisions,
              "selected_validations": copy.deepcopy(self.config["validations"])},
              runtime, "orchestrator-plan.schema.json", sandbox="read-only")
+        plan = _plan_valid(result, self.config, require_discovery=True)
         if result["decision"] == "NEEDS_HUMAN_INPUT":
             decision = result["decision_context"]
-            base_id = "PLAN-CLARIFICATION"
-            existing_ids = {row.get("decision_id") for row in self.state["pending_decisions"]}
-            decision_id = base_id
-            suffix = 2
-            while decision_id in existing_ids:
-                decision_id = f"{base_id}-{suffix}"
-                suffix += 1
-            requested_at = _now()
-            self.state["status"] = "WAITING_FOR_HUMAN"
-            self.state["pending_decisions"].append({
-                "decision_id": decision_id, "workflow_id": self.workflow_id,
-                "decision_category": decision["category"], "stage": "PLANNING",
-                "question": decision["question"], "proposal": decision["proposal"],
-                "reason": decision["reason"], "policy_or_skill_reference": decision["policy_or_skill_reference"],
-                "interactive_resolution_allowed": decision["interactive_resolution_allowed"],
-                "response_history": [], "question_or_action": decision["question"],
-                "impact": decision["reason"], "recommended_option": decision["proposal"],
-                "alternatives": decision["alternatives"], "required_authority": decision["required_authority"],
-                "affected_phase": "PLANNING", "requested_at": requested_at,
-                "created_at": requested_at, "status": "open",
-            })
-            self._save()
-            return None
-        plan = _plan_valid(result, self.config)
+            existing = next((row for row in self.state["pending_decisions"]
+                             if row.get("question") == decision["question"] and
+                             row.get("status") == "open"), None)
+            if existing is None:
+                base_id = "PLAN-CLARIFICATION"
+                existing_ids = {row.get("decision_id") for row in self.state["pending_decisions"]}
+                decision_id = base_id
+                suffix = 2
+                while decision_id in existing_ids:
+                    decision_id = f"{base_id}-{suffix}"
+                    suffix += 1
+                requested_at = _now()
+                self.state["pending_decisions"].append({
+                    "decision_id": decision_id, "workflow_id": self.workflow_id,
+                    "decision_category": decision["category"], "stage": "PLANNING",
+                    "question": decision["question"], "proposal": decision["proposal"],
+                    "reason": decision["reason"], "policy_or_skill_reference": decision["policy_or_skill_reference"],
+                    "interactive_resolution_allowed": decision["interactive_resolution_allowed"],
+                    "response_history": [], "question_or_action": decision["question"],
+                    "impact": decision["reason"], "recommended_option": decision["proposal"],
+                    "alternatives": decision["alternatives"], "required_authority": decision["required_authority"],
+                    "affected_phase": "PLANNING", "requested_at": requested_at,
+                    "created_at": requested_at, "status": "open",
+                })
+            if not plan["increments"]:
+                self.state["status"] = "WAITING_FOR_HUMAN"
+                self._save()
+                return None
+            self.state["status"] = "ACTIVE"
         for item in plan["increments"]:
             if version > 1:
                 raw_id = item["increment_id"]
@@ -2743,8 +2656,9 @@ class Orchestrator:
                 "artifact_paths": increment["artifact_paths"], "revision_paths": increment["revision_paths"],
                 "controller_managed_paths": [PROCESS_EVIDENCE_PATH],
                 "revision_exclusions": [PROCESS_EVIDENCE_PATH] if _process_evidence_is_in_scope(increment) else [],
-                "authorized_code_paths": self.config["authorized_code_paths"],
-                "authorized_artifact_paths": self.config["authorized_artifact_paths"]},
+                "execution_policy": copy.deepcopy(self.state.get("execution_policy")),
+                "workspace_root": str(self.target),
+                "workflow_created_paths": copy.deepcopy(orchestration.get("workflow_created_paths", []))},
             "scope": copy.deepcopy(self.state["scope"]),
             "dependencies": copy.deepcopy(plan["dependencies"]), "blockers": copy.deepcopy(plan["blockers"]),
             "validations": [copy.deepcopy(validations[key]) for key in increment["validation_ids"]],
@@ -2782,8 +2696,20 @@ class Orchestrator:
                    for key in ("description", "recommendation")):
                 raise OrchestratorError("Self-review finding description and recommendation must be non-empty")
         for change in value["changes"]:
-            if not isinstance(change, dict) or set(change) != {"path", "content"} or not isinstance(change["content"], str):
-                raise OrchestratorError("Self-review changes must contain only path and complete text content")
+            if not isinstance(change, dict) or not isinstance(change.get("path"), str):
+                raise OrchestratorError("Self-review changes must identify a workspace path")
+            operation = change.get("operation")
+            if operation is None:
+                if set(change) != {"path", "content"} or not isinstance(change.get("content"), str):
+                    raise OrchestratorError("Self-review writes require path and complete text content")
+            elif operation == "delete":
+                if set(change) != {"path", "operation"}:
+                    raise OrchestratorError("Self-review deletions require only path and operation")
+            elif operation == "rename":
+                if set(change) != {"path", "operation", "destination"} or not isinstance(change.get("destination"), str):
+                    raise OrchestratorError("Self-review renames require source, operation, and destination")
+            else:
+                raise OrchestratorError("Self-review file operation is unsupported")
             if _relative(change["path"], "self-review correction path") == PROCESS_EVIDENCE_PATH:
                 raise OrchestratorError("Self-review cannot change controller-managed process evidence")
         if value["decision"] == "PASS" and (value["findings"] or value["changes"]):
@@ -2965,14 +2891,6 @@ class Orchestrator:
                 rows.append(f"- Finding {self._markdown_cell(finding.get('finding_id'))}: "
                     f"{self._markdown_cell(finding.get('decision'))} / {self._markdown_cell(finding.get('resolution_status'))} — "
                     f"{self._markdown_cell(finding.get('reason'))}")
-        rows.extend(["", "### Controller-managed metadata removals", ""])
-        removals = orchestration.get("metadata_removals", [])
-        if not removals:
-            rows.append("No product metadata removal is recorded.")
-        for removal in removals:
-            rows.append(f"- {self._markdown_cell(removal.get('path'))}: {self._markdown_cell(removal.get('status'))}; "
-                f"SHA-256 {self._markdown_cell(removal.get('sha256'))}; {self._markdown_cell(removal.get('reason'))}; "
-                f"preserved at {self._markdown_cell(removal.get('artifact_reference'))}.")
         reconciliations = orchestration.get("claude_authorization_use_reconciliations", [])
         rows.extend(["", "### Authorization-use ledger reconciliations", ""])
         if not reconciliations:
@@ -3030,7 +2948,8 @@ class Orchestrator:
         digest = _sha(content)
         if not path.exists() or path.read_bytes() != content:
             with tempfile.TemporaryDirectory(prefix="harness-process-evidence-") as temp:
-                cfg = self.store._config(Path(temp), self.target, PROCESS_EVIDENCE_PATH, classification="artifact")
+                cfg = self.store._config(Path(temp), self.target, PROCESS_EVIDENCE_PATH,
+                                         classification="artifact", workflow_id=self.workflow_id)
                 if path.exists():
                     replace_file(self.target, cfg, PROCESS_EVIDENCE_PATH, content, _sha(path.read_bytes()))
                 else:
@@ -3066,7 +2985,7 @@ class Orchestrator:
             raise OrchestratorError(f"Unsupported increment resume state: {record['status']}")
         self._assert_increment_changes(increment)
         record["status"] = "implemented"
-        current = _status_for_workflow(self.target, self.state)
+        current = _status(self.target)
         baseline = {row["path"] for row in self.state["baseline"]["preexisting_changes"]}
         record["changed_paths"] = sorted(path for path in set(current) - baseline
             if not (path == self.store.directory or path.startswith(self.store.directory + "/")))
@@ -3074,7 +2993,7 @@ class Orchestrator:
         self._self_review(plan, increment, runtime)
         self._sync_process_evidence(increment)
         self._assert_increment_changes(increment)
-        current = _status_for_workflow(self.target, self.state)
+        current = _status(self.target)
         baseline = {row["path"] for row in self.state["baseline"]["preexisting_changes"]}
         changed = sorted(path for path in set(current) - baseline
                          if not (path == self.store.directory or path.startswith(self.store.directory + "/")))
@@ -3091,22 +3010,19 @@ class Orchestrator:
         self._validate(plan, increment, revision_id)
 
     def _assert_increment_changes(self, increment: dict[str, Any]) -> None:
-        current = _status_for_workflow(self.target, self.state)
+        current = _status(self.target)
         baseline = {row["path"] for row in self.state["baseline"]["preexisting_changes"]}
         changed = sorted(path for path in set(current) - baseline
                          if not (path == self.store.directory or path.startswith(self.store.directory + "/")))
-        authorized = increment["code_paths"] + increment["artifact_paths"]
-        unexpected = [path for path in changed if not _contained(path, authorized)]
+        unexpected = [path for path in changed if ".git" in PurePosixPath(path).parts or SECRET_PATH.search(path)]
         if unexpected:
-            raise OrchestratorError(f"Agent changed paths outside authorized increment scope: {unexpected}")
-        migrated_snapshot_paths = {row["path"] for row in _snapshot_migration_rows(self.state)}
+            raise OrchestratorError(f"Workspace policy excludes Git metadata and sensitive paths: {unexpected}")
         for path in baseline:
             saved = next(x for x in self.state["orchestration"]["preexisting_hashes"] if x["path"] == path)
-            if path in migrated_snapshot_paths and \
-                    _is_regular_untracked_ds_store(self.target, path):
-                continue
             now = current.get(path)
             if (not now or now["index_sha256"] != saved["index_sha256"] or
+                    (saved.get("protected_path") and "worktree_metadata" in saved and
+                     now.get("worktree_metadata") != saved["worktree_metadata"]) or
                     (not saved.get("protected_path") and now["worktree_sha256"] != saved["worktree_sha256"])):
                 raise OrchestratorError(f"Pre-existing change was modified: {path}")
 
@@ -3138,11 +3054,6 @@ class Orchestrator:
                 if name in managed_exclusions:
                     continue
                 item = candidate.lstat()
-                if (self.state.get("orchestration", {}).get("snapshot_policy") ==
-                        SNAPSHOT_POLICY_UNTRACKED_DS_STORE and
-                        PurePosixPath(name).name == DS_STORE_BASENAME and
-                        stat.S_ISREG(item.st_mode) and not _index_has_path(self.target, name)):
-                    continue
                 if stat.S_ISLNK(item.st_mode):
                     resolved = candidate.resolve(strict=True)
                     if resolved != self.target and self.target not in resolved.parents:
@@ -3185,70 +3096,168 @@ class Orchestrator:
         self._assert_active_worktree()
         if not isinstance(changes, list):
             raise OrchestratorError("Codex implementation result must contain a changes array")
-        allowed = increment["code_paths"] + increment["artifact_paths"]
         protected_paths = {row["path"] for row in self.state["orchestration"]["preexisting_hashes"]}
+        workflow_created = self.state["orchestration"].setdefault("workflow_created_paths", [])
         seen: set[str] = set()
         for change in changes:
-            if not isinstance(change, dict) or set(change) != {"path", "content"}:
-                raise OrchestratorError("Each Codex file change must contain only path and content")
+            if not isinstance(change, dict) or not isinstance(change.get("path"), str):
+                raise OrchestratorError("Each Codex change must name a workspace path")
             path = _relative(change["path"], "Codex changed path")
             if path == PROCESS_EVIDENCE_PATH:
                 raise OrchestratorError(f"Codex cannot modify controller-managed process evidence: {path}")
-            if path in seen or not _contained(path, allowed):
-                raise OrchestratorError(f"Codex file change is duplicate or outside its allowlist: {path}")
-            classification = "code" if _contained(path, increment["code_paths"]) else "artifact"
-            if (classification == "code" and self.config["code_file_extensions"] and
-                    Path(path).suffix.lower() not in self.config["code_file_extensions"]):
-                raise OrchestratorError(f"Codex code file extension is not authorized: {path}")
-            if path == self.store.directory or path.startswith(self.store.directory + "/"):
+            if path in seen:
+                raise OrchestratorError(f"Codex returned a duplicate workspace path: {path}")
+            if ".git" in PurePosixPath(path).parts or SECRET_PATH.search(path):
+                raise OrchestratorError(f"Workspace policy excludes Git metadata and sensitive paths: {path}")
+            if path.startswith(".engineering/workflows/"):
                 raise OrchestratorError("Codex cannot write workflow state or harness-owned workflow artifacts")
             if path in protected_paths:
                 raise OrchestratorError(f"Codex cannot modify a pre-existing user change: {path}")
-            if not isinstance(change["content"], str):
-                raise OrchestratorError(f"Codex file content must be UTF-8 text: {path}")
+            classification = ("code" if _contained(path, increment["code_paths"]) else
+                "artifact" if _contained(path, increment["artifact_paths"]) else
+                "artifact" if path.startswith(("docs/", "doc/")) or Path(path).suffix.lower() in
+                    {".md", ".rst", ".txt", ".yaml", ".yml", ".json", ".toml"} else "code")
+            for field in ("code_paths", "artifact_paths"):
+                if not _contained(path, increment[field]):
+                    if field == classification + "_paths":
+                        increment[field] = sorted(set(increment[field] + [path]))
             seen.add(path)
+            operation = change.get("operation")
             destination = self.target / path
-            parent_rel = PurePosixPath(path).parent.as_posix()
-            if parent_rel != ".":
-                current = PurePosixPath()
-                for component in PurePosixPath(parent_rel).parts:
-                    current = current / component
-                    candidate = self.target / current.as_posix()
-                    if candidate.is_symlink():
-                        raise OrchestratorError(f"Authorized file parent contains a symlink: {current}")
-                    if candidate.exists():
-                        if not candidate.is_dir():
-                            raise OrchestratorError(f"Authorized file parent is not a directory: {current}")
-                        continue
-                    if not _contained(current.as_posix(), allowed):
-                        raise OrchestratorError(
-                            f"Every new parent directory must be inside an explicitly planned write scope: {current}"
-                        )
+            operation_evidence: dict[str, Any]
+            if operation in {"delete", "rename"}:
+                if path not in workflow_created:
+                    raise OrchestratorError("Only files created by this workflow may be deleted or renamed")
+                if not destination.is_file() or destination.is_symlink():
+                    raise OrchestratorError(f"Workflow-created file is not a regular file: {path}")
+                if operation == "delete":
+                    if set(change) != {"path", "operation"}:
+                        raise OrchestratorError("Delete change contains unsupported fields")
                     with tempfile.TemporaryDirectory(prefix="harness-scope-") as temp:
-                        cfg = self.store._config(Path(temp), self.target, current.as_posix(), classification=classification)
-                        create_directories(self.target, cfg, current.as_posix())
-            if destination.is_symlink():
-                raise OrchestratorError(f"Refusing to write through a symlink: {path}")
-            content = change["content"].encode("utf-8")
-            with tempfile.TemporaryDirectory(prefix="harness-scope-") as temp:
-                cfg = self.store._config(Path(temp), self.target, path, classification=classification)
-                if destination.exists():
-                    if not destination.is_file():
-                        raise OrchestratorError(f"Authorized file destination is not a regular file: {path}")
-                    replace_file(self.target, cfg, path, content, _sha(destination.read_bytes()))
+                        cfg = self.store._config(Path(temp), self.target, path, workflow_id=self.workflow_id,
+                                                 workflow_created_paths=list(workflow_created))
+                        operation_evidence = delete_file(self.target, cfg, path, _sha(destination.read_bytes()))
+                    workflow_created.remove(path)
+                    increment["revision_paths"] = [item for item in increment.get("revision_paths", []) if item != path]
+                    increment["code_paths"] = [item for item in increment["code_paths"] if item != path]
+                    increment["artifact_paths"] = [item for item in increment["artifact_paths"] if item != path]
                 else:
-                    create_file(self.target, cfg, path, content)
+                    target_path = _relative(change.get("destination"), "Codex rename destination")
+                    if (set(change) != {"path", "operation", "destination"} or target_path in seen or
+                            target_path.startswith(".engineering/workflows/") or
+                            ".git" in PurePosixPath(target_path).parts or SECRET_PATH.search(target_path) or
+                            target_path in protected_paths):
+                        raise OrchestratorError("Rename destination is duplicate, protected, or outside the workspace policy")
+                    new_destination = self.target / target_path
+                    if new_destination.exists() or new_destination.is_symlink():
+                        raise OrchestratorError(f"Rename destination already exists: {target_path}")
+                    parent_rel = PurePosixPath(target_path).parent.as_posix()
+                    if parent_rel != ".":
+                        current = PurePosixPath()
+                        for component in PurePosixPath(parent_rel).parts:
+                            current = current / component
+                            candidate = self.target / current.as_posix()
+                            if candidate.is_symlink():
+                                raise OrchestratorError(f"Rename destination parent contains a symlink: {current}")
+                            if candidate.exists():
+                                if not candidate.is_dir():
+                                    raise OrchestratorError(f"Rename destination parent is not a directory: {current}")
+                                continue
+                            with tempfile.TemporaryDirectory(prefix="harness-scope-") as temp:
+                                cfg = self.store._config(Path(temp), self.target, current.as_posix(),
+                                    workflow_id=self.workflow_id, workflow_created_paths=list(workflow_created))
+                                create_directories(self.target, cfg, current.as_posix())
+                    with tempfile.TemporaryDirectory(prefix="harness-scope-") as temp:
+                        cfg = self.store._config(Path(temp), self.target, path, workflow_id=self.workflow_id,
+                                                 workflow_created_paths=list(workflow_created))
+                        operation_evidence = rename_file(self.target, cfg, path, target_path,
+                                                         _sha(destination.read_bytes()))
+                    workflow_created.remove(path)
+                    workflow_created.append(target_path)
+                    if not _contained(target_path, increment["revision_paths"]):
+                        increment["revision_paths"].append(target_path)
+                    if classification == "artifact":
+                        increment["artifact_paths"].append(target_path)
+                    else:
+                        increment["code_paths"].append(target_path)
+                    increment["revision_paths"] = [item for item in increment["revision_paths"] if item != path]
+                    increment["code_paths"] = [item for item in increment["code_paths"] if item != path]
+                    increment["artifact_paths"] = [item for item in increment["artifact_paths"] if item != path]
+                    seen.add(target_path)
+            else:
+                if set(change) != {"path", "content"} or not isinstance(change.get("content"), str):
+                    raise OrchestratorError(f"Workspace file write needs UTF-8 content: {path}")
+                parent_rel = PurePosixPath(path).parent.as_posix()
+                if parent_rel != ".":
+                    current = PurePosixPath()
+                    for component in PurePosixPath(parent_rel).parts:
+                        current = current / component
+                        candidate = self.target / current.as_posix()
+                        if candidate.is_symlink():
+                            raise OrchestratorError(f"File parent contains a symlink: {current}")
+                        if candidate.exists():
+                            if not candidate.is_dir():
+                                raise OrchestratorError(f"File parent is not a directory: {current}")
+                            continue
+                        with tempfile.TemporaryDirectory(prefix="harness-scope-") as temp:
+                            cfg = self.store._config(Path(temp), self.target, current.as_posix(),
+                                classification=classification, workflow_id=self.workflow_id)
+                            create_directories(self.target, cfg, current.as_posix())
+                if destination.is_symlink():
+                    raise OrchestratorError(f"Refusing to write through a symlink: {path}")
+                content = change["content"].encode("utf-8")
+                with tempfile.TemporaryDirectory(prefix="harness-scope-") as temp:
+                    cfg = self.store._config(Path(temp), self.target, path, classification=classification,
+                                             workflow_id=self.workflow_id)
+                    if destination.exists():
+                        if not destination.is_file():
+                            raise OrchestratorError(f"File destination is not a regular file: {path}")
+                        operation_evidence = replace_file(self.target, cfg, path, content,
+                                                          _sha(destination.read_bytes()))
+                    else:
+                        operation_evidence = create_file(self.target, cfg, path, content)
+                        if path not in workflow_created:
+                            workflow_created.append(path)
+                increment.setdefault("revision_paths", [])
+                if not _contained(path, increment["revision_paths"]):
+                    increment["revision_paths"] = sorted(set(increment["revision_paths"] + [path]))
+            active = next((row for row in self.state["orchestration"].get("increments", [])
+                           if row.get("increment_id") == increment.get("increment_id")), None)
+            if active is not None:
+                active.update({key: copy.deepcopy(increment.get(key, []))
+                               for key in ("code_paths", "artifact_paths", "revision_paths")})
+            self.state["scope"].update({"included_paths": sorted(set(increment.get("code_paths", []) + increment.get("artifact_paths", []))),
+                "code_paths": copy.deepcopy(increment.get("code_paths", [])),
+                "artifact_paths": copy.deepcopy(increment.get("artifact_paths", [])),
+                "revision_paths": copy.deepcopy(increment.get("revision_paths", []))})
+            self.state["orchestration"].setdefault("workspace_operations", []).append(operation_evidence)
+            self._save()
+        plan_reference = self.state.get("orchestration", {}).get("plan_reference")
+        if isinstance(plan_reference, str):
+            saved_plan = self.store.read_json(plan_reference)
+            plan_body = (saved_plan.get("plan", saved_plan) if isinstance(saved_plan, dict) else None)
+            if isinstance(plan_body, dict) and isinstance(plan_body.get("increments"), list):
+                for item in plan_body["increments"]:
+                    if item.get("increment_id") == increment["increment_id"]:
+                        item.update({key: copy.deepcopy(increment[key])
+                                     for key in ("code_paths", "artifact_paths", "revision_paths")})
+                self.store.write(plan_reference, saved_plan)
 
     def _validate(self, plan: dict[str, Any], increment: dict[str, Any], revision_id: str) -> None:
         self._assert_active_worktree()
         self._set_stage("VALIDATION", "TESTING")
         validations = {item["id"]: item for item in self.config["validations"]}
+        increment_record = next((row for row in self.state["orchestration"]["increments"]
+                                 if row.get("increment_id") == increment["increment_id"]), {})
+        stageable_paths = set(increment_record.get("changed_paths", []))
         for validation_id in increment["validation_ids"]:
             item = validations[validation_id]
             cwd = self.target if item.get("cwd", ".") == "." else canonical(self.target / item["cwd"])
             if cwd != self.target and self.target not in cwd.parents:
                 raise OrchestratorError("Validation working directory escaped the target")
-            result = _run_command(item["argv"], cwd, item.get("timeout_seconds", self.config["stage_timeout_seconds"]), self.process_runner)
+            result = _run_command(item["argv"], cwd, item.get("timeout_seconds", self.config["stage_timeout_seconds"]),
+                                  self.process_runner, workspace_root=self.target,
+                                  stageable_paths=stageable_paths)
             revision_after, _manifest_after, _manifest_path = self._revision_manifest(increment)
             if revision_after != revision_id:
                 raise OrchestratorError(f"Validation {validation_id} changed the reviewed product revision")
@@ -3275,7 +3284,7 @@ class Orchestrator:
             if not evidence_dir.exists():
                 path = f"{self.store.directory}/evidence"
                 with tempfile.TemporaryDirectory(prefix="harness-scope-") as temp:
-                    cfg = self.store._config(Path(temp), self.target, path)
+                    cfg = self.store._config(Path(temp), self.target, path, workflow_id=self.workflow_id)
                     create_directories(self.target, cfg, path)
             self.store.write(evidence_path, evidence)
             if evidence_path not in self.state["artifact_references"]:
@@ -3838,70 +3847,6 @@ class Orchestrator:
             return result["report"]
         return self._correct_and_reverify(plan, increment, result["report"], completed_cycle)
 
-    def _remove_ohpen_finder_metadata(self, increment: dict[str, Any]) -> dict[str, Any]:
-        if (self.workflow_id != OHPEN_RECOVERY_WORKFLOW_ID or
-                not _contained(OHPEN_FINDER_METADATA_PATH, increment.get("code_paths", [])) or
-                not _contained(OHPEN_FINDER_METADATA_PATH, increment.get("revision_paths", []))):
-            raise OrchestratorError("The metadata removal is outside the exact authorized Ohpen product scope")
-        orchestration = self.state["orchestration"]
-        removals = orchestration.setdefault("metadata_removals", [])
-        prior = [row for row in removals if isinstance(row, dict) and row.get("path") == OHPEN_FINDER_METADATA_PATH]
-        if len(prior) > 1:
-            raise OrchestratorError("Workflow state contains duplicate Finder metadata removal records")
-        record = prior[0] if prior else None
-        source = self.target / OHPEN_FINDER_METADATA_PATH
-        if record is not None and record.get("status") == "removed":
-            if source.exists() or source.is_symlink():
-                raise OrchestratorError("Previously removed Finder metadata reappeared; it remains protected")
-            return record
-        if record is not None and not (record.get("status") == "preserved_pending_removal" and
-                                       not source.exists() and not source.is_symlink()):
-            raise OrchestratorError("Existing Finder metadata removal record cannot be safely resumed")
-        if source.exists() or source.is_symlink():
-            if source.is_symlink() or not source.is_file() or _index_has_path(self.target, OHPEN_FINDER_METADATA_PATH):
-                raise OrchestratorError("Tracked, staged, linked, or non-regular src/.DS_Store remains protected")
-            payload = source.read_bytes()
-            if not payload.startswith(OHPEN_FINDER_METADATA_SIGNATURE):
-                raise OrchestratorError("src/.DS_Store does not have the confirmed Finder metadata signature")
-            digest = _sha(payload)
-            if record is not None and record.get("sha256") != digest:
-                raise OrchestratorError("src/.DS_Store differs from the preserved removal intent")
-            if record is None:
-                artifact_reference = f"{self.store.directory}/evidence/src-ds-store-original.json"
-                if (self.target / artifact_reference).exists():
-                    raise OrchestratorError("An unrecorded Finder metadata archive already exists")
-                self.store.write(artifact_reference, {
-                    "path": OHPEN_FINDER_METADATA_PATH, "sha256": digest, "size_bytes": len(payload),
-                    "content_base64": base64.b64encode(payload).decode("ascii"),
-                    "reason": OHPEN_FINDER_METADATA_REASON, "preserved_at": _now(),
-                })
-                if artifact_reference not in self.state["artifact_references"]:
-                    self.state["artifact_references"].append(artifact_reference)
-                record = {
-                    "path": OHPEN_FINDER_METADATA_PATH, "sha256": digest,
-                    "artifact_reference": artifact_reference, "reason": OHPEN_FINDER_METADATA_REASON,
-                    "status": "preserved_pending_removal", "preserved_at": _now(), "removed_at": None,
-                    "operation_evidence": None,
-                }
-                removals.append(record)
-                self._save()
-            with tempfile.TemporaryDirectory(prefix="harness-finder-removal-scope-") as temp:
-                config_path = self.store._config(Path(temp), self.target, OHPEN_FINDER_METADATA_PATH,
-                                                 classification="code")
-                evidence = remove_ohpen_finder_metadata(
-                    self.target, config_path, OHPEN_FINDER_METADATA_PATH,
-                    expected_sha256=digest, workflow_id=self.workflow_id)
-            record["operation_evidence"] = evidence
-        else:
-            if record is None:
-                raise OrchestratorError("src/.DS_Store disappeared without a preserved controller removal record")
-            record["reason"] = record.get("reason", OHPEN_FINDER_METADATA_REASON) + (
-                " The source path was absent on retry after the controller had preserved its removal intent.")
-        record["status"] = "removed"
-        record["removed_at"] = _now()
-        self._save()
-        return record
-
     def _controller_finding_decision(self, finding: dict[str, Any],
                                      increment: dict[str, Any]) -> dict[str, Any] | None:
         if finding.get("file") == PROCESS_EVIDENCE_PATH:
@@ -3909,11 +3854,6 @@ class Orchestrator:
                 raise OrchestratorError("Claude process-evidence finding is outside controller-managed artifact scope")
             return {"finding_id": finding["id"], "decision": "ACCEPT",
                 "reason": "Controller-owned process evidence is archived and regenerated from persisted workflow records; Codex is not asked to edit it.",
-                "evidence_references": []}
-        if finding.get("file") == OHPEN_FINDER_METADATA_PATH:
-            removal = self._remove_ohpen_finder_metadata(increment)
-            return {"finding_id": finding["id"], "decision": "ACCEPT",
-                "reason": f"The controller preserved and removed the confirmed untracked Finder metadata; evidence: {removal['artifact_reference']}.",
                 "evidence_references": []}
         return None
 
@@ -4058,7 +3998,7 @@ class Orchestrator:
         upstream_moved = ((upstream_commit != initial_upstream)
                           if upstream_ref and not tracking.get("migration") else None)
         base_moved = (observed_base != tracking.get("base_commit")) if base_ref not in {"HEAD", "legacy:HEAD"} else False
-        cleanliness = not _status_for_workflow(self.target, self.state)
+        cleanliness = not _status(self.target)
         note = None
         if isinstance(behind, int) and behind > 0:
             note = ("The branch is behind the observed upstream; this does not change the pinned workflow baseline "
@@ -4107,15 +4047,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--update-requirements", action="store_true",
                         help="Append a new requirement version to an existing workflow and force replanning")
     parser.add_argument("--update-reason", help="Required auditable reason for --update-requirements")
-    parser.add_argument("--migrate-untracked-ds-store", action="store_true",
-                        help="Apply the explicit root .DS_Store migration to the named Ohpen workflow")
-    parser.add_argument("--expected-old-sha256", help="Recorded pre-migration .DS_Store fingerprint")
-    parser.add_argument("--expected-current-sha256", help="Current .DS_Store fingerprint required for migration")
-    parser.add_argument("--authorization-reference", help="Reference to the explicit user authorization for workflow-state migration")
-    parser.add_argument("--authorize-ohpen-self-review-recovery", action="store_true",
-                        help="Persist and consume the one-use authorization for the current Ohpen SELF_REVIEW blocker")
-    parser.add_argument("--recovery-authorization-reference",
-                        help="Source reference for the explicit one-use Ohpen self-review recovery authorization")
     interaction = parser.add_mutually_exclusive_group()
     interaction.add_argument("--list-pending-decisions", action="store_true")
     interaction.add_argument("--respond-decision")
@@ -4125,29 +4056,6 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if not args.target:
             parser.error("--target is required")
-        migration_options = (args.expected_old_sha256, args.expected_current_sha256, args.authorization_reference)
-        if args.migrate_untracked_ds_store:
-            if (not args.workflow_id or any(value is None for value in migration_options) or
-                    args.branch or args.task is not None or args.task_file or args.config or
-                    args.update_requirements or args.update_reason or args.list_pending_decisions or args.respond_decision or
-                    args.authorize_ohpen_self_review_recovery or args.recovery_authorization_reference):
-                parser.error("--migrate-untracked-ds-store requires only --target, --workflow-id, both fingerprints, and --authorization-reference")
-            outcome = migrate_untracked_ds_store(
-                args.target, args.workflow_id,
-                expected_old_sha256=args.expected_old_sha256,
-                expected_current_sha256=args.expected_current_sha256,
-                authorization_reference=args.authorization_reference,
-            )
-            print(json.dumps(outcome, ensure_ascii=False, sort_keys=True))
-            return 0
-        if any(value is not None for value in migration_options):
-            parser.error("Migration fingerprint and authorization arguments require --migrate-untracked-ds-store")
-        if args.authorize_ohpen_self_review_recovery:
-            if (not args.workflow_id or not args.recovery_authorization_reference or args.list_pending_decisions or
-                    args.respond_decision):
-                parser.error("--authorize-ohpen-self-review-recovery requires --workflow-id and --recovery-authorization-reference during workflow execution")
-        elif args.recovery_authorization_reference is not None:
-            parser.error("--recovery-authorization-reference requires --authorize-ohpen-self-review-recovery")
         if args.list_pending_decisions:
             if (not args.workflow_id or args.branch or args.task is not None or args.task_file or args.config or
                     args.update_requirements or args.update_reason):
@@ -4177,9 +4085,7 @@ def main(argv: list[str] | None = None) -> int:
         config["branch"] = args.branch
         identity = args.workflow_id or "flow-" + _sha((str(Path(args.target).resolve()) + "\0" + text).encode())[:24]
         outcome = Orchestrator(args.target, text, config, identity, codex=args.codex, aily=args.aily,
-            update_requirements_reason=args.update_reason if args.update_requirements else None,
-            self_review_recovery_authorization_reference=(args.recovery_authorization_reference
-                if args.authorize_ohpen_self_review_recovery else None)).run()
+            update_requirements_reason=args.update_reason if args.update_requirements else None).run()
     except (OSError, json.JSONDecodeError, OrchestratorError, PreflightError) as exc:
         print(json.dumps({"status": "BLOCKED", "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 2

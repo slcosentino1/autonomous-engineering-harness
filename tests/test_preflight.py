@@ -109,6 +109,23 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(self.status(report, "scope.validation"), "PASS")
         self.assertEqual(report["scope"]["included_paths"], [])
 
+    def test_workspace_execution_policy_is_accepted_for_the_canonical_target(self):
+        policy = {"version": 1, "mode": "workspace", "workspace_root": str(self.target.resolve()),
+                  "workflow_id": "flow-workspace-test"}
+        result, report = self.invoke(config={"target_path": str(self.target.resolve()),
+            "execution_policy": policy})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(report["overall_result"], "READY")
+        self.assertEqual(report["scope"]["mode"], "workspace")
+
+    def test_workspace_execution_policy_cannot_expand_outside_the_target(self):
+        policy = {"version": 1, "mode": "workspace", "workspace_root": str(self.base.resolve()),
+                  "workflow_id": "flow-workspace-test"}
+        _result, report = self.invoke(config={"target_path": str(self.target.resolve()),
+            "execution_policy": policy})
+        self.assertEqual(report["overall_result"], "BLOCKED")
+        self.assertEqual(self.status(report, "scope.validation"), "FAIL")
+
     def test_nonexistent_target_is_blocked(self):
         _, report = self.invoke(self.base / "missing")
         self.assertEqual(report["overall_result"], "BLOCKED")

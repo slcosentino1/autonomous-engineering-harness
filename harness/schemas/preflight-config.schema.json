@@ -6,6 +6,19 @@
   "additionalProperties": false,
   "properties": {
     "target_path": {"type": "string", "minLength": 1, "description": "Optional assertion that must match the explicit --target argument."},
+    "execution_policy": {
+      "type": "object", "additionalProperties": false,
+      "required": ["version", "mode", "workspace_root", "workflow_id"],
+      "properties": {
+        "version": {"const": 1},
+        "mode": {"const": "workspace"},
+        "workspace_root": {"type": "string", "minLength": 1},
+        "workflow_id": {"type": "string", "minLength": 1}
+      },
+      "description": "One versioned workspace policy bound to the canonical target root and active workflow."
+    },
+    "workspace_excluded_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "workflow_created_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
     "workspace_root": {"type": "string", "minLength": 1, "description": "Optional explicitly authorized ancestor instruction root."},
     "instruction_roots": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
     "authorized_working_directories": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
@@ -15,5 +28,5 @@
     "revision_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
     "excluded_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
   },
-  "description": "All path normalization, containment, union, overlap, exclusion, revision-scope, and symlink rules are additionally checked semantically by harness/preflight.py. Omitted write-scope arrays default to empty and authorize no writes."
+  "description": "Workspace mode binds routine file operations to the canonical target root and workflow ID; .git, nested repositories, symlink escapes, sensitive paths, and unrelated roots remain excluded. Legacy path allowlists are validated only when execution_policy is absent."
 }

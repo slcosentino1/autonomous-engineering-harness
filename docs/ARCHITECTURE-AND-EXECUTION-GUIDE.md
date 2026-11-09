@@ -1,6 +1,6 @@
 # Architecture and Execution Guide
 
-> Historical diagnostic snapshot. The supported workflow entrypoint is now `harness/orchestrator.py`; `harness/runner.py` is deprecated. Use [README.md](../README.md) and [docs/workflow.md](workflow.md) for current operating instructions. The inventory and comparisons below describe the earlier pre-consolidation checkout and are retained as investigation evidence.
+> Historical diagnostic snapshot of the pre-consolidation checkout. Its inventory, repository status, and many implementation findings below are intentionally preserved as investigation evidence and are not current operating instructions. Since this snapshot was written, `harness/orchestrator.py` became the sole supported workflow entrypoint and a workspace-scoped execution policy replaced per-increment write allowlists for orchestrated tasks. `harness/runner.py` is deprecated. Use [README.md](../README.md), [docs/orchestrator.md](orchestrator.md), and [docs/workflow.md](workflow.md) for current behavior.
 
 ## Scope and evidence basis
 
@@ -209,7 +209,7 @@ The documented concurrency assumption is one writer. Atomic rename is not compar
 
 ### Branch, commit, push, and PR behavior
 
-Preflight inspects repository status and the orchestrator requires a named current branch; neither creates a branch. Prompt 06 and policy require separate authorization for Git mutation. The default runner path may let Codex perform a separately authorized local commit according to instructions, but `runner.py` itself does not stage or commit. It does not push or create PRs. The stage orchestrator rejects automatic commits and PR creation and implements neither operation. There is no Git hosting integration.
+Preflight inspects repository status and the orchestrator requires a named current branch; neither creates a branch. The workspace policy permits local Git inspection and exact-path staging. Commit, checkout, branch creation, reset, clean, merge, push, and PR operations remain separately authorized or unavailable. The stage orchestrator rejects automatic commits and PR creation and implements neither operation. There is no Git hosting integration.
 
 ### Written rules versus enforcement
 

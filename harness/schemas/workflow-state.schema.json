@@ -38,6 +38,18 @@
     "harness_git_common_dir": {"type": "string", "minLength": 1, "description": "Canonical absolute harness Git common directory."},
     "harness_git_refs_dir": {"type": "string", "minLength": 1, "description": "Canonical absolute harness refs directory."},
     "harness_git_object_store_paths": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "description": "Canonical absolute harness object store, including discovered alternates."}},
+    "execution_policy": {
+      "type": "object", "additionalProperties": false,
+      "required": ["version", "mode", "workspace_root", "workflow_id", "authorized_at", "source_reference", "allowed", "retained_protections"],
+      "properties": {
+        "version": {"const": 1}, "mode": {"const": "workspace"},
+        "workspace_root": {"type": "string", "minLength": 1}, "workflow_id": {"type": "string", "minLength": 1},
+        "authorized_at": {"type": "string", "format": "date-time"}, "source_reference": {"type": "string", "minLength": 1},
+        "allowed": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "retained_protections": {"type": "array", "items": {"type": "string", "minLength": 1}}
+      },
+      "description": "One workspace-scoped execution policy established at initialization and reused through internal stages and recovery."
+    },
     "scope": {
       "type": "object",
       "additionalProperties": false,
@@ -46,9 +58,9 @@
         "assignment_reference": {"type": "string", "minLength": 1},
         "authorized_working_directories": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "description": "Canonical absolute real paths strictly beneath or equal to target.git_root."}},
         "increment_id": {"type": "string", "minLength": 1},
-        "included_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "description": "Normalized repository-relative allowlist path; empty means no writes."}},
-        "code_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "description": "Code/test/config paths, each a member of included_paths."}},
-        "artifact_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "description": "Workflow/project artifact paths, each a member of included_paths."}},
+        "included_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "description": "Legacy path-scope bookkeeping only; workspace writes are bound by execution_policy."}},
+        "code_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "description": "Legacy or plan classification; not a workspace write permission."}},
+        "artifact_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "description": "Legacy or plan classification; not a workspace write permission."}},
         "revision_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "description": "Normalized repository-relative product source/test/config/documentation and source-requirement/approved-decision paths whose exact contents form the immutable verification revision; excludes mutable workflow records and evidence."}},
         "excluded_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
       },
@@ -112,23 +124,6 @@
       "required": ["version", "task_sha256", "config_sha256", "branch", "current_stage", "max_iterations", "iteration", "current_increment_id", "plan_reference", "increments", "attempts", "validation_results", "review_results", "correction_status", "preexisting_hashes", "commit_authorization_fingerprint", "current_requirement_version", "requirement_history", "invalidations", "self_reviews"],
       "properties": {
         "version": {"const": 1},
-        "snapshot_policy": {"const": "untracked_ds_store_v1"},
-        "snapshot_migrations": {"type": "array", "maxItems": 1, "items": {
-          "type": "object", "additionalProperties": false,
-          "required": ["migration_id", "policy_id", "path", "old_sha256", "current_sha256", "reason", "recorded_at", "original_bytes_recovered", "original_bytes_note", "authorization_id"],
-          "properties": {
-            "migration_id": {"const": "untracked_ds_store_root_v1"},
-            "policy_id": {"const": "untracked_ds_store_v1"},
-            "path": {"const": ".DS_Store"},
-            "old_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
-            "current_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
-            "reason": {"type": "string", "minLength": 1},
-            "recorded_at": {"type": "string", "format": "date-time"},
-            "original_bytes_recovered": {"const": false},
-            "original_bytes_note": {"type": "string", "minLength": 1},
-            "authorization_id": {"type": "string", "minLength": 1}
-          }
-        }},
         "process_evidence": {"type": "object", "additionalProperties": false,
           "required": ["path", "sha256", "updated_at", "attempt_count", "self_review_count", "validation_count"],
           "properties": {
@@ -146,20 +141,6 @@
             "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
             "archived_at": {"type": "string", "format": "date-time"}
           }},
-        "metadata_removals": {"type": "array", "items": {
-          "type": "object", "additionalProperties": false,
-          "required": ["path", "sha256", "artifact_reference", "reason", "status", "preserved_at", "removed_at", "operation_evidence"],
-          "properties": {
-            "path": {"const": "src/.DS_Store"},
-            "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
-            "artifact_reference": {"type": "string", "minLength": 1},
-            "reason": {"type": "string", "minLength": 1},
-            "status": {"enum": ["preserved_pending_removal", "removed"]},
-            "preserved_at": {"type": "string", "format": "date-time"},
-            "removed_at": {"type": ["string", "null"], "format": "date-time"},
-            "operation_evidence": {"type": ["object", "null"]}
-          }
-        }},
         "claude_authorization_use_reconciliations": {"type": "array", "items": {
           "type": "object", "additionalProperties": false,
           "required": ["event_id", "action", "authorization_id", "use_id", "use_index", "review_cycle_id", "round_number", "attempt_number", "source_reference", "source_sha256", "cost_usd", "reason", "recorded_at"],
@@ -177,26 +158,6 @@
             "cost_usd": {"type": ["number", "null"], "minimum": 0},
             "reason": {"type": "string", "minLength": 1},
             "recorded_at": {"type": "string", "format": "date-time"}
-          }
-        }},
-        "self_review_recovery_authorizations": {"type": "array", "maxItems": 1, "items": {
-          "type": "object", "additionalProperties": false,
-          "required": ["authorization_id", "operation", "target_id", "workflow_id", "stage", "blocker_sha256", "reason", "source_reference", "authorizer_identity", "identity_assurance", "authorized_at", "status", "consumed_at", "resume_attempt_number"],
-          "properties": {
-            "authorization_id": {"type": "string", "minLength": 1},
-            "operation": {"const": "resume_blocked_self_review_once"},
-            "target_id": {"type": "string", "minLength": 1},
-            "workflow_id": {"const": "migration-jobs-api-harness-v2"},
-            "stage": {"const": "SELF_REVIEW"},
-            "blocker_sha256": {"const": "158828cddd275fb5eae34934810e3ea88653d311ee0c446b61bea663aa4ee6e9"},
-            "reason": {"type": "string", "minLength": 1},
-            "source_reference": {"type": "string", "minLength": 1},
-            "authorizer_identity": {"type": "string", "minLength": 1},
-            "identity_assurance": {"const": "declared"},
-            "authorized_at": {"type": "string", "format": "date-time"},
-            "status": {"enum": ["authorized", "consumed"]},
-            "consumed_at": {"type": ["string", "null"], "format": "date-time"},
-            "resume_attempt_number": {"type": ["integer", "null"], "minimum": 1}
           }
         }},
         "task_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
@@ -217,6 +178,7 @@
             "revision_paths": {"type": "array", "items": {"type": "string", "minLength": 1}},
             "acceptance_criteria_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
             "validation_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "blocked_by_decision": {"type": "boolean", "description": "Independent increments may run while a plan decision remains open."},
             "status": {"enum": ["pending", "implemented", "validated", "reviewed", "complete"]},
             "changed_paths": {"type": "array", "items": {"type": "string", "minLength": 1}},
             "revision_id": {"type": "string", "pattern": "^content:[a-f0-9]{64}$"},
@@ -237,8 +199,7 @@
             "exit_code": {"type": "integer"}, "duration_ms": {"type": "integer", "minimum": 0},
             "result_sha256": {"type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"},
             "blocker_sha256": {"type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"},
-            "resume_basis": {"enum": ["corrected_validation_revision", "changed_execution_context", "authorized_self_review_recovery"]},
-            "recovery_authorization_id": {"type": "string", "minLength": 1},
+            "resume_basis": {"enum": ["corrected_validation_revision", "changed_execution_context"]},
             "previous_revision_id": {"type": "string", "pattern": "^content:[a-f0-9]{64}$"},
             "current_revision_id": {"type": "string", "pattern": "^content:[a-f0-9]{64}$"},
             "recovery_context_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
@@ -324,10 +285,6 @@
             {
               "if": {"properties": {"resume_basis": {"const": "changed_execution_context"}}, "required": ["resume_basis"]},
               "then": {"required": ["recovery_context_sha256", "recovery_context"]}
-            },
-            {
-              "if": {"properties": {"resume_basis": {"const": "authorized_self_review_recovery"}}, "required": ["resume_basis"]},
-              "then": {"required": ["recovery_context_sha256", "recovery_context", "recovery_authorization_id"]}
             }
           ]
         }},
@@ -365,6 +322,11 @@
           "properties": {
             "path": {"type": "string", "minLength": 1},
             "worktree_sha256": {"type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"},
+            "worktree_metadata": {"type": ["object", "null"], "additionalProperties": false,
+              "properties": {"device": {"type": "integer"}, "inode": {"type": "integer"},
+                "mode": {"type": "integer"}, "links": {"type": "integer"}, "size": {"type": "integer"},
+                "mtime_ns": {"type": "integer"}, "ctime_ns": {"type": "integer"}},
+              "description": "Non-content fingerprint for protected sensitive paths; avoids reading secret bytes."},
             "index_sha256": {"type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"},
             "protected_path": {"type": "boolean"}
           }

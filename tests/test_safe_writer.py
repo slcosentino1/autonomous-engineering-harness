@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(ROOT / "harness"))
 from safe_writer import (SafeWriteError, create_directories, create_file,
-                         remove_ohpen_finder_metadata, replace_file)
+                         delete_file, rename_file, replace_file)
 
 
 def clean_git_env():
@@ -46,6 +46,16 @@ class SafeWriterTests(unittest.TestCase):
             "authorized_working_directories": [str(self.root.resolve())],
         }), encoding="utf-8")
 
+    def write_workspace_config(self, *, excluded=(), created=()):
+        self.config_path.write_text(json.dumps({
+            "target_path": str(self.root.resolve()),
+            "authorized_working_directories": [str(self.root.resolve())],
+            "execution_policy": {"version": 1, "mode": "workspace",
+                "workspace_root": str(self.root.resolve()), "workflow_id": "flow-test"},
+            "workspace_excluded_paths": list(excluded),
+            "workflow_created_paths": list(created),
+        }), encoding="utf-8")
+
     @staticmethod
     def digest(data):
         return hashlib.sha256(data).hexdigest()
@@ -74,6 +84,53 @@ class SafeWriterTests(unittest.TestCase):
         self.assertEqual(result["mode"], 0o640)
         self.assertEqual(destination.stat().st_mode & 0o777, 0o640)
 
+    def test_workspace_policy_allows_ordinary_source_test_and_documentation_writes(self):
+        self.write_workspace_config()
+        create_directories(self.root, self.config_path, "tests")
+        created = create_file(self.root, self.config_path, "tests/test_feature.py", b"def test_ok(): pass\n")
+        self.assertEqual(created["operation"], "create")
+        destination = self.root / "docs/guide.md"
+        destination.parent.mkdir()
+        destination.write_text("old\n", encoding="utf-8")
+        replaced = replace_file(self.root, self.config_path, "docs/guide.md", b"new\n", self.digest(b"old\n"))
+        self.assertEqual(replaced["operation"], "replace")
+        self.assertEqual(destination.read_bytes(), b"new\n")
+
+    def test_workspace_policy_keeps_metadata_exclusions_and_root_containment(self):
+        self.write_workspace_config(excluded=("generated/keep",))
+        with self.assertRaisesRegex(SafeWriteError, "Git metadata"):
+            create_file(self.root, self.config_path, ".git/config", b"bad")
+        for sensitive in (".env", ".aws/credentials", ".ssh/id_ed25519", ".npmrc",
+                          "src/secrets/token.txt", "src/credentials/token.txt",
+                          "config/credentials.json", "config/api-token.token", "config/server.pem"):
+            with self.subTest(path=sensitive), self.assertRaisesRegex(SafeWriteError, "sensitive configuration"):
+                create_file(self.root, self.config_path, sensitive, b"secret")
+        with self.assertRaisesRegex(SafeWriteError, "excluded"):
+            create_file(self.root, self.config_path, "generated/keep/output.bin", b"bad")
+        with self.assertRaisesRegex(SafeWriteError, "not normalized"):
+            create_file(self.root, self.config_path, "../outside", b"bad")
+
+    def test_delete_and_rename_are_limited_to_workflow_created_files(self):
+        created_path = "src/generated.tmp"
+        payload = b"generated during this workflow\n"
+        self.write_workspace_config(created=(created_path,))
+        (self.root / created_path).write_bytes(payload)
+        deleted = delete_file(self.root, self.config_path, created_path, self.digest(payload))
+        self.assertEqual(deleted["operation"], "delete")
+        self.assertFalse((self.root / created_path).exists())
+
+        (self.root / created_path).write_bytes(payload)
+        renamed = rename_file(self.root, self.config_path, created_path, "src/generated.log", self.digest(payload))
+        self.assertEqual(renamed["operation"], "rename")
+        self.assertFalse((self.root / created_path).exists())
+        self.assertEqual((self.root / "src/generated.log").read_bytes(), payload)
+
+        preexisting = "src/existing.txt"
+        (self.root / preexisting).write_bytes(b"keep\n")
+        with self.assertRaisesRegex(SafeWriteError, "Only files recorded"):
+            delete_file(self.root, self.config_path, preexisting, self.digest(b"keep\n"))
+        self.assertEqual((self.root / preexisting).read_bytes(), b"keep\n")
+
     def test_creates_new_file_and_never_overwrites_existing_destination(self):
         created = create_file(self.root, self.config_path, "src/new.txt", b"new\n")
         self.assertEqual((self.root / "src/new.txt").read_bytes(), b"new\n")
@@ -82,45 +139,6 @@ class SafeWriterTests(unittest.TestCase):
             create_file(self.root, self.config_path, "src/new.txt", b"replacement\n")
         self.assertEqual((self.root / "src/new.txt").read_bytes(), b"new\n")
 
-    def test_exact_ohpen_finder_metadata_removal_preserves_git_and_hash_protections(self):
-        subprocess.run(["git", "init", "-q", "-b", "main", str(self.root)], check=True)
-        subprocess.run(["git", "-C", str(self.root), "config", "user.name", "Fixture"], check=True)
-        subprocess.run(["git", "-C", str(self.root), "config", "user.email", "fixture@example.invalid"], check=True)
-        (self.root / "README.md").write_text("baseline\n", encoding="utf-8")
-        subprocess.run(["git", "-C", str(self.root), "add", "README.md"], check=True)
-        subprocess.run(["git", "-C", str(self.root), "commit", "-q", "-m", "baseline"], check=True)
-        path = "src/.DS_Store"
-        payload = b"\x00\x00\x00\x01Bud1" + b"\x00" * 48
-        destination = self.root / path
-        destination.write_bytes(payload)
-        self.write_config({path})
-
-        evidence = remove_ohpen_finder_metadata(
-            self.root, self.config_path, path, expected_sha256=self.digest(payload),
-            workflow_id="migration-jobs-api-harness-v2")
-
-        self.assertFalse(destination.exists())
-        self.assertEqual(evidence["operation"], "remove_ohpen_finder_metadata")
-        self.assertEqual(evidence["before_sha256"], self.digest(payload))
-        self.assertEqual(evidence["path"], path)
-
-        for workflow_id, requested_path, expected in [
-                ("another-workflow", path, self.digest(payload)),
-                ("migration-jobs-api-harness-v2", "src/other.DS_Store", self.digest(payload)),
-                ("migration-jobs-api-harness-v2", path, "0" * 64)]:
-            destination.write_bytes(payload)
-            with self.subTest(workflow_id=workflow_id, requested_path=requested_path), self.assertRaises(SafeWriteError):
-                remove_ohpen_finder_metadata(
-                    self.root, self.config_path, requested_path, expected_sha256=expected,
-                    workflow_id=workflow_id)
-            self.assertEqual(destination.read_bytes(), payload)
-
-        subprocess.run(["git", "-C", str(self.root), "add", path], check=True)
-        with self.assertRaisesRegex(SafeWriteError, "Tracked or staged"):
-            remove_ohpen_finder_metadata(
-                self.root, self.config_path, path, expected_sha256=self.digest(payload),
-                workflow_id="migration-jobs-api-harness-v2")
-        self.assertEqual(destination.read_bytes(), payload)
     def test_creates_one_directory_and_reports_identity_evidence(self):
         result = create_directories(self.root, self.config_path, "src/new-dir")
         created = self.root / "src/new-dir"

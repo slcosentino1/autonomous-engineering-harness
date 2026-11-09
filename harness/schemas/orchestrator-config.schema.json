@@ -4,16 +4,16 @@
   "title": "Autonomous orchestrator configuration",
   "type": "object",
   "additionalProperties": false,
-  "required": ["claude_budget_usd", "validations", "authorized_code_paths", "authorized_artifact_paths", "code_file_extensions"],
+  "required": ["claude_budget_usd", "validations"],
   "properties": {
     "minimum_risk_band": {"enum": ["low", "medium", "high"]},
     "base_ref": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$", "description": "Optional exact branch-style Git ref resolved once at workflow start. Its commit identity is immutable for the workflow."},
     "max_iterations": {"type": "integer", "minimum": 1, "maximum": 5},
     "stage_timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 21600},
     "claude_budget_usd": {"type": "number", "exclusiveMinimum": 0},
-    "authorized_code_paths": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "authorized_code_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}, "deprecated": true},
     "authorized_artifact_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
-    "code_file_extensions": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^\\.[A-Za-z0-9]+$"}},
+    "code_file_extensions": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^\\.[A-Za-z0-9]+$"}, "deprecated": true},
     "validations": {
       "type": "array", "minItems": 1,
       "items": {

@@ -68,10 +68,14 @@ def plan(*, increments=None, risk="medium"):
         "acceptance_criteria": [{"id": "AC-1", "text": "The behavior is verified.", "source": "task"}],
         "architecture_context": [], "documentation_context": [], "capabilities_used": [],
         "dependencies": [], "blockers": [],
+        "engineering_discovery": {"quality_requirements": [], "constraints_and_dependencies": [],
+            "ambiguities": [], "scenarios": [{"id": "SC-1", "scenario": "Normal operation",
+                "expected_behavior": "The requested behavior works", "verification": "Run the configured test",
+                "requirement_ids": ["REQ-1"]}], "assumptions": [], "decisions": []},
         "increments": increments or [{
             "increment_id": "inc-1", "title": "Implement feature", "code_paths": ["src"],
             "artifact_paths": [], "revision_paths": ["src"],
-            "acceptance_criteria_ids": ["AC-1"], "validation_ids": ["tests"],
+            "acceptance_criteria_ids": ["AC-1"], "validation_ids": ["tests"], "blocked_by_decision": False,
         }],
     }
 
@@ -119,38 +123,6 @@ class OrchestratorTests(unittest.TestCase):
         runner.initialize()
         return target, runner
 
-    def legacy_snapshot_migration_fixture(self, name="migration-fixture"):
-        target, runner = self.new_git_workflow(
-            name, workflow_id=orchestrator.SNAPSHOT_MIGRATION_WORKFLOW_ID,
-            files={".DS_Store": b"current metadata", "src/.DS_Store": b"nested user metadata",
-                   "notes.txt": b"preserve this user file"},
-        )
-        state = copy.deepcopy(runner.state)
-        old_hash = orchestrator.SNAPSHOT_MIGRATION_OLD_HASH_PREFIX + "0" * 56
-        state["baseline"]["preexisting_changes"].append({
-            "path": ".DS_Store", "index_state": "added", "working_tree_state": "untracked",
-        })
-        state["orchestration"]["preexisting_hashes"].append({
-            "path": ".DS_Store", "worktree_sha256": old_hash,
-            "index_sha256": None, "protected_path": False,
-        })
-        nested_hash = orchestrator._sha((target / "src/.DS_Store").read_bytes())
-        state["baseline"]["preexisting_changes"].append({
-            "path": "src/.DS_Store", "index_state": "added", "working_tree_state": "untracked",
-        })
-        state["orchestration"]["preexisting_hashes"].append({
-            "path": "src/.DS_Store", "worktree_sha256": nested_hash,
-            "index_sha256": None, "protected_path": False,
-        })
-        state["status"] = "BLOCKED"
-        state["phase"] = "IMPLEMENTATION"
-        state["orchestration"]["current_stage"] = "SELF_REVIEW"
-        state["orchestration"].pop("snapshot_policy", None)
-        state["orchestration"].pop("snapshot_migrations", None)
-        runner.store.save(state)
-        runner.state = state
-        return target, runner, old_hash, orchestrator._sha((target / ".DS_Store").read_bytes())
-
     def process_evidence_fixture(self, name):
         target = Path(self.temp.name) / name
         git_fixture(target)
@@ -169,7 +141,8 @@ class OrchestratorTests(unittest.TestCase):
         runner._save()
         increment = {"increment_id": "inc-1", "title": "Implement feature", "code_paths": ["src"],
             "artifact_paths": ["docs"], "revision_paths": ["src", "docs"],
-            "acceptance_criteria_ids": ["AC-1"], "validation_ids": ["tests"]}
+            "acceptance_criteria_ids": ["AC-1"], "validation_ids": ["tests"],
+            "blocked_by_decision": False}
         return target, runner, plan(increments=[increment]), increment
 
     def test_process_evidence_refresh_archives_prior_narrative_and_keeps_review_revision_stable(self):
@@ -193,30 +166,6 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(archived["sha256"], orchestrator._sha(original.encode("utf-8")))
         self.assertEqual(runner.state["artifact_references"].count(archive_ref), 1)
         self.assertIn(archive_ref, (target / orchestrator.PROCESS_EVIDENCE_PATH).read_text(encoding="utf-8"))
-
-    def test_controller_resolves_only_confirmed_ohpen_finder_metadata_and_records_evidence(self):
-        finder = b"\x00\x00\x00\x01Bud1" + b"\x00" * 64
-        target, runner = self.new_git_workflow(
-            "ohpen-finder-metadata", workflow_id=orchestrator.OHPEN_RECOVERY_WORKFLOW_ID,
-            files={"src/.DS_Store": finder})
-        increment = {"increment_id": "req2-jobs-api", "code_paths": ["src"],
-            "artifact_paths": [".engineering/workflows/migration-jobs-api-harness-v2", "docs"],
-            "revision_paths": ["README.md", "docs", "src", "tests"]}
-        finding = {"id": "CR-3", "file": "src/.DS_Store"}
-        ready = {"overall_result": "READY", "target_path": str(target.resolve())}
-
-        with patch("safe_writer._run_preflight", return_value=ready):
-            decision = runner._controller_finding_decision(finding, increment)
-
-        self.assertEqual(decision["decision"], "ACCEPT")
-        self.assertFalse((target / "src/.DS_Store").exists())
-        removal = runner.state["orchestration"]["metadata_removals"][0]
-        self.assertEqual(removal["status"], "removed")
-        self.assertEqual(removal["sha256"], orchestrator._sha(finder))
-        saved = runner.store.read_json(removal["artifact_reference"])
-        self.assertEqual(base64.b64decode(saved["content_base64"]), finder)
-        self.assertEqual(saved["reason"], orchestrator.OHPEN_FINDER_METADATA_REASON)
-        self.assertEqual(removal["operation_evidence"]["operation"], "remove_ohpen_finder_metadata")
 
     @staticmethod
     def self_review_response(decision="PASS", *, findings=None, changes=None, summary=None):
@@ -358,7 +307,7 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_legacy_duplicate_reservation_and_missing_attempt_cost_reconcile_append_only(self):
         authorization = persistent_claude_authorization(
-            self.target, authorization_id="AUTH-OHPEN-AILY-20261109", max_budget_usd=2.0)
+            self.target, authorization_id="AUTH-AILY-20261109", max_budget_usd=2.0)
         self.runner.config = orchestrator.validate_config(config(
             claude_budget_usd=2.0, review={"enabled": True, "authorization": authorization}))
         cycle_id = "cycle-ohpen"
@@ -412,36 +361,64 @@ class OrchestratorTests(unittest.TestCase):
         self.assertAlmostEqual(remaining_again, remaining)
         self.assertEqual(len(self.runner.state["orchestration"]["claude_authorization_use_reconciliations"]), 2)
 
-    def test_authorized_ohpen_correction_deferral_is_resolved_with_auditable_user_source(self):
-        decision = {"decision_id": "CLAUDE-FINDING-DECISION", "workflow_id": self.flow,
-            "decision_category": "unclassified_human_decision", "status": "open",
-            "reason": "Codex could not safely determine or correct this issue within the authorized scope.",
-            "response_history": []}
-        self.runner.workflow_id = orchestrator.OHPEN_RECOVERY_WORKFLOW_ID
-        self.runner.state = {
-            "status": "WAITING_FOR_HUMAN", "phase": "CORRECTION", "workflow_id": self.runner.workflow_id,
-            "pending_decisions": [decision],
-            "claude_review_cycles": [{"increment_id": "req2-jobs-api", "rounds": [
-                {"status": "completed", "finding_ids": ["CR-1", "CR-2", "CR-3", "CR-4", "CR-5"]}]}],
-            "orchestration": {"current_stage": "CORRECTION", "current_increment_id": "req2-jobs-api"},
-        }
-        self.runner._save = lambda: None
-
-        self.runner._resolve_authorized_ohpen_correction_deferral()
-
-        self.assertEqual(self.runner.state["status"], "ACTIVE")
-        self.assertEqual(decision["status"], "resolved")
-        self.assertEqual(decision["response_history"][0]["source_reference"],
-                         orchestrator.OHPEN_CORRECTION_RESUME_SOURCE)
-        self.assertEqual(decision["response_history"][0]["identity_assurance"], "declared")
-
     def test_validation_command_policy_rejects_shells_and_implicit_restore(self):
         with self.assertRaisesRegex(orchestrator.OrchestratorError, "prohibited"):
             orchestrator._run_command(["bash", "-c", "echo unsafe"], self.target, 1,
                                       lambda *args, **kwargs: self.fail("must not execute"))
+        with self.assertRaisesRegex(orchestrator.OrchestratorError, "Inline-code"):
+            orchestrator._run_command(["python3", "-c", "import socket"], self.target, 1,
+                                      lambda *args, **kwargs: self.fail("must not execute"))
         with self.assertRaisesRegex(orchestrator.OrchestratorError, "--no-restore"):
             orchestrator._run_command(["dotnet", "test"], self.target, 1,
                                       lambda *args, **kwargs: self.fail("must not execute"))
+
+    def test_workspace_command_policy_runs_package_install_and_local_git_reads(self):
+        observed = []
+        def run(argv, **kwargs):
+            observed.append((argv, kwargs))
+            return subprocess.CompletedProcess(argv, 0, b"installed", b"")
+
+        with patch.dict(os.environ, {"WORKFLOW_TEST_SECRET": "must-not-pass",
+                                    "PIP_INDEX_URL": "https://user:password@example.invalid/simple",
+                                    "npm_config_registry": "https://registry.example.invalid"}, clear=False):
+            installed = orchestrator._run_command(["python3", "-m", "pip", "install", "example-package"],
+                                                   self.target, 5, run)
+        git_read = orchestrator._run_command(["git", "status", "--short"], self.target, 5, run)
+        staged = orchestrator._run_command(["git", "add", "--", "src/feature.py"], self.target, 5, run,
+                                           stageable_paths={"src/feature.py"})
+        self.assertEqual(installed["exit_code"], 0)
+        self.assertEqual(git_read["exit_code"], 0)
+        self.assertEqual(staged["exit_code"], 0)
+        self.assertEqual(observed[2][0], ["git", "add", "--", "src/feature.py"])
+        package_env = observed[0][1]["env"]
+        self.assertNotIn("WORKFLOW_TEST_SECRET", package_env)
+        self.assertNotIn("PIP_NO_INDEX", package_env)
+        self.assertNotIn("npm_config_offline", package_env)
+        self.assertNotIn("PIP_INDEX_URL", package_env)
+        self.assertNotIn("npm_config_registry", package_env)
+
+    def test_workspace_command_policy_keeps_remote_and_paid_actions_protected(self):
+        for command in (["git", "push", "origin", "main"], ["pip", "install", "--index-url", "https://example.invalid/simple"],
+                        ["python3", "-m", "pip", "install", "--index-url=https://example.invalid/simple"],
+                        ["python", "-m", "pip", "install", "git+https://example.invalid/project.git"],
+                        ["git", "commit", "-m", "unauthorized"], ["git", "merge", "feature"],
+                        ["git", "branch", "new-branch"], ["git", "add", "."],
+                        ["pip", "install", "file:///private/tmp/example.whl"],
+                        ["git", "add", "--", "../unrelated/file.py"],
+                        ["git", "add", "--", "credentials/token.txt"], ["git-upload-pack", "https://example.invalid/repo"],
+                        ["env", "curl", "https://example.invalid"], ["sudo", "pip", "install", "example-package"],
+                        ["rm", "--", "README.md"], ["rmdir", "--", "src"],
+                        ["unlink", "--", "README.md"], ["truncate", "-s", "0", "README.md"],
+                        ["git", "-C", "../unrelated", "status"],
+                        ["python3", "-m", "pytest", "../unrelated/test_external.py"],
+                        ["curl", "https://example.invalid"]):
+            with self.subTest(command=command), self.assertRaises(orchestrator.OrchestratorError):
+                orchestrator._run_command(command, self.target, 5,
+                    lambda *args, **kwargs: self.fail("protected command must not execute"))
+        with self.assertRaisesRegex(orchestrator.OrchestratorError, "pre-existing or out-of-increment"):
+            orchestrator._run_command(["git", "add", "--", "notes.txt"], self.target, 5,
+                lambda *args, **kwargs: self.fail("pre-existing path must not be staged"),
+                stageable_paths={"src/feature.py"})
 
     def test_revision_canonical_json_sorts_keys_by_utf16_code_units(self):
         value = {"\ue000": 1, "\U00010000": 2}
@@ -486,6 +463,56 @@ class OrchestratorTests(unittest.TestCase):
         with self.assertRaisesRegex(orchestrator.OrchestratorError, "validation_ids values must be unique"):
             orchestrator._plan_valid(bad, orchestrator.validate_config(config()))
 
+    def test_engineering_discovery_requires_scenarios_and_documents_assumptions(self):
+        bad = plan()
+        bad["engineering_discovery"]["scenarios"] = []
+        with self.assertRaisesRegex(orchestrator.OrchestratorError, "at least one relevant scenario"):
+            orchestrator._plan_valid(bad, orchestrator.validate_config(config()), require_discovery=True)
+
+        candidate = plan()
+        candidate["engineering_discovery"]["assumptions"] = [{"id": "ASM-1",
+            "description": "Use the repository's existing test runner", "rationale": "No new dependency is needed",
+            "impact_if_wrong": "Validation command may need adjustment", "reversible": True,
+            "requires_confirmation": False}]
+        candidate["engineering_discovery"]["decisions"] = [{"id": "DEC-1", "category": "engineering",
+            "decision": "Reuse the existing test layout", "rationale": "It is already established",
+            "alternatives": ["Add a new test framework"], "requires_human_input": False}]
+        self.assertEqual(orchestrator._plan_valid(candidate, orchestrator.validate_config(config()),
+            require_discovery=True)["engineering_discovery"]["assumptions"][0]["id"], "ASM-1")
+
+        unresolved = plan()
+        unresolved["engineering_discovery"]["assumptions"] = [{"id": "ASM-2",
+            "description": "Retain job data indefinitely", "rationale": "Simplifies support",
+            "impact_if_wrong": "Could violate retention obligations", "reversible": False,
+            "requires_confirmation": True}]
+        with self.assertRaisesRegex(orchestrator.OrchestratorError, "discovery still requires human input"):
+            orchestrator._plan_valid(unresolved, orchestrator.validate_config(config()), require_discovery=True)
+
+    def test_routine_engineering_decision_cannot_be_made_a_human_approval_gate(self):
+        candidate = plan()
+        candidate["engineering_discovery"]["decisions"] = [{"id": "DEC-1", "category": "engineering",
+            "decision": "Use the existing runner", "rationale": "Local convention", "alternatives": [],
+            "requires_human_input": True}]
+        with self.assertRaisesRegex(orchestrator.OrchestratorError, "Routine engineering decisions"):
+            orchestrator._plan_valid(candidate, orchestrator.validate_config(config()), require_discovery=True)
+
+    def test_plan_can_defer_dependent_increment_while_unblocked_increment_proceeds(self):
+        increments = [
+            {**plan()["increments"][0], "increment_id": "inc-independent", "blocked_by_decision": False},
+            {**plan()["increments"][0], "increment_id": "inc-dependent", "blocked_by_decision": True},
+        ]
+        candidate = plan(increments=increments)
+        candidate["decision"] = "NEEDS_HUMAN_INPUT"
+        candidate["decision_context"] = {"category": "functional_decision",
+            "question": "Should clients be able to cancel a running job?",
+            "proposal": "Keep cancellation out of scope for this release.",
+            "alternatives": ["Add cancellation", "Defer cancellation"],
+            "reason": "The API capability changes client behavior and processing guarantees.",
+            "policy_or_skill_reference": None, "required_authority": "product owner",
+            "interactive_resolution_allowed": False}
+        validated = orchestrator._plan_valid(candidate, orchestrator.validate_config(config()), require_discovery=True)
+        self.assertEqual([row["blocked_by_decision"] for row in validated["increments"]], [False, True])
+
     def test_provider_output_schemas_omit_unsupported_strict_schema_keywords(self):
         unsupported = {'"uniqueItems"', '"minItems"', '"minLength"', '"pattern"', '"allOf"', '"if"', '"then"'}
         for name in ("orchestrator-plan.schema.json", "orchestrator-stage-result.schema.json",
@@ -494,12 +521,12 @@ class OrchestratorTests(unittest.TestCase):
             for keyword in unsupported:
                 self.assertNotIn(keyword, encoded, f"{keyword} is unsupported by the provider's strict schema")
 
-    def test_plan_cannot_expand_user_authorized_code_scope(self):
-        bad = plan()
-        bad["increments"][0]["code_paths"] = ["outside"]
-        bad["increments"][0]["revision_paths"] = ["outside"]
-        with self.assertRaisesRegex(orchestrator.OrchestratorError, "authorized code paths"):
-            orchestrator._plan_valid(bad, orchestrator.validate_config(config()))
+    def test_plan_scope_is_review_guidance_inside_workspace_not_a_second_approval_list(self):
+        value = plan()
+        value["increments"][0]["code_paths"] = ["outside"]
+        value["increments"][0]["revision_paths"] = ["outside"]
+        validated = orchestrator._plan_valid(value, orchestrator.validate_config(config()))
+        self.assertEqual(validated["increments"][0]["code_paths"], ["outside"])
 
     def test_failed_codex_stage_preserves_redacted_process_diagnostic(self):
         self.write_state(self.runner)
@@ -628,24 +655,26 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(trace["skills"]["read_verified"][0]["stage"], "PLANNING")
         self.assertNotIn("private skill text", json.dumps(trace))
 
-    def test_stored_plan_may_retain_only_the_controller_owned_artifact_path(self):
+    def test_plan_may_retain_controller_owned_workflow_artifacts(self):
         stored = plan()
         stored["increments"][0]["artifact_paths"] = [".engineering/workflows/flow-test-1"]
-        with self.assertRaisesRegex(orchestrator.OrchestratorError, "authorized artifact paths"):
-            orchestrator._plan_valid(stored, orchestrator.validate_config(config()))
         validated = orchestrator._plan_valid(stored, orchestrator.validate_config(config()),
             controller_artifact_paths=[".engineering/workflows/flow-test-1"])
         self.assertEqual(validated["increments"][0]["artifact_paths"],
                          [".engineering/workflows/flow-test-1"])
 
-    def test_code_file_extension_is_enforced_before_any_write(self):
+    def test_workspace_policy_allows_relevant_project_files_regardless_of_extension_list(self):
         self.runner.config["code_file_extensions"] = [".cs"]
-        self.runner.state = {"orchestration": {"preexisting_hashes": []}}
-        increment = {"code_paths": ["src"], "artifact_paths": []}
-        with patch.object(self.runner, "_assert_active_worktree"):
-            with self.assertRaisesRegex(orchestrator.OrchestratorError, "extension is not authorized"):
-                self.runner._apply_changes([{"path": "src/README.md", "content": "no\n"}], increment)
-        self.assertFalse((self.target / "README.md").exists())
+        self.runner.state = {"orchestration": {"preexisting_hashes": [], "increments": [],
+            "workflow_created_paths": []}, "scope": {}}
+        self.runner._save = lambda: None
+        increment = {"increment_id": "inc-1", "code_paths": ["src"], "artifact_paths": [],
+            "revision_paths": ["src"]}
+        with patch.object(self.runner, "_assert_active_worktree"), \
+                patch.object(orchestrator, "create_file", return_value={"operation": "create"}) as create:
+            self.runner._apply_changes([{"path": "src/README.md", "content": "relevant\n"}], increment)
+        create.assert_called_once()
+        self.assertTrue(orchestrator._contained("src/README.md", increment["revision_paths"]))
 
     def test_stage_response_rejects_unknown_fields_and_bad_correction_decisions(self):
         value = {"status": "COMPLETED", "summary": "Done", "changes": [], "extra": True}
@@ -674,13 +703,37 @@ class OrchestratorTests(unittest.TestCase):
                 self.runner._apply_changes([{"path": "src/user.txt", "content": "replace\n"}], increment)
         self.assertEqual(existing.read_text(encoding="utf-8"), "keep this\n")
 
-    def test_new_parent_directory_must_be_inside_an_explicit_write_scope(self):
-        self.runner.state = {"orchestration": {"preexisting_hashes": []}}
+    def test_new_parent_directory_is_created_inside_workspace_policy(self):
+        self.runner.state = {"orchestration": {"preexisting_hashes": [], "increments": [],
+            "workflow_created_paths": []}, "scope": {}}
         increment = {"code_paths": ["src/new/file.cs"], "artifact_paths": []}
-        with patch.object(self.runner, "_assert_active_worktree"):
-            with self.assertRaisesRegex(orchestrator.OrchestratorError, "planned write scope"):
-                self.runner._apply_changes([{"path": "src/new/file.cs", "content": "class C {}\n"}], increment)
-        self.assertFalse((self.target / "src" / "new").exists())
+        ready = {"overall_result": "READY", "target_path": str(self.target.resolve())}
+        with patch.object(self.runner, "_assert_active_worktree"), \
+                patch("safe_writer._run_preflight", return_value=ready):
+            self.runner._apply_changes([{"path": "src/new/file.cs", "content": "class C {}\n"}], increment)
+        self.assertTrue((self.target / "src" / "new/file.cs").exists())
+
+    def test_workflow_created_files_can_be_deleted_or_renamed_without_touching_user_files(self):
+        source = self.target / "src/generated.txt"
+        source.write_text("generated\n", encoding="utf-8")
+        user_file = self.target / "src/user.txt"
+        user_file.write_text("user data\n", encoding="utf-8")
+        self.runner.state = {"orchestration": {"preexisting_hashes": [], "increments": [],
+                "workflow_created_paths": ["src/generated.txt"]}, "scope": {}}
+        self.runner._save = lambda: None
+        increment = {"increment_id": "inc-1", "code_paths": ["src"], "artifact_paths": [],
+            "revision_paths": ["src"]}
+        ready = {"overall_result": "READY", "target_path": str(self.target.resolve())}
+        with patch.object(self.runner, "_assert_active_worktree"), \
+                patch("safe_writer._run_preflight", return_value=ready):
+            self.runner._apply_changes([{"path": "src/generated.txt", "operation": "rename",
+                "destination": "src/generated-renamed.txt"}], increment)
+            self.runner._apply_changes([{"path": "src/generated-renamed.txt", "operation": "delete"}], increment)
+            with self.assertRaisesRegex(orchestrator.OrchestratorError, "Only files created"):
+                self.runner._apply_changes([{"path": "src/user.txt", "operation": "delete"}], increment)
+        self.assertFalse(source.exists())
+        self.assertFalse((self.target / "src/generated-renamed.txt").exists())
+        self.assertEqual(user_file.read_text(encoding="utf-8"), "user data\n")
 
     def test_workflow_store_safely_creates_nested_report_directories(self):
         store = orchestrator.WorkflowStore(self.target, self.flow)
@@ -705,6 +758,13 @@ class OrchestratorTests(unittest.TestCase):
             config(branch="feature/task"), "flow-initialize")
         runner.initialize()
         self.assertEqual(runner.state["status"], "ACTIVE")
+        execution_policy = runner.state["execution_policy"]
+        self.assertEqual(execution_policy["version"], 1)
+        self.assertEqual(execution_policy["mode"], "workspace")
+        self.assertEqual(execution_policy["workspace_root"], str(target.resolve()))
+        self.assertEqual(execution_policy["workflow_id"], "flow-initialize")
+        self.assertIn("workspace file operations", execution_policy["allowed"])
+        self.assertIn("commit/push/merge/deploy/publish", execution_policy["retained_protections"])
         preflight_reference = f"{runner.store.directory}/preflight.json"
         self.assertIn(preflight_reference, runner.state["artifact_references"])
         self.assertEqual(runner.store.read_json(preflight_reference)["overall_result"], "READY")
@@ -720,6 +780,7 @@ class OrchestratorTests(unittest.TestCase):
             changed_config, "flow-initialize")
         resumed.initialize()
         self.assertEqual(resumed.state["orchestration"]["config_snapshot"]["claude_budget_usd"], 1.0)
+        self.assertEqual(resumed.state["execution_policy"], execution_policy)
         changed_planning_config = config(branch="feature/task", claude_budget_usd=1.0,
             validations=[{"id": "other-tests", "argv": ["python3", "-m", "unittest", "tests.test_other"]}])
         planning_update = orchestrator.Orchestrator(str(target), "Add the requested backend behavior.",
@@ -731,47 +792,28 @@ class OrchestratorTests(unittest.TestCase):
         with self.assertRaisesRegex(orchestrator.OrchestratorError, "different task text"):
             changed_task.initialize()
 
-    def test_new_snapshot_excludes_untracked_root_ds_store(self):
-        target, runner = self.new_git_workflow("untracked-root-ds-store", files={".DS_Store": b"root metadata"})
-        self.assertEqual(runner.state["orchestration"]["snapshot_policy"],
-                         orchestrator.SNAPSHOT_POLICY_UNTRACKED_DS_STORE)
-        self.assertNotIn(".DS_Store", {row["path"] for row in runner.state["baseline"]["preexisting_changes"]})
-        self.assertNotIn(".DS_Store", {row["path"] for row in runner.state["orchestration"]["preexisting_hashes"]})
-        self.assertNotIn(".DS_Store", orchestrator._status(target, exclude_untracked_ds_store=True))
-
-    def test_new_snapshot_excludes_untracked_nested_ds_store(self):
-        target, runner = self.new_git_workflow("untracked-nested-ds-store", files={"src/.DS_Store": b"nested metadata"})
-        self.assertNotIn("src/.DS_Store", {row["path"] for row in runner.state["baseline"]["preexisting_changes"]})
-        self.assertNotIn("src/.DS_Store", {row["path"] for row in runner.state["orchestration"]["preexisting_hashes"]})
-
-    def test_tracked_ds_store_remains_protected(self):
-        target = Path(self.temp.name) / "tracked-ds-store"
-        git_fixture(target)
-        (target / ".DS_Store").write_bytes(b"committed metadata")
-        subprocess.run(["git", "-C", str(target), "add", ".DS_Store"], check=True)
-        subprocess.run(["git", "-C", str(target), "commit", "-q", "-m", "track metadata"], check=True)
-        (target / ".DS_Store").write_bytes(b"pre-existing tracked edit")
-        runner = orchestrator.Orchestrator(str(target), "Add a feature", config(), "flow-tracked-ds-store")
-        runner.initialize()
+    def test_preexisting_untracked_metadata_is_snapshotted_and_preserved_like_any_user_file(self):
+        target, runner = self.new_git_workflow("untracked-metadata-preserved", files={".DS_Store": b"user metadata"})
+        self.assertIn(".DS_Store", {row["path"] for row in runner.state["baseline"]["preexisting_changes"]})
         self.assertIn(".DS_Store", {row["path"] for row in runner.state["orchestration"]["preexisting_hashes"]})
-        (target / ".DS_Store").write_bytes(b"later tracked edit")
-        resumed = orchestrator.Orchestrator(str(target), "Add a feature", config(), "flow-tracked-ds-store")
-        with self.assertRaisesRegex(orchestrator.OrchestratorError, "Pre-existing change changed"):
+        (target / ".DS_Store").write_bytes(b"changed metadata")
+        resumed = orchestrator.Orchestrator(str(target), "Add a feature", config(), runner.workflow_id)
+        with self.assertRaisesRegex(orchestrator.OrchestratorError, "Pre-existing change changed since workflow start: \.DS_Store"):
             resumed.initialize()
 
-    def test_staged_ds_store_remains_protected(self):
-        target = Path(self.temp.name) / "staged-ds-store"
-        git_fixture(target)
-        (target / ".DS_Store").write_bytes(b"staged metadata")
-        subprocess.run(["git", "-C", str(target), "add", ".DS_Store"], check=True)
-        runner = orchestrator.Orchestrator(str(target), "Add a feature", config(), "flow-staged-ds-store")
-        runner.initialize()
-        saved = next(row for row in runner.state["orchestration"]["preexisting_hashes"] if row["path"] == ".DS_Store")
-        self.assertIsNotNone(saved["index_sha256"])
-        (target / ".DS_Store").write_bytes(b"changed after staging")
-        resumed = orchestrator.Orchestrator(str(target), "Add a feature", config(), "flow-staged-ds-store")
-        with self.assertRaisesRegex(orchestrator.OrchestratorError, "Pre-existing change changed"):
-            resumed.initialize()
+    def test_preexisting_sensitive_file_is_fingerprinted_without_reading_and_preserved(self):
+        target, runner = self.new_git_workflow("sensitive-file-preserved", files={
+            ".env": b"token=first\n", "credentials/token.txt": b"credential=first\n",
+            ".aws/credentials": b"secret-access-key=first\n"})
+        saved = {row["path"]: row for row in runner.state["orchestration"]["preexisting_hashes"]}
+        for path in (".env", "credentials/token.txt", ".aws/credentials"):
+            with self.subTest(path=path):
+                self.assertTrue(saved[path]["protected_path"])
+                self.assertIsNone(saved[path]["worktree_sha256"])
+                self.assertIsInstance(saved[path]["worktree_metadata"], dict)
+        (target / "credentials/token.txt").write_text("credential=other\n", encoding="utf-8")
+        with self.assertRaisesRegex(orchestrator.OrchestratorError, "Pre-existing change was modified: credentials/token.txt"):
+            runner._assert_increment_changes({"increment_id": "inc-1"})
 
     def test_other_untracked_files_remain_protected(self):
         target, runner = self.new_git_workflow("other-untracked-protected", files={"notes.txt": b"user notes"})
@@ -779,107 +821,6 @@ class OrchestratorTests(unittest.TestCase):
         (target / "notes.txt").write_bytes(b"changed notes")
         resumed = orchestrator.Orchestrator(str(target), "Add a feature", config(), runner.workflow_id)
         with self.assertRaisesRegex(orchestrator.OrchestratorError, "Pre-existing change changed since workflow start: notes.txt"):
-            resumed.initialize()
-
-    def test_snapshot_and_resume_share_ds_store_policy(self):
-        target, runner = self.new_git_workflow("same-snapshot-policy", files={".DS_Store": b"initial metadata"})
-        (target / ".DS_Store").write_bytes(b"changed volatile metadata")
-        resumed = orchestrator.Orchestrator(str(target), "Add a feature", config(), runner.workflow_id)
-        resumed.initialize()
-        self.assertEqual(resumed.state["orchestration"]["snapshot_policy"],
-                         orchestrator.SNAPSHOT_POLICY_UNTRACKED_DS_STORE)
-        subprocess.run(["git", "-C", str(target), "add", ".DS_Store"], check=True)
-        self.assertIn(".DS_Store", orchestrator._status_for_workflow(target, resumed.state))
-
-    def test_revision_manifest_excludes_only_untracked_ds_store(self):
-        target, runner = self.new_git_workflow("manifest-ds-store")
-        (target / "src" / ".DS_Store").write_bytes(b"untracked metadata")
-        (target / "src" / "feature.py").write_text("value = 1\n", encoding="utf-8")
-        increment = {"increment_id": "inc-1", "revision_paths": ["src"]}
-        _revision_id, manifest, _reference = runner._revision_manifest(increment)
-        names = {row["path"] for row in manifest["manifest"]}
-        self.assertIn("src/feature.py", names)
-        self.assertNotIn("src/.DS_Store", names)
-        subprocess.run(["git", "-C", str(target), "add", "src/.DS_Store"], check=True)
-        _revision_id, staged_manifest, _reference = runner._revision_manifest(increment)
-        self.assertIn("src/.DS_Store", {row["path"] for row in staged_manifest["manifest"]})
-
-    def test_historical_snapshot_migration_is_auditable_and_idempotent(self):
-        target, runner, old_hash, current_hash = self.legacy_snapshot_migration_fixture()
-        baseline_before = copy.deepcopy(runner.state["baseline"])
-        hashes_before = copy.deepcopy(runner.state["orchestration"]["preexisting_hashes"])
-        unrelated_before = {row["path"]: row for row in hashes_before if row["path"] != ".DS_Store"}
-        reference = "user-task:Harness Improvement — Normalize volatile OS metadata in workflow snapshots"
-        with unittest.mock.patch.object(orchestrator, "SNAPSHOT_MIGRATION_CURRENT_HASH_PREFIX", current_hash[:8]):
-            result = orchestrator.migrate_untracked_ds_store(
-                str(target.resolve()), orchestrator.SNAPSHOT_MIGRATION_WORKFLOW_ID,
-                expected_old_sha256=old_hash, expected_current_sha256=current_hash,
-                authorization_reference=reference,
-            )
-            migrated = runner.store.read_state()
-            row = migrated["orchestration"]["snapshot_migrations"][0]
-            self.assertTrue(result["changed"])
-            self.assertEqual(row["path"], ".DS_Store")
-            self.assertEqual(row["old_sha256"], old_hash)
-            self.assertEqual(row["current_sha256"], current_hash)
-            self.assertTrue(row["reason"])
-            self.assertFalse(row["original_bytes_recovered"])
-            self.assertIn("could not be recovered", row["original_bytes_note"])
-            datetime.fromisoformat(row["recorded_at"].replace("Z", "+00:00"))
-            self.assertEqual(migrated["baseline"], baseline_before)
-            self.assertEqual(migrated["orchestration"]["preexisting_hashes"], hashes_before)
-            self.assertEqual({item["path"]: item for item in migrated["orchestration"]["preexisting_hashes"]
-                              if item["path"] != ".DS_Store"}, unrelated_before)
-            auth_count = len(migrated["authorizations"])
-            repeated = orchestrator.migrate_untracked_ds_store(
-                str(target.resolve()), orchestrator.SNAPSHOT_MIGRATION_WORKFLOW_ID,
-                expected_old_sha256=old_hash, expected_current_sha256=current_hash,
-                authorization_reference=reference,
-            )
-            self.assertFalse(repeated["changed"])
-            self.assertEqual(len(runner.store.read_state()["authorizations"]), auth_count)
-        resumed = orchestrator.Orchestrator(
-            str(target), "Add a feature", config(), orchestrator.SNAPSHOT_MIGRATION_WORKFLOW_ID,
-        )
-        resumed.initialize()
-        self.assertEqual(resumed.state["status"], "BLOCKED")
-        self.assertEqual(resumed.state["orchestration"]["current_stage"], "SELF_REVIEW")
-        subprocess.run(["git", "-C", str(target), "add", ".DS_Store"], check=True)
-        staged_check = orchestrator.Orchestrator(
-            str(target), "Add a feature", config(), orchestrator.SNAPSHOT_MIGRATION_WORKFLOW_ID,
-        )
-        with self.assertRaisesRegex(orchestrator.OrchestratorError, r"Pre-existing change changed since workflow start: \.DS_Store"):
-            staged_check.initialize()
-        subprocess.run(["git", "-C", str(target), "reset", "-q", "--", ".DS_Store"], check=True)
-        (target / "src/.DS_Store").write_bytes(b"changed unrelated metadata")
-        checked = orchestrator.Orchestrator(
-            str(target), "Add a feature", config(), orchestrator.SNAPSHOT_MIGRATION_WORKFLOW_ID,
-        )
-        with self.assertRaisesRegex(orchestrator.OrchestratorError, r"Pre-existing change changed since workflow start: src/\.DS_Store"):
-            checked.initialize()
-
-    def test_migration_requires_authorization_and_does_not_touch_other_paths(self):
-        target, runner, old_hash, current_hash = self.legacy_snapshot_migration_fixture("migration-auth-required")
-        before = runner.store.read_state()
-        with self.assertRaisesRegex(orchestrator.OrchestratorError, "authorization provenance"):
-            orchestrator.migrate_untracked_ds_store(
-                str(target.resolve()), orchestrator.SNAPSHOT_MIGRATION_WORKFLOW_ID,
-                expected_old_sha256=old_hash, expected_current_sha256=current_hash,
-                authorization_reference="",
-            )
-        self.assertEqual(runner.store.read_state(), before)
-
-    def test_legacy_workflow_without_migration_keeps_original_ds_store_checks(self):
-        target, runner, old_hash, _current_hash = self.legacy_snapshot_migration_fixture("legacy-ds-store-check")
-        state = runner.store.read_state()
-        state["orchestration"].pop("snapshot_policy", None)
-        state["orchestration"].pop("snapshot_migrations", None)
-        runner.store.save(state)
-        (target / ".DS_Store").write_bytes(b"changed current metadata")
-        resumed = orchestrator.Orchestrator(
-            str(target), "Add a feature", config(), orchestrator.SNAPSHOT_MIGRATION_WORKFLOW_ID,
-        )
-        with self.assertRaisesRegex(orchestrator.OrchestratorError, r"Pre-existing change changed since workflow start: \.DS_Store"):
             resumed.initialize()
 
     def test_remote_ref_movement_is_recorded_without_replacing_workflow_baseline(self):
@@ -1257,7 +1198,7 @@ class OrchestratorTests(unittest.TestCase):
         }
         return plan_reference, original_config_sha
 
-    def test_recorded_legacy_ohpen_plan_survives_review_budget_and_authorization_changes(self):
+    def test_recorded_legacy_plan_survives_review_budget_and_authorization_changes(self):
         plan_reference, original_config_sha = self._recorded_legacy_plan_fixture()
 
         recovered = self.runner._read_plan(plan_reference)
@@ -1592,8 +1533,6 @@ class OrchestratorTests(unittest.TestCase):
                    "description": "A defect needs correction.", "recommendation": "Correct it."}
         managed_process = {"id": "CF-2", "severity": "medium", "file": orchestrator.PROCESS_EVIDENCE_PATH,
                    "description": "Controller process evidence is stale.", "recommendation": "Refresh from records."}
-        managed_metadata = {"id": "CF-3", "severity": "low", "file": orchestrator.OHPEN_FINDER_METADATA_PATH,
-                   "description": "Confirmed Finder metadata is in the product tree.", "recommendation": "Remove the metadata."}
         old_revision = "content:" + "1" * 64
         new_revision = "content:" + "2" * 64
         cycle = claude_reviewer.new_review_cycle(
@@ -1605,11 +1544,11 @@ class OrchestratorTests(unittest.TestCase):
                                                      verification_evidence_references=["VAL-OLD"])
         cycle["rounds"][0].update({"status": "completed", "outcome": "REVIEW_COMPLETED",
             "report_valid": True, "envelope_valid": True, "reviewer_status": "CHANGES_REQUESTED",
-            "finding_ids": ["CF-1", "CF-2", "CF-3"], "report_reference": ".engineering/reports/first.json"})
+            "finding_ids": ["CF-1", "CF-2"], "report_reference": ".engineering/reports/first.json"})
         cycle["round_count"] = 1
         cycle["status"] = "finding_analysis_pending"
-        report = {"decision": "CHANGES_REQUESTED", "summary": "Three issues found.",
-                  "findings": [finding, managed_process, managed_metadata]}
+        report = {"decision": "CHANGES_REQUESTED", "summary": "Two issues found.",
+                  "findings": [finding, managed_process]}
         self.runner.state = {
             "status": "ACTIVE", "phase": "INDEPENDENT_VERIFICATION", "updated_at": "",
             "workflow_id": self.flow, "scope": {}, "artifact_references": [],
@@ -1653,7 +1592,6 @@ class OrchestratorTests(unittest.TestCase):
 
         controller_decisions = {
             "CF-2": {"finding_id": "CF-2", "decision": "ACCEPT", "reason": "Controller refreshed evidence.", "evidence_references": []},
-            "CF-3": {"finding_id": "CF-3", "decision": "ACCEPT", "reason": "Controller removed confirmed metadata.", "evidence_references": []},
         }
         with patch("orchestrator._runtime_bundle_files", side_effect=prepare_runtime), \
              patch("orchestrator._runtime_bundle_unchanged", return_value=True), \
@@ -1674,8 +1612,8 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(captured["codex_finding_ids"], ["CF-1"])
         self.assertTrue(observed_runtime["path"].is_absolute())
         self.assertEqual(captured["revision_id"], new_revision)
-        self.assertEqual(captured["previous_findings"], [finding, managed_process, managed_metadata])
-        self.assertEqual({row["finding_id"] for row in captured["prior_decisions"]}, {"CF-1", "CF-2", "CF-3"})
+        self.assertEqual(captured["previous_findings"], [finding, managed_process])
+        self.assertEqual({row["finding_id"] for row in captured["prior_decisions"]}, {"CF-1", "CF-2"})
         self.assertTrue(all(row["decision"] == "ACCEPT" for row in captured["prior_decisions"]))
         self.assertTrue(all(row["resolution_evidence_references"] == ["VAL-NEW"]
                             for row in captured["prior_decisions"]))
@@ -1685,6 +1623,7 @@ class OrchestratorTests(unittest.TestCase):
             "increment_id": "inc-2", "title": "Document feature", "code_paths": ["docs"],
             "artifact_paths": [], "revision_paths": ["docs"],
             "acceptance_criteria_ids": ["AC-1"], "validation_ids": ["tests"],
+            "blocked_by_decision": False,
         }]
         document = plan(increments=increments)
         self.write_state(self.runner)
@@ -1699,6 +1638,34 @@ class OrchestratorTests(unittest.TestCase):
             result = self.runner.run()
         self.assertEqual(invoked, ["inc-1", "inc-2"])
         self.assertEqual(result["status"], "ACTIVE")
+
+    def test_orchestrator_runs_independent_increment_before_waiting_for_product_decision(self):
+        increments = [
+            {**plan()["increments"][0], "increment_id": "inc-independent", "blocked_by_decision": False},
+            {**plan()["increments"][0], "increment_id": "inc-dependent", "blocked_by_decision": True},
+        ]
+        document = plan(increments=increments)
+        document["decision"] = "NEEDS_HUMAN_INPUT"
+        document["decision_context"] = {"category": "functional_decision",
+            "question": "Should clients be able to cancel a running job?",
+            "proposal": "Keep cancellation out of scope for this release.",
+            "alternatives": ["Add cancellation", "Defer cancellation"],
+            "reason": "The API capability changes client behavior and processing guarantees.",
+            "policy_or_skill_reference": None, "required_authority": "product owner",
+            "interactive_resolution_allowed": False}
+        self.write_state(self.runner)
+        self.runner.state["pending_decisions"] = [{"decision_id": "PLAN-CLARIFICATION", "status": "open"}]
+        invoked = []
+        self.runner.initialize = lambda: None
+        self.runner._save = lambda: None
+        self.runner._planning = lambda _runtime: document
+        self.runner._increment = lambda _plan, item, _runtime: invoked.append(item["increment_id"])
+        self.runner._finalize_revision = lambda _plan: self.fail("must wait before finalization")
+        with patch("orchestrator._runtime_bundle_files", return_value={}):
+            outcome = self.runner.run()
+        self.assertEqual(invoked, ["inc-independent"])
+        self.assertEqual(outcome["status"], "WAITING_FOR_HUMAN")
+        self.assertEqual(self.runner.state["orchestration"]["current_stage"], "PLANNING")
 
     def test_waiting_for_human_is_not_automatically_reactivated(self):
         pending = [{"decision_id": "PLAN-CLARIFICATION", "status": "open"}]
@@ -1734,6 +1701,7 @@ class OrchestratorTests(unittest.TestCase):
             "requirements": [], "acceptance_criteria": [], "risk_band": "medium",
             "architecture_context": [], "documentation_context": [], "capabilities_used": [],
             "increments": [], "dependencies": [], "blockers": [],
+            "engineering_discovery": plan()["engineering_discovery"],
             "decision_context": {
                 "category": "functional_decision", "question": "Which contract should be implemented?",
                 "proposal": "Use the proposed contract.", "alternatives": ["Provide another contract."],
@@ -1863,6 +1831,24 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(saved["pending_decisions"][0]["response_history"][0]["response"], text)
             self.assertEqual(saved["status"], "ACTIVE")
 
+    def test_nonapproval_response_to_partially_blocked_plan_does_not_release_dependent_work(self):
+        decision = self.functional_decision()
+        state = {"workflow_id": self.flow, "status": "WAITING_FOR_HUMAN",
+            "pending_decisions": [decision], "orchestration": {
+                "plan_reference": f".engineering/workflows/{self.flow}/plan.json",
+                "increments": [{"increment_id": "inc-dependent", "status": "pending",
+                    "blocked_by_decision": True}]}}
+        saved = {}
+        store = type("Store", (), {"directory": f".engineering/workflows/{self.flow}",
+            "save": lambda _self, value: saved.update(json.loads(json.dumps(value)))})()
+        result = orchestrator.record_decision_response(store, state, "PLAN-CLARIFICATION", "ALTERNATIVE",
+            "Support cancellation after item completion only.", operator_identity="conversation participant",
+            source_reference="conversation response")
+        self.assertFalse(result["resolved"])
+        self.assertTrue(result["requires_requirement_update"])
+        self.assertEqual(saved["status"], "WAITING_FOR_HUMAN")
+        self.assertEqual(saved["pending_decisions"][0]["status"], "open")
+
     def test_cli_lists_pending_decisions_and_maps_response_actions(self):
         output = StringIO()
         listing = {"workflow_id": self.flow, "workflow_status": "WAITING_FOR_HUMAN",
@@ -1987,97 +1973,6 @@ class OrchestratorTests(unittest.TestCase):
         with patch.object(self.runner, "_recovery_context", return_value=current):
             result = self.runner.run()
         self.assertEqual(result["status"], "BLOCKED")
-
-    def test_ohpen_recovery_authorization_is_persisted_consumed_and_single_use(self):
-        runner = orchestrator.Orchestrator(str(self.target), "Add a feature", config(),
-            orchestrator.OHPEN_RECOVERY_WORKFLOW_ID)
-        blocker = {"affected_phase": "IMPLEMENTATION",
-            "reason": "Self-review findings remain after the bounded correction loop",
-            "recorded_at": "2026-11-09T13:41:01Z",
-            "safe_recovery_path": "Resolve the recorded blocker and resume with the same target, task, and workflow ID."}
-        blocker_hash = orchestrator._blocker_fingerprint(blocker)
-        self.write_state(runner, status="BLOCKED", stage="SELF_REVIEW", attempts=[
-            {"stage": "RESUME", "blocker_sha256": blocker_hash},
-            *({"stage": "SELF_REVIEW", "trace": {}} for _ in range(13)),
-        ])
-        runner.state["target"] = {"target_id": "TARGET-TEST"}
-        runner.state["blocker"] = blocker
-        runner.state["orchestration"]["current_stage"] = "SELF_REVIEW"
-        runner.state["orchestration"]["current_increment_id"] = None
-        runner.initialize = lambda: None
-        runner._save = lambda: None
-        runner._planning = lambda _runtime: None
-        runner.self_review_recovery_authorization_reference = (
-            "conversation: user approved one-use recovery after escalation review")
-        current_context = {"workflow_id": runner.workflow_id, "stage": "SELF_REVIEW",
-            "blocker_sha256": blocker_hash, "requirement_version": 2, "task_sha256": "a" * 64,
-            "config_sha256": "b" * 64, "target_baseline_commit": "base", "revision_id": "content:" + "c" * 64,
-            "harness_orchestrator_sha256": "d" * 64, "runtime_bundle_sha256": "e" * 64,
-            "codex": {"cli_version": "codex test", "model": "model", "provider": "provider",
-                "python_runtime": "3.x"}}
-        with patch.object(runner, "_recovery_context", return_value=current_context), \
-             patch("orchestrator._runtime_bundle_files", return_value={}):
-            result = runner.run()
-        self.assertEqual(result["status"], "ACTIVE")
-        self.assertEqual(len(runner.state["orchestration"]["attempts"]), 15)
-        authorization = runner.state["orchestration"]["self_review_recovery_authorizations"][0]
-        resume = runner.state["orchestration"]["attempts"][-1]
-        self.assertEqual(authorization["status"], "consumed")
-        self.assertEqual(authorization["blocker_sha256"], blocker_hash)
-        self.assertEqual(authorization["resume_attempt_number"], 15)
-        self.assertEqual(resume["resume_basis"], "authorized_self_review_recovery")
-        self.assertEqual(resume["recovery_authorization_id"], authorization["authorization_id"])
-        self.assertEqual(runner.state["orchestration"]["attempts"][0]["blocker_sha256"], blocker_hash)
-
-        runner.state["status"] = "BLOCKED"
-        runner.state["blocker"] = blocker
-        runner.self_review_recovery_authorization_reference = None
-        with patch.object(runner, "_planning", side_effect=AssertionError("consumed recovery must not run again")):
-            repeated = runner.run()
-        self.assertEqual(repeated["status"], "BLOCKED")
-        self.assertEqual(len(runner.state["orchestration"]["attempts"]), 15)
-        self.assertEqual(len(runner.state["orchestration"]["self_review_recovery_authorizations"]), 1)
-
-    def test_ohpen_recovery_authorization_rejects_stale_attempt_count(self):
-        runner = orchestrator.Orchestrator(str(self.target), "Add a feature", config(),
-            orchestrator.OHPEN_RECOVERY_WORKFLOW_ID)
-        blocker = {"affected_phase": "IMPLEMENTATION",
-            "reason": "Self-review findings remain after the bounded correction loop",
-            "recorded_at": "2026-11-09T13:41:01Z",
-            "safe_recovery_path": "Resolve the recorded blocker and resume with the same target, task, and workflow ID."}
-        self.write_state(runner, status="BLOCKED", stage="SELF_REVIEW", attempts=[{}] * 13)
-        runner.state["target"] = {"target_id": "TARGET-TEST"}
-        runner.state["blocker"] = blocker
-        runner.state["orchestration"]["current_stage"] = "SELF_REVIEW"
-        runner.self_review_recovery_authorization_reference = "conversation: approved recovery"
-        runner.initialize = lambda: None
-        runner._save = lambda: None
-        with self.assertRaisesRegex(orchestrator.OrchestratorError, "does not match the recorded Ohpen workflow state"):
-            runner.run()
-        self.assertEqual(runner.state["orchestration"].get("self_review_recovery_authorizations", []), [])
-
-    def test_cli_passes_ohpen_recovery_authorization_source_to_controller(self):
-        task_path = Path(self.temp.name) / "task.txt"
-        config_path = Path(self.temp.name) / "config.json"
-        task_path.write_text("Resume the existing workflow.\n", encoding="utf-8")
-        config_path.write_text(json.dumps(config()), encoding="utf-8")
-        captured = {}
-
-        class FakeOrchestrator:
-            def __init__(self, *_args, **kwargs):
-                captured.update(kwargs)
-            def run(self):
-                return {"status": "ACTIVE", "workflow_id": orchestrator.OHPEN_RECOVERY_WORKFLOW_ID}
-
-        with patch.object(orchestrator, "Orchestrator", FakeOrchestrator), redirect_stdout(StringIO()):
-            result = orchestrator.main(["--target", str(self.target), "--branch", "feature/task",
-                "--workflow-id", orchestrator.OHPEN_RECOVERY_WORKFLOW_ID,
-                "--task-file", str(task_path), "--config", str(config_path),
-                "--authorize-ohpen-self-review-recovery",
-                "--recovery-authorization-reference", "conversation: explicit one-use authorization"])
-        self.assertEqual(result, 3)
-        self.assertEqual(captured["self_review_recovery_authorization_reference"],
-                         "conversation: explicit one-use authorization")
 
     def test_repeated_validation_blocker_resumes_only_after_revision_changes(self):
         blocker = {"reason": "Required validation tests failed (exit 1)", "affected_phase": "TESTING",

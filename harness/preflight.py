@@ -34,6 +34,7 @@ SKIP_DIRS = {".git", ".hg", ".svn", "node_modules", "vendor", ".venv", "venv", "
 CONFIG_KEYS = {
     "target_path", "included_paths", "code_paths", "artifact_paths", "revision_paths",
     "excluded_paths", "workspace_root", "instruction_roots", "authorized_working_directories",
+    "execution_policy", "workspace_excluded_paths", "workflow_created_paths",
 }
 
 
@@ -900,6 +901,33 @@ class Preflight:
             self.add("scope.validation", "NOT_APPLICABLE", "Scope config could not be loaded; the config input check has failed.")
             return
         try:
+            execution_policy = self.config.get("execution_policy")
+            if execution_policy is not None:
+                if (not isinstance(execution_policy, dict) or
+                        set(execution_policy) != {"version", "mode", "workspace_root", "workflow_id"} or
+                        execution_policy.get("version") != 1 or execution_policy.get("mode") != "workspace" or
+                        not isinstance(execution_policy.get("workflow_id"), str) or
+                        not execution_policy["workflow_id"]):
+                    raise PreflightError("execution_policy must identify version 1 workspace mode and its workflow")
+                policy_root = canonical_authorized_root(execution_policy.get("workspace_root"),
+                                                        "execution_policy.workspace_root")
+                if policy_root != self.target:
+                    raise PreflightError("Workspace execution policy must be bound to the canonical target root")
+                if self.config.get("target_path") != str(self.target):
+                    raise PreflightError("Workspace execution policy requires the exact canonical target_path")
+                nested = self.nested_git_repository_roots()
+                if nested:
+                    raise PreflightError(f"Workspace execution policy cannot cross nested repositories: {nested}")
+                scopes = {"mode": "workspace", "workspace_root": str(self.target),
+                          "workflow_id": execution_policy["workflow_id"]}
+                self.report["scope"] = scopes
+                self.report["authorized_working_directories"] = [str(self.target)]
+                self.add("scope.validation", "PASS",
+                         "One workspace execution policy is bound to the canonical target; Git metadata, nested repositories, symlink escapes, and dirty baseline changes remain protected.",
+                         evidence=scopes,
+                         limitations=["The policy authorizes routine operations only inside this target workspace.",
+                                      "External operations, publication, and paid services remain separately restricted."])
+                return
             lists = self.load_scope_lists()
             if "target_path" in self.config:
                 if not isinstance(self.config["target_path"], str):

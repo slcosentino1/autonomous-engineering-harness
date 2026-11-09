@@ -4,7 +4,7 @@ Repository: `autonomous-engineering-harness`
 
 A reusable foundation for working through software assignments in an existing or new target repository. It defines an evidence-based engineering lifecycle, review contracts, quality gates, reusable project-document templates, and a read-only target preflight CLI. It is designed to be language- and architecture-neutral.
 
-The current release provides an **explicit stage controller, a read-only target preflight CLI, a scope-checked safe writer, and a bounded Claude-through-Aily reviewer adapter**. `harness/orchestrator.py` is the sole supported workflow execution entrypoint. It controls planning, implementation, configured validations, Claude review, correction, revalidation, and target-local workflow state. Codex child sessions are read-only and return structured file changes; the controller applies them through `safe_writer.py`. `harness/runner.py` is deprecated and retained only as a legacy compatibility launcher. The orchestrator does not implement the complete cross-record verification gate evaluator or a commit authorization workflow. High-risk tasks stop at `WAITING_FOR_HUMAN` until the policy-required authenticated human reviewer and distinct final gate approver are recorded. The controller does not stage, commit, push, merge, publish, or create PRs.
+The current workflow uses **one workspace-scoped execution policy, a read-only target preflight, Safe Writer, and a bounded Claude-through-Aily reviewer adapter**. `harness/orchestrator.py` is the sole supported workflow execution entrypoint. At initialization it records a versioned policy bound to the canonical target and workflow ID. That policy covers ordinary assignment-related file operations, configured development commands, approved project dependency installation, workflow evidence, local Git inspection and exact-path staging, internal transitions, and bounded review corrections. Codex child sessions are read-only and return structured file changes; the controller applies them through Safe Writer. `harness/runner.py` is deprecated and retained only as legacy compatibility code. The orchestrator does not implement the complete cross-record verification gate evaluator or commits, pushes, merges, publication, or PRs. Required authenticated High-risk review and gate authority remain external.
 
 ## Repository boundary
 
@@ -25,18 +25,17 @@ flowchart LR
     G --> H{Verification gate}
     H -->|Correction required| K
     H -->|Evidence missing| F
-    H -->|Accepted| I[Local commit, if authorized]
-    I --> J[Next increment or close]
+    H -->|Accepted| I[Next increment or close]
 ```
 
 ## Start here
 
 1. Start a Codex session with this repository's `AGENTS.md` instructions available. Give Codex the task and the **absolute repository-root path** of the target. If the target path is missing or ambiguous, Codex must ask for it; it never guesses from the harness working directory.
-2. Start the task with `harness/orchestrator.py` using an absolute target, exact branch, task file, and a configuration containing inspected validation commands. The controller launches Codex using `--sandbox read-only` for each plan, implementation, and correction stage; the outer controller is the only process that writes target files, using `safe_writer.py`. See [the orchestrator guide](docs/orchestrator.md) for the full command and configuration. Use Prompt 06 directly only for an already active interactive Codex session.
+2. Start the task with `harness/orchestrator.py` using an absolute target, exact branch, task file, and a configuration containing inspected validation commands. The controller launches Codex using `--sandbox read-only` for each plan, implementation, and correction stage; the outer controller is the only process that writes target files, using Safe Writer under the persisted workspace policy. See [the orchestrator guide](docs/orchestrator.md) for the full command and configuration. Use Prompt 06 only for an already active interactive Codex session; it does not replace the orchestrator as a workflow engine.
 
-The workflow ID is stable for the same canonical target, task text, branch, and configuration. If a run is interrupted, rerun the same orchestrator command with the same `--workflow-id`; it resumes from persisted target-local state when no unresolved human decision blocks the phase. Inspect and respond to a pending decision with `--list-pending-decisions` and `--respond-decision`, then rerun the same workflow command. Interactive responses record declared provenance and cannot satisfy external-operation authorization or authenticated High-risk approvals. The orchestrator does not bypass operation-specific approvals for branches, commits, pushes, PRs, deployments, or external services.
-3. Codex runs the [read-only preflight](#read-only-target-preflight), reads the target's instructions and conventions, and derives and records narrow per-increment code and artifact scopes from the authorized task before writing. Product records stay in the target. If the target has no workflow-state convention, the default is `.engineering/workflows/<workflow_id>/workflow-state.json`; related workflow evidence and reports are kept in that workflow directory. Existing target conventions take precedence.
-4. The controller runs a stage self-review, configured validations, and then Claude through Aily automatically when a valid persistent `review.authorization` in the workflow config covers the repository, exact review files, read-only mode, exclusions, validity period, and budget. Missing or invalid authorization pauses before external contact. The adapter reviews a bounded read-only snapshot; Codex processes findings, corrects accepted issues, self-reviews again, reruns affected validations, and uses the remaining review round when appropriate. Authorization provenance is recorded as declared unless trusted authentication evidence is supplied; it is never treated as functional approval or High-risk human approval. High-risk human review, second-review, and gate-approval requirements remain.
+The workflow ID is stable for the same canonical target, task text, branch, and configuration. If a run is interrupted, rerun the same orchestrator command with the same `--workflow-id`; it resumes from persisted target-local state when no genuine product decision blocks the phase. The workspace execution policy is reused on resume. Functional decisions can be inspected with `--list-pending-decisions` and answered with `--respond-decision`; those responses cannot authorize external operations or satisfy authenticated High-risk approvals.
+3. The orchestrator runs read-only preflight, reads target instructions and conventions, and records the workspace policy before making changes. Product records stay in the target. If the target has no workflow-state convention, the default is `.engineering/workflows/<workflow_id>/workflow-state.json`; related workflow evidence and reports are kept in that workflow directory. `revision_paths` describe what reviewers inspect and are not write allowlists.
+4. The controller runs self-review, configured validations, and then Claude through Aily when the workflow config carries a valid, explicitly authorized review grant covering the repository, exact review files, read-only mode, exclusions, validity period, and budget. Missing or invalid authorization pauses before external contact. The adapter reviews a bounded read-only snapshot; Codex processes findings, corrects accepted issues, self-reviews again, and reruns affected validations. Review authorization is distinct from human review or gate approval. Required authenticated High-risk human review and gate authority remain.
 
 Use the [new-task guide and reusable prompt template](docs/workflow.md#start-a-new-task-with-codex) to provide a request. Codex should continue autonomously on authorized, in-scope work and ask only about material ambiguity, restricted-operation authorization, required human approval, or a genuine blocker.
 
@@ -52,7 +51,7 @@ See the [workflow guide](docs/workflow.md), [engineering lifecycle](harness/work
 - `harness/preflight.py`: dependency-free read-only target identity, isolation, state, instruction, scope, and filesystem inspection.
 - `harness/orchestrator.py`: bounded stage controller for plan, implement, validate, Claude review, correction, revalidation, and target-local workflow state.
 - `harness/runner.py`: deprecated legacy compatibility launcher; not a supported workflow entrypoint.
-- `harness/safe_writer.py`: narrow scope-checked target directory creation and file creation/replacement helper; re-runs preflight and emits JSON operation evidence under the documented single-writer assumption.
+- `harness/safe_writer.py`: workspace-bound target file operations with retained path, identity, hard-link, and expected-content checks; legacy path-scope mode remains available to standalone callers.
 - `harness/claude_reviewer.py`: bounded Aily/Claude read-only review invocation, evidence and manifest validation, one-shot persisted two-round enforcement, isolated snapshot, report validation, and review-evidence mapping. Explicit user authorization can be persisted with declared identity assurance when external identity is unavailable.
 - `harness/schemas/preflight-config.schema.json`: optional JSON input contract for preflight scopes and instruction roots.
 - `harness/config/`: default verification policy.
@@ -68,7 +67,7 @@ Run from any working directory with an explicit repository-root target:
 ./harness/preflight.py --target /absolute/path/to/target
 ```
 
-Optional scope and instruction-root configuration is JSON. An omitted or empty `included_paths` list authorizes zero writes. `--workspace-root` explicitly authorizes inspection of the direct ancestor instruction chain; without it, preflight does not read above the target root.
+Optional scope and instruction-root configuration is JSON. Legacy `included_paths` limits apply only when no workspace execution policy is supplied. The orchestrator uses its persisted policy rather than per-increment path lists. `--workspace-root` explicitly authorizes inspection of the direct ancestor instruction chain; without it, preflight does not read above the target root.
 
 ```sh
 ./harness/preflight.py \
@@ -91,41 +90,19 @@ Example scope config:
 }
 ```
 
-Preflight verifies Git identity and separation from the harness, reads repository state, inventories instructions/capabilities and documentation locations, validates configured scopes, and observes symlinks, hard links, and filesystem identity. It never writes to the target, executes discovered instructions, installs tools, or contacts external services. A `READY` report means these read-only checks passed for the observed state. It does not itself enforce future writes; `harness/safe_writer.py` re-runs preflight for each write and revalidates the exact path through no-follow directory descriptors. Ancestor instruction reads occur only for roots explicitly supplied through `--workspace-root` or `instruction_roots`.
+Preflight verifies Git identity and separation from the harness, reads repository state, inventories instructions/capabilities and documentation locations, validates configured scopes, and observes symlinks, hard links, and filesystem identity. It never writes to the target, executes discovered instructions, installs tools, or contacts external services. A `READY` report means these read-only checks passed for the observed state. Safe Writer re-runs preflight and revalidates workspace binding and path identity through no-follow directory descriptors before each file operation. Ancestor instruction reads occur only for roots explicitly supplied through `--workspace-root` or `instruction_roots`.
 
-## Scope-checked target writes
+## Workspace writes and retained checks
 
-Use the safe writer with the same JSON scope configuration used by preflight. It accepts bytes on standard input and only writes a path covered by exactly one authorized code or artifact prefix:
+The orchestrator supplies Safe Writer with the workspace policy stored at initialization. Assignment-related source, tests, documentation, configuration, metadata, generated files, and evidence can be created or edited anywhere inside the canonical target without exact path-prefix or extension allowlists. Verified existing directories can be traversed; directory creation no longer requires separate approval for each missing component. Workflow-created files may be renamed or deleted with operation evidence. Preserve pre-existing unrelated user files and changes. Git metadata, nested repositories, credential/environment paths, symlink escapes, and paths outside the target remain excluded. Replacements still verify the expected content and file identity and reject hard links. The standalone helper retains legacy scope-config mode for existing callers.
 
-```sh
-python3 harness/safe_writer.py mkdir \
-  --target /absolute/path/to/target \
-  --config /absolute/path/to/preflight.json \
-  --path src/new-module/types
-
-python3 harness/safe_writer.py create \
-  --target /absolute/path/to/target \
-  --config /absolute/path/to/preflight.json \
-  --path src/new-file.py < /path/to/new-content
-
-python3 harness/safe_writer.py replace \
-  --target /absolute/path/to/target \
-  --config /absolute/path/to/preflight.json \
-  --path src/existing-file.py \
-  --expected-sha256 SHA256_RECORDED_BEFORE_EDIT < /path/to/replacement-content
-```
-
-`mkdir` creates missing path components one at a time with exclusive directory creation. Every missing component must independently pass the explicit write-scope and code/artifact classification checks; a scope for a nested leaf does not authorize creating an out-of-scope parent. Existing components are opened with no-follow directory descriptors and are not replaced or directly changed. If the requested directory already exists, the operation fails. A later filesystem error leaves earlier directories in place and returns partial JSON evidence; inspect that evidence before retrying. Creating a child necessarily updates its existing parent directory's filesystem timestamps, while preserving the parent's identity, mode, ownership, and existing entries.
-
-Creation uses `O_EXCL` and never overwrites an existing entry. Replacement requires the expected baseline SHA-256 recorded before implementation, rejects symlinks and files with multiple hard links, writes and fsyncs a temporary file in the verified destination directory, checks the original path/descriptor identity and content immediately before an atomic rename, fsyncs the directory, then verifies the resulting hash and identity. The JSON response contains the operation, path, before/after identities and hashes, and link count; retain it with the target workflow evidence. The helper preserves POSIX mode and owner/group where permitted; it does not preserve extended attributes or ACLs, so do not use it on files whose correctness depends on those metadata.
-
-The replacement rename is atomic for readers, but macOS does not condition it on the destination inode checked immediately beforehand. The workflow therefore assumes one Codex writer and requires humans and automation to pause edits during that workflow. This is not protection against arbitrary non-cooperating writers racing after the final check. Stop and revalidate if an unexpected modification is observed. A process crash during exclusive creation may leave a partial new file; inspect and resolve it before retrying.
+Normal project commands and approved package-manager installs run through the configured command filter without per-command approval. The filter blocks known shell, external-service, privilege-escalation, publication, direct destructive filesystem, and out-of-workspace command forms and removes credential-like environment variables. Workflow-created files can be removed through Safe Writer. The command filter is a guardrail, not OS-level process confinement; project code can still have side effects as the current user.
 
 The standard-library test suite runs with `python3 -m unittest discover -s tests -v`.
 
 ## Current limitations
 
-The launcher delegates phase orchestration to one Codex session; it does not implement a separate transition engine, state store, command broker, identity provider, CI integration, or cross-record policy evaluator. Its Codex sandbox is scoped to the target repository root and an ephemeral tool snapshot; per-increment write scopes remain enforced by safe-writer invocations and workflow contracts, not a per-path Codex sandbox. The snapshot is verified by hash after the run. The safe writer relies on the single-writer assumption and does not preserve ACLs/extended attributes. The Claude adapter validates target/workflow/reviewer/data-specific authorization attestations, evidence artifacts, scoped manifests, one-shot round claims, and workflow history. When a total budget is supplied through `max_budget_usd` or `HARNESS_CLAUDE_TOTAL_BUDGET_USD`, it clamps Aily's `--max-budget-usd` to the remaining amount and blocks another call if earlier spend is unknown. Without a supplied limit, no monetary ceiling is enforced. The adapter records declared identity when the runtime lacks authenticated user identity and does not claim cryptographic proof. Its temporary snapshot plus Claude Code `--restricted`, no-MCP configuration, and read-only tool allowlist constrain file tools to the authorized snapshot; this is not an OS sandbox around the Aily/Claude process. Human identities and approvals required by High-risk policy still need trusted authentication. The workflow owner must compute the complete workflow `revision_paths` identity for the gate. The isolated demo completed implementation, tests, self-review, and preflight, but the actual Aily call failed before producing a report because the sandbox could not create a temporary file under `~/.cache/uv`; no Claude review or approved gate was recorded. The first standalone Codex CLI probe also returned 401 without a bearer token, while the final runner invocation succeeded after the normal local filesystem permission escalation.
+The command filter is not a substitute for OS-level process confinement. Runtime project scripts may have side effects under the current user account, so configured commands still need ordinary engineering judgment and must respect provider/organization policy. Safe Writer assumes a single writer and its atomic replacement does not prevent a non-cooperating process racing after the final identity check. It does not preserve all ACLs or extended attributes. The orchestrator does not implement the complete cross-record verification gate evaluator or an identity provider; any policy-required authenticated human review and gate approval remain external. Claude/Aily review transmits its explicitly authorized bounded review packet and requires a valid grant and budget.
 
 ## Roadmap
 

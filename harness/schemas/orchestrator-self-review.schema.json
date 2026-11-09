@@ -11,8 +11,9 @@
     "findings": {"type": "array", "items": {"$ref": "#/$defs/finding"}},
     "changes": {"type": "array", "items": {
       "type": "object", "additionalProperties": false,
-      "required": ["path", "content"],
-      "properties": {"path": {"type": "string"}, "content": {"type": "string"}}
+      "required": ["path"],
+      "properties": {"path": {"type": "string"}, "content": {"type": "string"},
+        "operation": {"enum": ["delete", "rename"]}, "destination": {"type": "string"}}
     }}
   },
   "$defs": {

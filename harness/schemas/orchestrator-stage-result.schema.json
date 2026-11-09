@@ -12,10 +12,12 @@
       "type": "array",
       "items": {
         "type": "object", "additionalProperties": false,
-        "required": ["path", "content"],
+        "required": ["path"],
         "properties": {
           "path": {"type": "string"},
-          "content": {"type": "string"}
+          "content": {"type": "string"},
+          "operation": {"enum": ["delete", "rename"]},
+          "destination": {"type": "string"}
         }
       }
     },
