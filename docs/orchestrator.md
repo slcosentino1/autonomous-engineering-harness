@@ -38,7 +38,15 @@ To continue, rerun the original workflow command with the same target, branch, t
 
 ## Start a task
 
-Supply the absolute Git root, its existing branch, one task prompt, and a JSON file describing validations, review settings, and the exact user-authorized code/artifact path prefixes. The planner cannot widen these prefixes. `code_file_extensions` can further restrict the files Codex may return; an empty array explicitly permits any extension. The initial prompt is retained in `task.json` and a versioned `requirements-v1.json`; the current requirements and plan are stored under the workflow directory.
+Supply the absolute Git root, its existing branch, one task prompt, and a JSON file describing validations, review settings, and the exact user-authorized code/artifact path prefixes. The planner cannot widen these prefixes. `code_file_extensions` can further restrict the files Codex may return; an empty array explicitly permits any extension. Optionally set `base_ref` (for example, `origin/main`) to pin a requested base reference; if omitted, the controller uses the branch's configured upstream, or `HEAD` when no upstream exists. At workflow start, the controller resolves that reference to an exact commit and keeps that `base_commit` unchanged. The initial checked-out `HEAD` remains separately stored as `baseline.commit`. The initial prompt is retained in `task.json` and a versioned `requirements-v1.json`; the current requirements and plan are stored under the workflow directory.
+
+### Git baseline and worktree identity
+
+The workflow state records `orchestration.git_tracking.base_ref_at_start`, its immutable `base_commit`, the assigned `workflow_branch`, and the canonical `target_worktree`. On resume, the controller verifies that it is still using that worktree and branch, and rejects a branch that Git reports as checked out in any other worktree. It does not create, switch, reset, clean up, or remove worktrees or branches. There is no detached-worktree creation lifecycle in this orchestrator; start it in the intended named-branch worktree. Supplying a commit ID as `base_ref` pins that exact commit without checking it out.
+
+Git refs and remotes are shared between linked worktrees. The controller does not fetch, but observes the pinned base ref and configured upstream at initialization, resume, and final status reporting. A changed remote-tracking ref is appended to `orchestration.git_tracking.reference_movements` with its old and new commit, observation time, workflow ID, and observing operation. This event is separate from `baseline.commit` and the pinned `base_commit`. The controller never pulls, resets, rebases, merges, fast-forwards, or replaces either baseline automatically. A remote ref can move while the workflow is running; movement is recorded the next time the controller observes it.
+
+The CLI result's `git_state` distinguishes the workflow baseline commit, pinned base commit/reference, current branch and `HEAD`, worktree cleanliness, observed upstream commit, ahead/behind counts, and whether the upstream moved since workflow start. A branch behind the currently observed upstream is reported as such; it is not treated as worktree corruption or as evidence that the workflow baseline or files changed. Worktree cleanliness reflects Git status at the target path, including target-local workflow artifacts.
 
 The config shape is defined in [`orchestrator-config.schema.json`](../harness/schemas/orchestrator-config.schema.json). The CLI supplies the branch separately; the config must include a positive aggregate Claude budget and at least one validation. Review cannot be disabled, and commit/PR options are required to remain false.
 
@@ -60,6 +68,7 @@ Example config (replace the validation commands with commands discovered in the 
 ```json
 {
   "minimum_risk_band": "medium",
+  "base_ref": "origin/main",
   "max_iterations": 2,
   "stage_timeout_seconds": 3600,
   "claude_budget_usd": 2.0,

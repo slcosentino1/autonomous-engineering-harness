@@ -4,35 +4,6 @@
   "title": "Target engineering workflow state",
   "type": "object",
   "additionalProperties": false,
-  "$defs": {
-    "reviewResponseMetadata": {
-      "type": "object", "additionalProperties": false,
-      "properties": {
-        "response_field": {"const": "result"},
-        "envelope_type": {"const": "result"},
-        "subtype": {"type": "string", "maxLength": 48},
-        "is_error": {"type": "boolean"},
-        "session_id": {"type": "string", "maxLength": 160},
-        "invocation_id": {"type": "string", "maxLength": 160},
-        "request_id": {"type": "string", "maxLength": 160},
-        "model": {"type": "string", "maxLength": 128},
-        "cost_usd": {"type": "number", "minimum": 0},
-        "usage": {
-          "type": "object", "additionalProperties": false,
-          "properties": {
-            "input_tokens": {"type": "integer", "minimum": 0},
-            "output_tokens": {"type": "integer", "minimum": 0},
-            "cache_creation_input_tokens": {"type": "integer", "minimum": 0},
-            "cache_read_input_tokens": {"type": "integer", "minimum": 0},
-            "output_tokens_details": {"type": "object", "additionalProperties": false, "properties": {"thinking_tokens": {"type": "integer", "minimum": 0}}},
-            "server_tool_use": {"type": "object", "additionalProperties": false, "properties": {"web_search_requests": {"type": "integer", "minimum": 0}, "web_fetch_requests": {"type": "integer", "minimum": 0}}},
-            "cache_creation": {"type": "object", "additionalProperties": false, "properties": {"ephemeral_1h_input_tokens": {"type": "integer", "minimum": 0}, "ephemeral_5m_input_tokens": {"type": "integer", "minimum": 0}}},
-            "service_tier": {"type": "string", "maxLength": 48}
-          }
-        }
-      }
-    }
-  },
   "required": ["schema_version", "workflow_id", "target", "harness_root", "harness_git_root", "harness_git_common_dir", "harness_git_refs_dir", "harness_git_object_store_paths", "scope", "baseline", "phase", "status", "phase_records", "artifact_references", "findings_register_reference", "review_assignments", "authorized_instruction_roots", "instruction_records", "applied_capabilities", "authorizations", "pending_decisions", "updated_at"],
   "properties": {
     "schema_version": {"const": 1},
@@ -280,6 +251,7 @@
           }
         }},
         "commit_authorization_fingerprint": {"type": ["string", "null"]},
+        "git_tracking": {"$ref": "#/$defs/gitTracking"},
         "final_revision_id": {"type": "string", "pattern": "^content:[a-f0-9]{64}$"},
         "revision_manifest_reference": {"type": "string", "minLength": 1},
         "config_snapshot": {"type": "object"},
@@ -711,6 +683,72 @@
     "updated_at": {"type": "string", "format": "date-time"}
   },
   "$defs": {
+    "reviewResponseMetadata": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "response_field": {"const": "result"},
+        "envelope_type": {"const": "result"},
+        "subtype": {"type": "string", "maxLength": 48},
+        "is_error": {"type": "boolean"},
+        "session_id": {"type": "string", "maxLength": 160},
+        "invocation_id": {"type": "string", "maxLength": 160},
+        "request_id": {"type": "string", "maxLength": 160},
+        "model": {"type": "string", "maxLength": 128},
+        "cost_usd": {"type": "number", "minimum": 0},
+        "usage": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "input_tokens": {"type": "integer", "minimum": 0},
+            "output_tokens": {"type": "integer", "minimum": 0},
+            "cache_creation_input_tokens": {"type": "integer", "minimum": 0},
+            "cache_read_input_tokens": {"type": "integer", "minimum": 0},
+            "output_tokens_details": {"type": "object", "additionalProperties": false, "properties": {"thinking_tokens": {"type": "integer", "minimum": 0}}},
+            "server_tool_use": {"type": "object", "additionalProperties": false, "properties": {"web_search_requests": {"type": "integer", "minimum": 0}, "web_fetch_requests": {"type": "integer", "minimum": 0}}},
+            "cache_creation": {"type": "object", "additionalProperties": false, "properties": {"ephemeral_1h_input_tokens": {"type": "integer", "minimum": 0}, "ephemeral_5m_input_tokens": {"type": "integer", "minimum": 0}}},
+            "service_tier": {"type": "string", "maxLength": 48}
+          }
+        }
+      }
+    },
+    "gitReferenceObservation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["reference", "commit", "observed_at", "workflow_id", "operation"],
+      "properties": {
+        "reference": {"type": "string", "minLength": 1},
+        "commit": {"type": ["string", "null"], "pattern": "^[a-f0-9]{40,64}$"},
+        "observed_at": {"type": "string", "format": "date-time"},
+        "workflow_id": {"type": "string", "minLength": 1},
+        "operation": {"enum": ["workflow_initialize", "workflow_resume", "workflow_status_observation"]}
+      }
+    },
+    "gitReferenceMovement": {
+      "type": "object", "additionalProperties": false,
+      "required": ["reference", "previous_commit", "new_commit", "observed_at", "workflow_id", "operation"],
+      "properties": {
+        "reference": {"type": "string", "minLength": 1},
+        "previous_commit": {"type": ["string", "null"], "pattern": "^[a-f0-9]{40,64}$"},
+        "new_commit": {"type": ["string", "null"], "pattern": "^[a-f0-9]{40,64}$"},
+        "observed_at": {"type": "string", "format": "date-time"},
+        "workflow_id": {"type": "string", "minLength": 1},
+        "operation": {"enum": ["workflow_initialize", "workflow_resume", "workflow_status_observation"]}
+      }
+    },
+    "gitTracking": {
+      "type": "object", "additionalProperties": false,
+      "required": ["base_ref_at_start", "base_commit", "workflow_branch", "target_worktree", "upstream_ref_at_start", "current_upstream_ref", "upstream_commit_at_start", "observations", "reference_movements"],
+      "properties": {
+        "base_ref_at_start": {"type": "string", "minLength": 1},
+        "base_commit": {"type": "string", "pattern": "^[a-f0-9]{40,64}$"},
+        "workflow_branch": {"type": ["string", "null"]},
+        "target_worktree": {"type": "string", "minLength": 1},
+        "upstream_ref_at_start": {"type": ["string", "null"]},
+        "current_upstream_ref": {"type": ["string", "null"]},
+        "upstream_commit_at_start": {"type": ["string", "null"], "pattern": "^[a-f0-9]{40,64}$"},
+        "observations": {"type": "array", "items": {"$ref": "#/$defs/gitReferenceObservation"}},
+        "reference_movements": {"type": "array", "items": {"$ref": "#/$defs/gitReferenceMovement"}},
+        "migration": {"type": "string", "maxLength": 500}
+      }
+    },
     "skillTraceEntry": {
       "type": "object", "additionalProperties": false,
       "required": ["name", "skill_md_path"],

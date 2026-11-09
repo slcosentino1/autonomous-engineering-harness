@@ -74,6 +74,18 @@ def plan(*, increments=None, risk="medium"):
     }
 
 
+def git_fixture(root: Path, branch="feature/task") -> tuple[Path, str]:
+    root.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", "-b", branch, str(root)], check=True)
+    subprocess.run(["git", "-C", str(root), "config", "user.name", "Harness Test"], check=True)
+    subprocess.run(["git", "-C", str(root), "config", "user.email", "harness-test@example.invalid"], check=True)
+    (root / "README.md").write_text("baseline\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "-q", "-m", "baseline"], check=True)
+    head = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+    return root, head
+
+
 class OrchestratorTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="orchestrator-tests-")
@@ -391,8 +403,9 @@ class OrchestratorTests(unittest.TestCase):
         self.runner.config["code_file_extensions"] = [".cs"]
         self.runner.state = {"orchestration": {"preexisting_hashes": []}}
         increment = {"code_paths": ["src"], "artifact_paths": []}
-        with self.assertRaisesRegex(orchestrator.OrchestratorError, "extension is not authorized"):
-            self.runner._apply_changes([{"path": "src/README.md", "content": "no\n"}], increment)
+        with patch.object(self.runner, "_assert_active_worktree"):
+            with self.assertRaisesRegex(orchestrator.OrchestratorError, "extension is not authorized"):
+                self.runner._apply_changes([{"path": "src/README.md", "content": "no\n"}], increment)
         self.assertFalse((self.target / "README.md").exists())
 
     def test_stage_response_rejects_unknown_fields_and_bad_correction_decisions(self):
@@ -417,15 +430,17 @@ class OrchestratorTests(unittest.TestCase):
         existing.write_text("keep this\n", encoding="utf-8")
         self.runner.state = {"orchestration": {"preexisting_hashes": [{"path": "src/user.txt"}]}}
         increment = {"code_paths": ["src"], "artifact_paths": []}
-        with self.assertRaisesRegex(orchestrator.OrchestratorError, "pre-existing user change"):
-            self.runner._apply_changes([{"path": "src/user.txt", "content": "replace\n"}], increment)
+        with patch.object(self.runner, "_assert_active_worktree"):
+            with self.assertRaisesRegex(orchestrator.OrchestratorError, "pre-existing user change"):
+                self.runner._apply_changes([{"path": "src/user.txt", "content": "replace\n"}], increment)
         self.assertEqual(existing.read_text(encoding="utf-8"), "keep this\n")
 
     def test_new_parent_directory_must_be_inside_an_explicit_write_scope(self):
         self.runner.state = {"orchestration": {"preexisting_hashes": []}}
         increment = {"code_paths": ["src/new/file.cs"], "artifact_paths": []}
-        with self.assertRaisesRegex(orchestrator.OrchestratorError, "planned write scope"):
-            self.runner._apply_changes([{"path": "src/new/file.cs", "content": "class C {}\n"}], increment)
+        with patch.object(self.runner, "_assert_active_worktree"):
+            with self.assertRaisesRegex(orchestrator.OrchestratorError, "planned write scope"):
+                self.runner._apply_changes([{"path": "src/new/file.cs", "content": "class C {}\n"}], increment)
         self.assertFalse((self.target / "src" / "new").exists())
 
     def test_workflow_store_safely_creates_nested_report_directories(self):
@@ -456,6 +471,11 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(runner.store.read_json(preflight_reference)["overall_result"], "READY")
         self.assertEqual(runner.state["baseline"]["commit"],
                          subprocess.check_output(["git", "-C", str(target), "rev-parse", "HEAD"], text=True).strip())
+        self.assertEqual(runner.state["orchestration"]["git_tracking"]["base_ref_at_start"], "HEAD")
+        self.assertEqual(runner.state["orchestration"]["git_tracking"]["base_commit"],
+                         runner.state["baseline"]["commit"])
+        self.assertEqual(runner.state["orchestration"]["git_tracking"]["workflow_branch"], "feature/task")
+        self.assertEqual(runner.state["orchestration"]["git_tracking"]["target_worktree"], str(target.resolve()))
         changed_config = config(branch="feature/task", claude_budget_usd=1.0)
         resumed = orchestrator.Orchestrator(str(target), "Add the requested backend behavior.",
             changed_config, "flow-initialize")
@@ -465,6 +485,136 @@ class OrchestratorTests(unittest.TestCase):
             config(branch="feature/task"), "flow-initialize")
         with self.assertRaisesRegex(orchestrator.OrchestratorError, "different task text"):
             changed_task.initialize()
+
+    def test_remote_ref_movement_is_recorded_without_replacing_workflow_baseline(self):
+        target, base = git_fixture(Path(self.temp.name) / "git-target-ref-movement")
+        subprocess.run(["git", "-C", str(target), "update-ref", "refs/remotes/origin/main", base], check=True)
+        subprocess.run(["git", "-C", str(target), "config", "remote.origin.fetch",
+                        "+refs/heads/*:refs/remotes/origin/*"], check=True)
+        subprocess.run(["git", "-C", str(target), "config", "branch.feature/task.remote", "origin"], check=True)
+        subprocess.run(["git", "-C", str(target), "config", "branch.feature/task.merge", "refs/heads/main"], check=True)
+        (target / "feature.txt").write_text("feature\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(target), "add", "feature.txt"], check=True)
+        subprocess.run(["git", "-C", str(target), "commit", "-q", "-m", "feature change"], check=True)
+        feature_head = subprocess.check_output(["git", "-C", str(target), "rev-parse", "HEAD"], text=True).strip()
+        runner = orchestrator.Orchestrator(str(target), "Add a feature", config(base_ref="origin/main"),
+                                           "flow-ref-movement")
+        runner.initialize()
+        tracking = runner.state["orchestration"]["git_tracking"]
+        self.assertEqual(tracking["base_ref_at_start"], "origin/main")
+        self.assertEqual(tracking["base_commit"], base)
+        self.assertEqual(runner.state["baseline"]["commit"], feature_head)
+
+        tree = subprocess.check_output(["git", "-C", str(target), "write-tree"], text=True).strip()
+        upstream = subprocess.check_output([
+            "git", "-C", str(target), "commit-tree", tree, "-p", feature_head,
+        ], input="upstream-only commit\n", text=True).strip()
+        subprocess.run(["git", "-C", str(target), "update-ref", "refs/remotes/origin/main", upstream], check=True)
+
+        resumed = orchestrator.Orchestrator(str(target), "Add a feature", config(base_ref="origin/main"),
+                                            "flow-ref-movement")
+        resumed.initialize()
+        tracking = resumed.state["orchestration"]["git_tracking"]
+        self.assertEqual(tracking["base_commit"], base)
+        self.assertEqual(resumed.state["baseline"]["commit"], feature_head)
+        self.assertEqual(len(tracking["reference_movements"]), 1)
+        movement = tracking["reference_movements"][0]
+        self.assertEqual((movement["reference"], movement["previous_commit"], movement["new_commit"],
+                          movement["workflow_id"], movement["operation"]),
+                         ("origin/main", base, upstream, "flow-ref-movement", "workflow_resume"))
+        self.assertEqual(subprocess.check_output(["git", "-C", str(target), "rev-parse", "HEAD"], text=True).strip(),
+                         feature_head)
+        status = resumed._result()["git_state"]
+        self.assertEqual(status["workflow_baseline_commit"], feature_head)
+        self.assertEqual(status["base_commit"], base)
+        self.assertEqual(status["workflow_branch"], "feature/task")
+        self.assertEqual(status["target_worktree"], str(target.resolve()))
+        self.assertEqual(status["head"], feature_head)
+        self.assertIsInstance(status["worktree_clean"], bool)
+        self.assertEqual(status["observed_upstream_commit"], upstream)
+        self.assertEqual(status["behind_observed_upstream"], 1)
+        self.assertTrue(status["upstream_moved_since_workflow_start"])
+        self.assertTrue(status["base_reference_moved_since_workflow_start"])
+        self.assertIn("does not change", status["interpretation"])
+
+    def test_workflow_base_ref_cannot_be_replaced_during_requirement_update(self):
+        target, base = git_fixture(Path(self.temp.name) / "git-target-immutable-base-ref")
+        subprocess.run(["git", "-C", str(target), "update-ref", "refs/remotes/origin/main", base], check=True)
+        original = orchestrator.Orchestrator(str(target), "Add a feature", config(base_ref="origin/main"),
+                                             "flow-immutable-base-ref")
+        original.initialize()
+        changed = orchestrator.Orchestrator(str(target), "Add a changed feature",
+            config(base_ref="origin/other"), "flow-immutable-base-ref",
+            update_requirements_reason="The task requirements changed.")
+        with self.assertRaisesRegex(orchestrator.OrchestratorError, "base_ref configuration is immutable"):
+            changed.initialize()
+
+    def test_branch_checked_out_in_another_worktree_is_rejected_without_reuse(self):
+        target, _ = git_fixture(Path(self.temp.name) / "git-target-duplicate-branch")
+        other = Path(self.temp.name) / "other-worktree"
+        subprocess.run(["git", "-C", str(target), "worktree", "add", "--force", str(other), "feature/task"],
+                       check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        runner = orchestrator.Orchestrator(str(target), "Add a feature", config(), "flow-duplicate-branch")
+        with self.assertRaisesRegex(orchestrator.OrchestratorError, "only in the explicitly selected target worktree"):
+            runner.initialize()
+        self.assertTrue((other / ".git").is_file())
+        self.assertFalse((target / runner.store.directory).exists())
+
+    def test_active_worktree_is_rechecked_before_scoped_operations(self):
+        target, _ = git_fixture(Path(self.temp.name) / "git-target-active-worktree-guard")
+        runner = orchestrator.Orchestrator(str(target), "Add a feature", config(), "flow-active-worktree-guard")
+        runner.initialize()
+        other = Path(self.temp.name) / "other-worktree-active-guard"
+        subprocess.run(["git", "-C", str(target), "worktree", "add", "--force", str(other), "feature/task"],
+                       check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        with self.assertRaisesRegex(orchestrator.OrchestratorError, "only in the explicitly selected target worktree"):
+            runner._assert_active_worktree()
+        self.assertTrue((other / ".git").is_file())
+
+    def test_initialize_does_not_create_or_clean_up_worktrees_or_move_branch(self):
+        target, base = git_fixture(Path(self.temp.name) / "git-target-worktree-stability")
+        other = Path(self.temp.name) / "other-worktree"
+        subprocess.run(["git", "-C", str(target), "worktree", "add", "-b", "other-task",
+                        str(other), base], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        before = subprocess.check_output(["git", "-C", str(target), "worktree", "list", "--porcelain", "-z"])
+        before_head = subprocess.check_output(["git", "-C", str(target), "rev-parse", "HEAD"], text=True).strip()
+        before_branch = subprocess.check_output(["git", "-C", str(target), "branch", "--show-current"], text=True).strip()
+        runner = orchestrator.Orchestrator(str(target), "Add a feature", config(), "flow-worktree-stability")
+        runner.initialize()
+        runner._result()
+        after = subprocess.check_output(["git", "-C", str(target), "worktree", "list", "--porcelain", "-z"])
+        self.assertEqual(after, before)
+        self.assertTrue((other / ".git").is_file())
+        self.assertEqual(subprocess.check_output(["git", "-C", str(target), "rev-parse", "HEAD"], text=True).strip(),
+                         before_head)
+        self.assertEqual(subprocess.check_output(["git", "-C", str(target), "branch", "--show-current"], text=True).strip(),
+                         before_branch)
+
+    def test_explicit_commit_base_ref_records_exact_commit_without_checkout_mutation(self):
+        target, base = git_fixture(Path(self.temp.name) / "git-target-explicit-commit-base")
+        before_head = subprocess.check_output(["git", "-C", str(target), "rev-parse", "HEAD"], text=True).strip()
+        runner = orchestrator.Orchestrator(str(target), "Add a feature", config(base_ref=base),
+                                           "flow-explicit-commit-base")
+        runner.initialize()
+        tracking = runner.state["orchestration"]["git_tracking"]
+        self.assertEqual(tracking["base_ref_at_start"], base)
+        self.assertEqual(tracking["base_commit"], base)
+        self.assertEqual(subprocess.check_output(["git", "-C", str(target), "rev-parse", "HEAD"], text=True).strip(),
+                         before_head)
+
+    def test_legacy_workflow_migrates_from_recorded_head_without_guessing_old_base_ref(self):
+        target, base = git_fixture(Path(self.temp.name) / "git-target-legacy-state")
+        runner = orchestrator.Orchestrator(str(target), "Add a feature", config(), "flow-legacy-git-state")
+        runner.initialize()
+        runner.state["orchestration"].pop("git_tracking")
+        runner.store.save(runner.state)
+        resumed = orchestrator.Orchestrator(str(target), "Add a feature", config(), "flow-legacy-git-state")
+        resumed.initialize()
+        tracking = resumed.state["orchestration"]["git_tracking"]
+        self.assertEqual(tracking["base_ref_at_start"], "legacy:HEAD")
+        self.assertEqual(tracking["base_commit"], base)
+        self.assertIn("original base reference was not recorded", tracking["migration"])
+        self.assertIsNone(resumed._result()["git_state"]["upstream_moved_since_workflow_start"])
 
     def test_explicit_requirement_update_preserves_history_and_invalidates_dependent_records(self):
         target = Path(self.temp.name) / "git-target-requirement-update"
@@ -675,7 +825,8 @@ class OrchestratorTests(unittest.TestCase):
                 "increments": [{"increment_id": "inc-1", "status": "implemented"}]},
         }
         revision_id, _, _ = self.runner._revision_manifest(increment)
-        with patch("safe_writer._run_preflight", return_value={"overall_result": "READY", "target_path": str(self.target.resolve())}):
+        with patch("safe_writer._run_preflight", return_value={"overall_result": "READY", "target_path": str(self.target.resolve())}), \
+             patch.object(self.runner, "_assert_active_worktree"):
             self.runner._validate(plan(), increment, revision_id)
         result = self.runner.state["orchestration"]["validation_results"][0]
         self.assertEqual(result["exit_code"], 0)
@@ -728,6 +879,7 @@ class OrchestratorTests(unittest.TestCase):
              patch("orchestrator.claude._changed_path_names", return_value=["src/feature.txt"]), \
              patch("orchestrator.claude._authorized_review_paths",
                    return_value=["src/feature.txt", evidence_reference, manifest_reference]), \
+             patch.object(self.runner, "_assert_active_worktree"), \
              patch("orchestrator.claude.run_claude_review", side_effect=adapter) as invoke:
             missing = self.runner._review_increment(plan(), {**increment, "artifact_paths": [store.directory]}, revision_id)
             self.assertIsNone(missing)

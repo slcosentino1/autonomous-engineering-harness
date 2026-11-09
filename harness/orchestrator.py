@@ -368,6 +368,172 @@ def _git(target: Path, *args: str, check: bool = True) -> bytes:
     return result.stdout if result.returncode == 0 else b""
 
 
+def _resolve_commit(target: Path, reference: str, *, required: bool = True) -> str | None:
+    if not isinstance(reference, str) or not reference or reference.startswith("-") or any(
+            char.isspace() or ord(char) < 32 for char in reference):
+        raise OrchestratorError("Git reference must be a non-empty, unambiguous reference name")
+    output = _git(target, "rev-parse", "--verify", "--end-of-options",
+                  f"{reference}^{{commit}}", check=False).decode("ascii", "ignore").strip()
+    if not output:
+        if required:
+            raise OrchestratorError(f"Git reference cannot be resolved to a commit: {reference}")
+        return None
+    if not re.fullmatch(r"[a-f0-9]{40,64}", output):
+        raise OrchestratorError("Git returned an invalid commit identity")
+    return output
+
+
+def _branch_upstream(target: Path, branch: str) -> str | None:
+    if not branch:
+        return None
+    output = _git(target, "rev-parse", "--abbrev-ref", "--symbolic-full-name",
+                  f"{branch}@{{upstream}}", check=False).decode("utf-8", "strict").strip()
+    if output and output != f"{branch}@{{upstream}}":
+        return output
+    remote = _git(target, "config", "--get", f"branch.{branch}.remote", check=False).decode("utf-8", "strict").strip()
+    merge = _git(target, "config", "--get", f"branch.{branch}.merge", check=False).decode("utf-8", "strict").strip()
+    if not remote or not merge:
+        return None
+    if remote == ".":
+        return merge
+    fetchspecs = _git(target, "config", "--get-all", f"remote.{remote}.fetch",
+                      check=False).decode("utf-8", "strict").splitlines()
+    for raw_spec in fetchspecs:
+        spec = raw_spec.lstrip("+")
+        if spec.startswith("^") or ":" not in spec:
+            continue
+        source, destination = spec.split(":", 1)
+        if "*" in source:
+            prefix, suffix = source.split("*", 1)
+            if not merge.startswith(prefix) or not merge.endswith(suffix):
+                continue
+            middle_end = len(merge) - len(suffix) if suffix else len(merge)
+            wildcard_value = merge[len(prefix):middle_end]
+            if not wildcard_value:
+                continue
+            mapped = destination.replace("*", wildcard_value)
+        elif source == merge:
+            mapped = destination
+        else:
+            continue
+        if mapped.startswith("refs/remotes/"):
+            return mapped.removeprefix("refs/remotes/")
+        return mapped
+    return None
+
+
+def _worktree_records(target: Path) -> list[dict[str, str]]:
+    raw = _git(target, "worktree", "list", "--porcelain", "-z")
+    records: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    for field in raw.decode("utf-8", "surrogateescape").split("\0"):
+        if not field:
+            if current:
+                records.append(current)
+                current = {}
+            continue
+        key, separator, value = field.partition(" ")
+        if not separator:
+            current[key] = ""
+        else:
+            current[key] = value
+    if current:
+        records.append(current)
+    return records
+
+
+def _assert_worktree_owns_branch(target: Path, branch: str) -> None:
+    expected = str(target.resolve(strict=True))
+    owners = []
+    for record in _worktree_records(target):
+        if record.get("branch") != f"refs/heads/{branch}":
+            continue
+        path = record.get("worktree")
+        if not path:
+            raise OrchestratorError("Git reported a branch owner without a worktree path")
+        actual = str(Path(path).resolve(strict=False))
+        owners.append(actual)
+    if len(owners) != 1 or owners[0] != expected:
+        raise OrchestratorError(
+            "Workflow branch must be checked out only in the explicitly selected target worktree"
+        )
+
+
+def _new_git_tracking(target: Path, branch: str,
+                      requested_base_ref: str | None, workflow_id: str) -> dict[str, Any]:
+    upstream_ref = _branch_upstream(target, branch)
+    upstream_commit = _resolve_commit(target, upstream_ref, required=False) if upstream_ref else None
+    base_ref = requested_base_ref or (upstream_ref if upstream_commit else "HEAD")
+    base_commit = _resolve_commit(target, base_ref)
+    now = _now()
+    tracking: dict[str, Any] = {
+        "base_ref_at_start": base_ref,
+        "base_commit": base_commit,
+        "workflow_branch": branch or None,
+        "target_worktree": str(target.resolve(strict=True)),
+        "upstream_ref_at_start": upstream_ref,
+        "current_upstream_ref": upstream_ref,
+        "upstream_commit_at_start": upstream_commit,
+        "observations": [],
+        "reference_movements": [],
+    }
+    for reference in dict.fromkeys(ref for ref in (base_ref, upstream_ref) if ref and ref != "HEAD"):
+        commit = _resolve_commit(target, reference, required=False)
+        tracking["observations"].append({
+            "reference": reference, "commit": commit, "observed_at": now,
+            "workflow_id": workflow_id, "operation": "workflow_initialize",
+        })
+    return tracking
+
+
+def _legacy_git_tracking(target: Path, state: dict[str, Any], branch: str) -> dict[str, Any]:
+    baseline = state.get("baseline")
+    if not isinstance(baseline, dict) or not isinstance(baseline.get("commit"), str):
+        raise OrchestratorError("Cannot migrate legacy workflow without its recorded baseline commit")
+    current_upstream_ref = _branch_upstream(target, branch)
+    tracking = {
+        "base_ref_at_start": "legacy:HEAD",
+        "base_commit": baseline["commit"],
+        "workflow_branch": branch or None,
+        "target_worktree": str(target.resolve(strict=True)),
+        "upstream_ref_at_start": None,
+        "current_upstream_ref": current_upstream_ref,
+        "upstream_commit_at_start": None,
+        "observations": [],
+        "reference_movements": [],
+        "migration": "legacy workflow pinned to its recorded HEAD; original base reference was not recorded",
+    }
+    return tracking
+
+
+def _observe_git_references(target: Path, tracking: dict[str, Any],
+                            workflow_id: str, operation: str) -> bool:
+    observations = tracking.get("observations")
+    movements = tracking.get("reference_movements")
+    if not isinstance(observations, list) or not isinstance(movements, list):
+        raise OrchestratorError("Workflow Git reference history is malformed")
+    refs = list(dict.fromkeys(ref for ref in
+        (tracking.get("base_ref_at_start"), tracking.get("current_upstream_ref"))
+        if isinstance(ref, str) and ref not in {"HEAD", "legacy:HEAD"} and
+        not re.fullmatch(r"[a-f0-9]{40,64}", ref)))
+    changed = False
+    for reference in refs:
+        current = _resolve_commit(target, reference, required=False)
+        prior_rows = [row for row in observations if isinstance(row, dict) and row.get("reference") == reference]
+        previous = prior_rows[-1].get("commit") if prior_rows else None
+        if prior_rows and previous == current:
+            continue
+        now = _now()
+        if prior_rows and previous != current:
+            movements.append({"reference": reference, "previous_commit": previous,
+                "new_commit": current, "observed_at": now, "workflow_id": workflow_id,
+                "operation": operation})
+        observations.append({"reference": reference, "commit": current, "observed_at": now,
+            "workflow_id": workflow_id, "operation": operation})
+        changed = True
+    return changed
+
+
 def _status(target: Path) -> dict[str, dict[str, Any]]:
     raw = _git(target, "status", "--porcelain=v1", "-z", "--untracked-files=all")
     rows, result, i = raw.split(b"\0"), {}, 0
@@ -692,13 +858,18 @@ def _validate_claude_authorization(value: Any) -> dict[str, Any]:
 def validate_config(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise OrchestratorError("Configuration must be a JSON object")
-    allowed = {"branch", "minimum_risk_band", "max_iterations", "stage_timeout_seconds",
+    allowed = {"branch", "base_ref", "minimum_risk_band", "max_iterations", "stage_timeout_seconds",
                "claude_budget_usd", "validations", "review", "commit", "create_pr",
                "authorized_code_paths", "authorized_artifact_paths", "code_file_extensions"}
     if set(value) - allowed:
         raise OrchestratorError(f"Unsupported configuration keys: {sorted(set(value) - allowed)}")
     if not isinstance(value.get("branch"), str) or not value["branch"]:
         raise OrchestratorError("An exact existing target branch is required")
+    base_ref = value.get("base_ref")
+    if base_ref is not None and (not isinstance(base_ref, str) or not base_ref or
+            base_ref.startswith("-") or any(char.isspace() or ord(char) < 32 for char in base_ref) or
+            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", base_ref)):
+        raise OrchestratorError("base_ref must be an unambiguous Git ref name such as origin/main")
     authorized_code_paths = value.get("authorized_code_paths")
     authorized_artifact_paths = value.get("authorized_artifact_paths")
     if not isinstance(authorized_code_paths, list) or not authorized_code_paths:
@@ -1032,6 +1203,13 @@ class Orchestrator:
         branch = _git(self.target, "branch", "--show-current").decode().strip()
         if branch != self.config["branch"]:
             raise OrchestratorError(f"Expected branch {self.config['branch']}; found {branch}")
+        _assert_worktree_owns_branch(self.target, branch)
+        requested_base_ref = self.config.get("base_ref")
+        if requested_base_ref:
+            checked_ref = _git(self.target, "check-ref-format", "--branch", requested_base_ref,
+                               check=False).decode("utf-8", "strict").strip()
+            if checked_ref != requested_base_ref:
+                raise OrchestratorError("base_ref is not a valid branch-style Git reference")
         self.preflight = Preflight(str(self.target), str(HARNESS_ROOT), None, None)
         report = self.preflight.run()
         if report["overall_result"] != "READY":
@@ -1052,6 +1230,24 @@ class Orchestrator:
                 raise OrchestratorError("Existing workflow state has no valid orchestration record")
             if orchestration.get("branch") != branch:
                 raise OrchestratorError("Existing workflow state belongs to another branch")
+            git_tracking = orchestration.get("git_tracking")
+            if git_tracking is None:
+                git_tracking = _legacy_git_tracking(self.target, existing, branch)
+                orchestration["git_tracking"] = git_tracking
+            if (not isinstance(git_tracking, dict) or
+                    git_tracking.get("workflow_branch") != branch or
+                    git_tracking.get("target_worktree") != str(self.target)):
+                raise OrchestratorError("Existing workflow is bound to another branch or target worktree")
+            config_snapshot = orchestration.get("config_snapshot")
+            if (isinstance(config_snapshot, dict) and
+                    config_snapshot.get("base_ref") != self.config.get("base_ref")):
+                raise OrchestratorError("The workflow base_ref configuration is immutable; start a new workflow to change it")
+            if _branch_upstream(self.target, branch) != git_tracking.get("current_upstream_ref"):
+                raise OrchestratorError("Workflow branch upstream configuration changed; refusing to reinterpret its Git baseline")
+            if requested_base_ref and git_tracking.get("base_ref_at_start") != requested_base_ref:
+                raise OrchestratorError("The workflow base reference is immutable; start a new workflow to change it")
+            _observe_git_references(self.target, git_tracking, self.workflow_id, "workflow_resume")
+            self.store.save(existing)
             if existing.get("baseline", {}).get("commit") != report["repository_state"].get("head"):
                 raise OrchestratorError("Target HEAD changed since workflow initialization; resume on the original baseline")
             preexisting_hashes = orchestration.get("preexisting_hashes")
@@ -1108,6 +1304,7 @@ class Orchestrator:
         repo = self.preflight.git_repos["target"]
         harness = self.preflight.git_repos["harness"]
         head = report["repository_state"]["head"]
+        git_tracking = _new_git_tracking(self.target, branch, requested_base_ref, self.workflow_id)
         preexisting = []
         for path, row in sorted(current.items()):
             preexisting.append({"path": path, "index_state": row["index_state"],
@@ -1149,6 +1346,7 @@ class Orchestrator:
             "orchestration": {"version": 1, "task_sha256": _sha(self.task.encode()),
                 "config_sha256": _sha(_json_bytes(self.config)),
                 "branch": branch, "current_stage": "PLANNING", "max_iterations": self.config["max_iterations"],
+                "git_tracking": git_tracking,
                 "iteration": 0, "current_increment_id": None, "plan_reference": None, "increments": [],
                 "attempts": [], "validation_results": [], "review_results": [], "correction_status": [],
                 "current_requirement_version": 1,
@@ -1471,6 +1669,21 @@ class Orchestrator:
         self.state["phase"] = phase
         self.state["status"] = "ACTIVE"
         self._save()
+
+    def _assert_active_worktree(self) -> None:
+        assert self.state is not None
+        tracking = self.state.get("orchestration", {}).get("git_tracking")
+        if not isinstance(tracking, dict):
+            raise OrchestratorError("Workflow Git tracking is unavailable; refusing a scoped operation")
+        root = Path(_git(self.target, "rev-parse", "--show-toplevel").decode().strip()).resolve(strict=True)
+        branch = _git(self.target, "branch", "--show-current").decode("utf-8", "strict").strip()
+        head = _resolve_commit(self.target, "HEAD")
+        if (root != self.target or str(root) != tracking.get("target_worktree") or
+                branch != tracking.get("workflow_branch") or branch != self.config["branch"]):
+            raise OrchestratorError("Workflow target worktree or branch identity changed during execution")
+        if head != self.state.get("baseline", {}).get("commit"):
+            raise OrchestratorError("Workflow branch HEAD changed during execution; no automatic branch update is permitted")
+        _assert_worktree_owns_branch(self.target, branch)
 
     def _changed_validation_revision(self, blocker: dict[str, Any]) -> tuple[str, str] | None:
         """Permit one resume after a failed validation only when its scoped revision changed."""
@@ -2183,6 +2396,7 @@ class Orchestrator:
         return revision_id
 
     def _apply_changes(self, changes: Any, increment: dict[str, Any]) -> None:
+        self._assert_active_worktree()
         if not isinstance(changes, list):
             raise OrchestratorError("Codex implementation result must contain a changes array")
         allowed = increment["code_paths"] + increment["artifact_paths"]
@@ -2238,6 +2452,7 @@ class Orchestrator:
                     create_file(self.target, cfg, path, content)
 
     def _validate(self, plan: dict[str, Any], increment: dict[str, Any], revision_id: str) -> None:
+        self._assert_active_worktree()
         self._set_stage("VALIDATION", "TESTING")
         validations = {item["id"]: item for item in self.config["validations"]}
         for validation_id in increment["validation_ids"]:
@@ -2438,6 +2653,7 @@ class Orchestrator:
                           *, cycle: dict[str, Any] | None = None,
                           previous_findings: list[dict[str, Any]] | None = None,
                           prior_decisions: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
+        self._assert_active_worktree()
         if not self.aily:
             self.aily = claude.AILY_EXECUTABLE
         scope_paths = increment["revision_paths"]
@@ -2801,10 +3017,67 @@ class Orchestrator:
         return self._review_increment(plan, increment, current_manifest_id, cycle=cycle,
             previous_findings=report["findings"], prior_decisions=decision_rows)
 
+    def _git_status_report(self) -> dict[str, Any]:
+        assert self.state is not None
+        orchestration = self.state.get("orchestration", {})
+        tracking = orchestration.get("git_tracking") if isinstance(orchestration, dict) else None
+        if not isinstance(tracking, dict):
+            return {"available": False, "reason": "Git baseline tracking is unavailable in this legacy state."}
+        if _observe_git_references(self.target, tracking, self.workflow_id, "workflow_status_observation"):
+            self._save()
+        head = _resolve_commit(self.target, "HEAD")
+        branch = _git(self.target, "branch", "--show-current").decode("utf-8", "strict").strip() or None
+        upstream_ref = tracking.get("current_upstream_ref")
+        observations = tracking.get("observations", [])
+        latest = next((row for row in reversed(observations)
+                       if isinstance(row, dict) and row.get("reference") == upstream_ref), None)
+        upstream_commit = latest.get("commit") if latest else None
+        ahead = behind = None
+        if isinstance(upstream_commit, str):
+            counts = _git(self.target, "rev-list", "--left-right", "--count",
+                          f"{head}...{upstream_commit}", check=False).decode("ascii", "ignore").split()
+            if len(counts) == 2 and all(item.isdigit() for item in counts):
+                ahead, behind = int(counts[0]), int(counts[1])
+        base_ref = tracking.get("base_ref_at_start")
+        base_rows = [row for row in observations if isinstance(row, dict) and row.get("reference") == base_ref]
+        observed_base = base_rows[-1].get("commit") if base_rows else tracking.get("base_commit")
+        initial_upstream = tracking.get("upstream_commit_at_start")
+        upstream_moved = ((upstream_commit != initial_upstream)
+                          if upstream_ref and not tracking.get("migration") else None)
+        base_moved = (observed_base != tracking.get("base_commit")) if base_ref not in {"HEAD", "legacy:HEAD"} else False
+        cleanliness = not _status(self.target)
+        note = None
+        if isinstance(behind, int) and behind > 0:
+            note = ("The branch is behind the observed upstream; this does not change the pinned workflow baseline "
+                    "or indicate that the workflow worktree was updated.")
+        return {
+            "available": True,
+            "workflow_baseline_commit": self.state.get("baseline", {}).get("commit"),
+            "base_ref_at_start": base_ref,
+            "base_commit": tracking.get("base_commit"),
+            "workflow_branch": branch,
+            "head": head,
+            "target_worktree": tracking.get("target_worktree"),
+            "worktree_clean": cleanliness,
+            "observed_upstream_ref": upstream_ref,
+            "observed_upstream_commit": upstream_commit,
+            "ahead_of_observed_upstream": ahead,
+            "behind_observed_upstream": behind,
+            "upstream_moved_since_workflow_start": upstream_moved,
+            "base_reference_moved_since_workflow_start": base_moved,
+            "reference_movement_count": len(tracking.get("reference_movements", [])),
+            "interpretation": note,
+        }
+
     def _result(self) -> dict[str, Any]:
-        return {"status": self.state["status"], "workflow_id": self.workflow_id,
-                "stage": self.state["orchestration"]["current_stage"],
-                "phase": self.state["phase"], "state_path": self.store.state_path}
+        result = {"status": self.state["status"], "workflow_id": self.workflow_id,
+                  "stage": self.state["orchestration"]["current_stage"],
+                  "phase": self.state["phase"], "state_path": self.store.state_path}
+        try:
+            result["git_state"] = self._git_status_report()
+        except (OSError, OrchestratorError, ValueError) as exc:
+            result["git_state"] = {"available": False, "reason": _redact(str(exc))}
+        return result
 
 
 def main(argv: list[str] | None = None) -> int:
