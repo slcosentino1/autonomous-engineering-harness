@@ -123,6 +123,190 @@ class OrchestratorTests(unittest.TestCase):
         runner.initialize()
         return target, runner
 
+    def plan_review_workflow(self, name):
+        target = Path(self.temp.name) / name
+        git_fixture(target)
+        (target / "src").mkdir()
+        workflow_id = f"flow-{name}"
+        authorization = persistent_claude_authorization(target,
+            permitted_paths=["src", f".engineering/workflows/{workflow_id}"])
+        runner = orchestrator.Orchestrator(str(target), "Add a feature",
+            config(review={"enabled": True, "authorization": authorization}), workflow_id,
+            process_runner=lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, b"ok", b""))
+        with patch("safe_writer._run_preflight", return_value={
+                "overall_result": "READY", "target_path": str(target.resolve())}):
+            runner.initialize()
+        return target, runner
+
+    @staticmethod
+    def successful_plan_review(request, report=None):
+        now = orchestrator._now()
+        report = report or {"decision": "APPROVED", "summary": "The complete proposal covers the assignment.", "findings": []}
+        process = {"invocation_attempted_at": now, "review_manifest_sha256": "a" * 64,
+            "scope_fingerprint_sha256": "b" * 64, "exit_code": 0, "duration_ms": 1,
+            "review_cycle_id": request["review_cycle"]["cycle_id"],
+            "review_round": request["review_cycle"]["rounds"][-1]["round_number"],
+            "review_id": request["review_id"], "assignment_reference": request["assignment_reference"],
+            "reviewer_role": request["reviewer_role"], "started_at": now, "finished_at": now,
+            "invocation_method": "aily claude", "executable": "/fake/aily",
+            "stdout_sha256": "c" * 64, "stderr_sha256": "d" * 64, "prompt_sha256": "e" * 64,
+            "authorization_scope_sha256": "f" * 64,
+            "authorization_verification_reference": "test-authorization-source",
+            "snapshot_sha256": "1" * 64,
+            "snapshot_file_paths": request["scope_paths"],
+            "reviewer_contract_reference": request["reviewer_contract_reference"],
+            "reviewer_contract_sha256": "2" * 64,
+            "report_sha256": orchestrator.claude._sha256(orchestrator.claude._canonical_json(report)),
+            "response_metadata": {"cost_usd": 0.0, "session_id": "claude-session"},
+            "cost_usd": 0.0, "model": "claude-test", "usage": {"input_tokens": 10},
+            "reviewer_identity": "Claude", "reviewer_identity_assurance": "declared",
+            "reviewer_session_identity": "claude-session"}
+        return {"status": "APPROVED", "failure_kind": None, "error": None,
+            "envelope_valid": True, "report_valid": True, "report_received": True,
+            "report": report, "process": process}
+
+    def test_two_plan_reviews_and_explicit_approval_precede_any_increment(self):
+        target, runner = self.plan_review_workflow("plan-review-approval")
+        current_plan = plan()
+        runner.initialize = lambda: None
+        runner._planning = lambda _runtime: current_plan
+        implemented = []
+        runner._increment = lambda _plan, item, _runtime: implemented.append(item["increment_id"])
+        runner._finalize_revision = lambda _plan: "content:" + "c" * 64
+        runner._review_and_gate = lambda _plan: None
+        calls = []
+
+        def review(request, **_kwargs):
+            calls.append(request["review_cycle"]["rounds"][-1]["round_number"])
+            return self.successful_plan_review(request)
+
+        ready = {"overall_result": "READY", "target_path": str(target.resolve())}
+        with patch("safe_writer._run_preflight", return_value=ready), \
+             patch("orchestrator.claude.run_claude_review", side_effect=review), \
+             patch("orchestrator._runtime_bundle_files", return_value={}), \
+             patch("orchestrator._runtime_bundle_unchanged", return_value=True):
+            pending = runner.run()
+        self.assertEqual(calls, [1, 2])
+        self.assertEqual(implemented, [])
+        self.assertEqual(pending["status"], "WAITING_FOR_HUMAN")
+        self.assertIn("plan_approval", pending)
+        self.assertIn("Claude round 1", pending["plan_approval"]["proposal"])
+        self.assertEqual(runner.state["orchestration"]["plan_review"]["review_round_count"], 2)
+
+        with patch("safe_writer._run_preflight", return_value=ready):
+            state = runner.store.read_state()
+            receipt = orchestrator.record_decision_response(runner.store, state, "PLAN-APPROVAL",
+                "APPROVE", "I approve the reviewed plan.", operator_identity="local account: test",
+                source_reference="interactive local CLI")
+        self.assertTrue(receipt["resolved"])
+        runner.state = runner.store.read_state()
+        runner._planning = lambda _runtime: runner._read_plan(
+            runner.state["orchestration"]["plan_reference"])
+        with patch("safe_writer._run_preflight", return_value=ready), \
+             patch("orchestrator._runtime_bundle_files", return_value={}), \
+             patch("orchestrator._runtime_bundle_unchanged", return_value=True):
+            resumed = runner.run()
+        self.assertEqual(implemented, ["inc-1"])
+        self.assertEqual(resumed["status"], "ACTIVE")
+        self.assertEqual(calls, [1, 2])
+
+    def test_unavailable_claude_plan_review_blocks_without_claiming_independent_review(self):
+        _target, runner = self.plan_review_workflow("plan-review-unavailable")
+        runner.initialize = lambda: None
+        runner._planning = lambda _runtime: plan()
+        implemented = []
+        runner._increment = lambda _plan, item, _runtime: implemented.append(item["increment_id"])
+        def unavailable(_request, **_kwargs):
+            return {"status": "BLOCKED", "failure_kind": "process_launch_failure",
+                "error": "Aily executable unavailable", "report_valid": False,
+                "envelope_valid": False, "report": None,
+                "process": {"invocation_attempted_at": None, "exit_code": None}}
+        with patch("safe_writer._run_preflight", return_value={"overall_result": "READY",
+                "target_path": str(runner.target.resolve())}), \
+             patch("orchestrator.claude.run_claude_review", side_effect=unavailable), \
+             patch("orchestrator._runtime_bundle_files", return_value={}):
+            result = runner.run()
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(implemented, [])
+        self.assertEqual(runner.state["orchestration"]["plan_review"]["status"], "blocked")
+        self.assertIn("not independently reviewed", runner.state["blocker"]["reason"])
+
+    def test_codex_dispositions_refine_plan_and_no_third_claude_round_runs(self):
+        target, runner = self.plan_review_workflow("plan-review-findings")
+        initial_plan = plan()
+        runner.initialize = lambda: None
+        runner._planning = lambda _runtime: initial_plan
+        runner._increment = lambda *_args: self.fail("human approval is required before implementation")
+        calls = []
+        first_finding = {"id": "PLAN-1", "severity": "high",
+            "rationale": "The proposed job state has no crash recovery transition.",
+            "impact": "A worker restart could duplicate or lose an item.",
+            "recommendation": "Persist item attempts and define resume behavior."}
+        second_finding = {"id": "PLAN-2", "severity": "low",
+            "rationale": "The plan adds a metrics exporter outside the assignment.",
+            "impact": "It increases scope and adds an operational dependency.",
+            "recommendation": "Drop the exporter from this prototype."}
+        final_finding = {"id": "PLAN-3", "severity": "medium",
+            "rationale": "The plan does not specify request validation failures.",
+            "impact": "Malformed job payloads may have inconsistent API behavior.",
+            "recommendation": "Define a stable validation error response."}
+
+        def review(request, **_kwargs):
+            round_number = request["review_cycle"]["rounds"][-1]["round_number"]
+            calls.append((round_number, request["implementation_plan"]["summary"],
+                copy.deepcopy(request.get("codex_finding_decisions", []))))
+            if round_number == 1:
+                report = {"decision": "CHANGES_REQUESTED", "summary": "Recovery is missing and telemetry is out of scope.",
+                    "findings": [first_finding, second_finding]}
+            else:
+                report = {"decision": "CHANGES_REQUESTED", "summary": "The API error contract needs detail.",
+                    "findings": [final_finding]}
+            return self.successful_plan_review(request, report)
+
+        refinement_calls = []
+        def refine(stage, context, *_args, **_kwargs):
+            self.assertEqual(stage, "PLAN_REFINEMENT")
+            refinement_calls.append(context["review_round"])
+            updated = copy.deepcopy(context["current_plan"])
+            if context["review_round"] == 1:
+                updated["summary"] = "Persist item attempts and resume failed jobs; keep prototype telemetry out of scope."
+                dispositions = [
+                    {"finding_id": "PLAN-1", "decision": "ACCEPT",
+                     "rationale": "Crash recovery is required to prevent duplicate item processing.",
+                     "plan_change": "Add persisted item attempts and resumable state transitions.",
+                     "evidence_references": [context["current_plan_reference"]]},
+                    {"finding_id": "PLAN-2", "decision": "REJECT",
+                     "rationale": "The exporter is outside the requested job lifecycle and has no supporting requirement.",
+                     "plan_change": None, "evidence_references": [context["current_plan_reference"]]},
+                ]
+            else:
+                updated["summary"] += " Return a consistent validation error response for malformed job payloads."
+                dispositions = [{"finding_id": "PLAN-3", "decision": "ACCEPT",
+                    "rationale": "Stable request errors are part of the REST contract.",
+                    "plan_change": "Add a validation error response contract to the API plan.",
+                    "evidence_references": [context["current_plan_reference"]]}]
+            return {"status": "COMPLETED", "summary": "Plan findings were dispositioned.",
+                "plan": updated, "dispositions": dispositions}
+
+        ready = {"overall_result": "READY", "target_path": str(target.resolve())}
+        with patch("safe_writer._run_preflight", return_value=ready), \
+             patch("orchestrator.claude.run_claude_review", side_effect=review), \
+             patch.object(runner, "_run_codex", side_effect=refine), \
+             patch("orchestrator._runtime_bundle_files", return_value={}), \
+             patch("orchestrator._runtime_bundle_unchanged", return_value=True):
+            result = runner.run()
+        self.assertEqual([item[0] for item in calls], [1, 2])
+        self.assertTrue(calls[1][1].startswith("Persist item attempts"))
+        self.assertEqual(calls[1][2][0]["finding_id"], "PLAN-1")
+        self.assertEqual(calls[1][2][0]["decision"], "ACCEPT")
+        self.assertEqual(refinement_calls, [1, 2])
+        final_plan = runner._read_plan(runner.state["orchestration"]["plan_reference"])
+        self.assertIn("consistent validation error response", final_plan["summary"])
+        self.assertEqual(result["status"], "WAITING_FOR_HUMAN")
+        self.assertEqual(runner.state["orchestration"]["plan_review"]["review_round_count"], 2)
+        self.assertIn("not sent for a third independent review", result["plan_approval"]["proposal"])
+        self.assertIn("Codex REJECT", result["plan_approval"]["proposal"])
+
     def process_evidence_fixture(self, name):
         target = Path(self.temp.name) / name
         git_fixture(target)
@@ -1630,6 +1814,7 @@ class OrchestratorTests(unittest.TestCase):
         invoked = []
         self.runner.initialize = lambda: None
         self.runner._planning = lambda runtime: document
+        self.runner._review_plan_and_wait_for_approval = lambda current_plan, _runtime: current_plan
         self.runner._increment = lambda p, item, runtime: invoked.append(item["increment_id"])
         self.runner._finalize_revision = lambda p: "content:" + "c" * 64
         self.runner._review_and_gate = lambda p: None
@@ -1639,7 +1824,21 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(invoked, ["inc-1", "inc-2"])
         self.assertEqual(result["status"], "ACTIVE")
 
-    def test_orchestrator_runs_independent_increment_before_waiting_for_product_decision(self):
+    def test_approved_refined_plan_refreshes_only_pending_increment_records(self):
+        self.write_state(self.runner)
+        self.runner.state["orchestration"]["increments"] = [{
+            **plan()["increments"][0], "status": "pending", "requirement_version": 1}]
+        revised_increment = {**plan()["increments"][0], "title": "Implement refined behavior",
+            "code_paths": ["src/refined"], "revision_paths": ["src/refined"]}
+        with patch.object(self.runner, "_save"):
+            self.runner._activate_plan(plan(increments=[revised_increment]),
+                f"{self.runner.store.directory}/refined-plan.json", 1)
+        record = self.runner.state["orchestration"]["increments"][0]
+        self.assertEqual(record["title"], "Implement refined behavior")
+        self.assertEqual(record["code_paths"], ["src/refined"])
+        self.assertEqual(record["status"], "pending")
+
+    def test_plan_approval_blocks_every_increment_before_product_decisions(self):
         increments = [
             {**plan()["increments"][0], "increment_id": "inc-independent", "blocked_by_decision": False},
             {**plan()["increments"][0], "increment_id": "inc-dependent", "blocked_by_decision": True},
@@ -1659,13 +1858,22 @@ class OrchestratorTests(unittest.TestCase):
         self.runner.initialize = lambda: None
         self.runner._save = lambda: None
         self.runner._planning = lambda _runtime: document
+        def require_plan_approval(_plan, _runtime):
+            self.runner.state["pending_decisions"].append({"decision_id": "PLAN-APPROVAL",
+                "decision_category": "implementation_plan_approval", "requirement_version": 1,
+                "status": "open"})
+            self.runner.state["status"] = "WAITING_FOR_HUMAN"
+            self.runner.state["phase"] = "PLANNING"
+            self.runner.state["orchestration"]["current_stage"] = "PLAN_APPROVAL"
+            return None
+        self.runner._review_plan_and_wait_for_approval = require_plan_approval
         self.runner._increment = lambda _plan, item, _runtime: invoked.append(item["increment_id"])
         self.runner._finalize_revision = lambda _plan: self.fail("must wait before finalization")
         with patch("orchestrator._runtime_bundle_files", return_value={}):
             outcome = self.runner.run()
-        self.assertEqual(invoked, ["inc-independent"])
+        self.assertEqual(invoked, [])
         self.assertEqual(outcome["status"], "WAITING_FOR_HUMAN")
-        self.assertEqual(self.runner.state["orchestration"]["current_stage"], "PLANNING")
+        self.assertEqual(self.runner.state["orchestration"]["current_stage"], "PLAN_APPROVAL")
 
     def test_waiting_for_human_is_not_automatically_reactivated(self):
         pending = [{"decision_id": "PLAN-CLARIFICATION", "status": "open"}]
@@ -1775,6 +1983,7 @@ class OrchestratorTests(unittest.TestCase):
         resumed.state = resumed_state
         resumed.initialize = lambda: None
         resumed._run_codex = lambda *args, **kwargs: self.fail("a persisted plan must not be planned again")
+        resumed._review_plan_and_wait_for_approval = lambda current_plan, _runtime: current_plan
         resumed._finalize_revision = lambda _plan: "content:" + "c" * 64
         resumed._review_and_gate = lambda _plan: None
         with patch.object(resumed.store, "read_json", return_value=plan()), \

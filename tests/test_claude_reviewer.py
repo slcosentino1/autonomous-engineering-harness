@@ -620,6 +620,56 @@ class ClaudeReviewerTests(unittest.TestCase):
         self.assertIn("unsupported report field: uncontracted_field",
                       validate_reviewer_report(report, self.request(cycle)))
 
+    def test_plan_review_report_requires_rationale_impact_and_concrete_recommendation(self):
+        request = {"review_scope_kind": "plan", "scope_paths": [".engineering/workflows/flow/plan.json"]}
+        report = {"decision": "CHANGES_REQUESTED", "summary": "The plan misses recovery behavior.",
+            "findings": [{"id": "PLAN-1", "severity": "high",
+                "rationale": "The plan never specifies recovery after a worker crash.",
+                "impact": "A restart may duplicate or lose job progress.",
+                "recommendation": "Define persisted item state and restart behavior before implementation."}]}
+        self.assertEqual(validate_reviewer_report(report, request), [])
+        del report["findings"][0]["impact"]
+        self.assertIn("findings[0] missing required field: impact",
+                      validate_reviewer_report(report, request))
+
+    def test_plan_review_request_reuses_persisted_authorization_and_cycle(self):
+        plan_id = "plan-v1"
+        cycle = new_review_cycle(cycle_id=stable_review_cycle_id(str(self.target.resolve()), plan_id),
+            scope_kind="plan", increment_id=plan_id, assignment_reference="ASSIGN-1",
+            target_revision_id=REVISION_1, scope_paths=["src/app.py"])
+        cycle = reserve_review_round(cycle, target_revision_id=REVISION_1)
+        request = self.request(cycle)
+        request["increment_id"] = plan_id
+        request["review_scope_kind"] = "plan"
+        request["reviewer_role"] = "Senior Software Architect, Senior Software Engineer, and Senior Product Engineer"
+        request["implementation_plan"] = {"summary": "Persist and process submitted jobs.", "increments": []}
+        request["reviewer_contract_reference"] = "harness/verification/plan-reviewer-contract.md"
+        request["reviewer_contract"] = "Challenge requirements, reliability, recovery, security, and test coverage."
+        for artifact in request["evidence_artifacts"]:
+            evidence_path = self.target / artifact["artifact_reference"]
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            evidence["increment_id"] = plan_id
+            evidence["revision"]["revision_id"] = REVISION_1
+            raw = json.dumps(evidence, sort_keys=True).encode("utf-8")
+            evidence_path.write_bytes(raw)
+            artifact["sha256"] = hashlib.sha256(raw).hexdigest()
+        authorization = request["external_authorization"]
+        authorization["increment_id"] = plan_id
+        authorization["reviewer_role"] = request["reviewer_role"]
+        authorization["permitted_data"] = authorization["permitted_data"] + [
+            "implementation_plan", "prior_plan_review_findings_and_dispositions"]
+        authorization["workflow_owner_verification"]["verified_scope_sha256"] = authorization_scope_fingerprint(authorization)
+        state_path = self.target / request["workflow_state_path"]
+        persisted = json.loads(state_path.read_text(encoding="utf-8"))
+        persisted["scope"]["increment_id"] = plan_id
+        persisted["authorizations"] = [authorization]
+        persisted["claude_review_cycles"] = [cycle]
+        state_path.write_text(json.dumps(persisted, indent=2) + "\n", encoding="utf-8")
+        request["review_cycle"] = cycle
+        request["external_authorization"] = authorization
+        validated, _target, _env = _validate_request(request)
+        self.assertEqual(validated["authorized_input_paths"], authorization["permitted_paths"])
+
     def test_02c_non_object_json_result_is_received_but_rejected(self):
         envelope = {
             "type": "result", "subtype": "success", "is_error": False,

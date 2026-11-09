@@ -163,7 +163,25 @@
         "task_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
         "config_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
         "branch": {"type": "string", "minLength": 1},
-        "current_stage": {"enum": ["PLANNING", "IMPLEMENTATION", "SELF_REVIEW", "VALIDATION", "REVIEW", "CORRECTION", "FINAL_GATE", "COMMIT", "COMPLETED"]},
+        "current_stage": {"enum": ["PLANNING", "PLAN_REVIEW", "PLAN_REFINEMENT", "PLAN_APPROVAL", "IMPLEMENTATION", "SELF_REVIEW", "VALIDATION", "REVIEW", "CORRECTION", "FINAL_GATE", "COMMIT", "COMPLETED"]},
+        "plan_review": {
+          "type": "object", "additionalProperties": false,
+          "required": ["requirement_version", "status", "cycle_id", "review_round_count", "current_plan_reference", "proposal_sha256", "reviews", "dispositions"],
+          "properties": {
+            "requirement_version": {"type": "integer", "minimum": 1},
+            "status": {"enum": ["reviewing", "awaiting_human_approval", "approved", "blocked"]},
+            "cycle_id": {"type": "string", "minLength": 1},
+            "review_round_count": {"type": "integer", "minimum": 0, "maximum": 2},
+            "current_plan_reference": {"type": "string", "minLength": 1},
+            "proposal_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+            "reviews": {"type": "array", "maxItems": 2, "items": {"type": "object", "additionalProperties": false,
+              "required": ["round_number", "reviewed_plan_sha256", "report_reference", "evidence_reference", "decision"],
+              "properties": {"round_number": {"type": "integer", "enum": [1, 2]}, "reviewed_plan_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}, "report_reference": {"type": "string", "minLength": 1}, "evidence_reference": {"type": "string", "minLength": 1}, "decision": {"enum": ["APPROVED", "CHANGES_REQUESTED"]}}}},
+            "dispositions": {"type": "array", "items": {"type": "object", "additionalProperties": false,
+              "required": ["round_number", "finding_id", "decision", "rationale", "plan_change", "evidence_references"],
+              "properties": {"round_number": {"type": "integer", "enum": [1, 2]}, "finding_id": {"type": "string", "minLength": 1}, "decision": {"enum": ["ACCEPT", "REJECT"]}, "rationale": {"type": "string", "minLength": 1}, "plan_change": {"type": ["string", "null"]}, "evidence_references": {"type": "array", "items": {"type": "string", "minLength": 1}}}}}
+          }
+        },
         "max_iterations": {"type": "integer", "minimum": 1, "maximum": 5},
         "iteration": {"type": "integer", "minimum": 0, "maximum": 5},
         "current_increment_id": {"type": ["string", "null"]},
@@ -192,7 +210,7 @@
           "type": "object", "additionalProperties": false,
           "required": ["stage", "schema", "started_at", "finished_at", "exit_code", "duration_ms", "result_sha256"],
           "properties": {
-            "stage": {"enum": ["PLANNING", "IMPLEMENTATION", "SELF_REVIEW", "CORRECTION", "RESUME"]},
+            "stage": {"enum": ["PLANNING", "PLAN_REFINEMENT", "IMPLEMENTATION", "SELF_REVIEW", "CORRECTION", "RESUME"]},
             "schema": {"type": ["string", "null"]},
             "started_at": {"type": "string", "format": "date-time"},
             "finished_at": {"type": "string", "format": "date-time"},
@@ -386,7 +404,7 @@
         "required": ["cycle_id", "scope_kind", "increment_id", "assignment_reference", "target_revision_id", "scope_paths", "max_rounds", "round_count", "status", "rounds", "finding_decisions", "unresolved_finding_ids", "human_escalation"],
         "properties": {
           "cycle_id": {"type": "string", "minLength": 1},
-          "scope_kind": {"enum": ["increment", "final"]},
+          "scope_kind": {"enum": ["increment", "final", "plan"]},
           "increment_id": {"type": "string", "minLength": 1},
           "assignment_reference": {"type": "string", "minLength": 1},
           "target_revision_id": {"type": "string", "pattern": "^content:[a-f0-9]{64}$"},
@@ -654,8 +672,9 @@
         "required": ["decision_id", "question_or_action", "impact", "recommended_option", "required_authority", "affected_phase", "requested_at", "status"],
         "properties": {
           "decision_id": {"type": "string", "minLength": 1},
+          "requirement_version": {"type": "integer", "minimum": 1},
           "workflow_id": {"type": "string", "minLength": 1},
-          "decision_category": {"enum": ["functional_decision", "external_data_transfer_authorization", "restricted_operation_authorization", "security_risk_acceptance", "high_risk_approval", "criterion_waiver", "unclassified_human_decision"]},
+          "decision_category": {"enum": ["functional_decision", "implementation_plan_approval", "external_data_transfer_authorization", "restricted_operation_authorization", "security_risk_acceptance", "high_risk_approval", "criterion_waiver", "unclassified_human_decision"]},
           "stage": {"enum": ["DISCOVERY", "REQUIREMENTS", "ARCHITECTURE", "PLANNING", "IMPLEMENTATION", "TESTING", "INDEPENDENT_VERIFICATION", "CORRECTION", "VERIFICATION_GATE", "COMMIT", "NEXT_INCREMENT"]},
           "question": {"type": "string", "minLength": 1},
           "proposal": {"type": "string", "minLength": 1},

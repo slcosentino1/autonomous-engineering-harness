@@ -796,6 +796,7 @@ def record_decision_response(store: WorkflowStore, state: dict[str, Any], decisi
         isinstance(decision.get("policy_or_skill_reference"), str) and
         bool(decision["policy_or_skill_reference"].strip())
     )
+    plan_approval = decision.get("decision_category") == "implementation_plan_approval"
     partial_plan_decision = (
         decision.get("stage") == "PLANNING" and
         isinstance(state.get("orchestration"), dict) and
@@ -810,7 +811,27 @@ def record_decision_response(store: WorkflowStore, state: dict[str, Any], decisi
                 "response_id": response_record["response_id"], "resolved": False,
                 "requires_requirement_update": True, "identity_assurance": "declared"}
     resolved = False
-    if interactive_allowed:
+    if interactive_allowed or plan_approval:
+        if plan_approval and action != "APPROVE":
+            decision["status"] = "resolved"
+            decision["resolution_action"] = action
+            decision["resolution"] = response.strip()
+            decision["resolved_by"] = operator_identity.strip()
+            decision["resolved_by_kind"] = "human"
+            decision["resolved_by_identity_assurance"] = "declared"
+            decision["resolved_at"] = response_record["responded_at"]
+            state["status"] = "BLOCKED"
+            state["phase"] = "PLANNING"
+            state["blocker"] = {
+                "reason": "The proposed implementation plan was not approved; no product implementation may begin.",
+                "affected_phase": "PLANNING", "recorded_at": _now(),
+                "safe_recovery_path": "Revise the task or workflow requirements explicitly, then replan and repeat plan review.",
+            }
+            store.save(state)
+            return {"workflow_id": state["workflow_id"], "decision_id": decision_id,
+                    "decision_status": decision["status"], "workflow_status": state["status"],
+                    "response_id": response_record["response_id"], "resolved": True,
+                    "identity_assurance": "declared"}
         decision["status"] = "resolved"
         decision["resolution_action"] = action
         decision["resolution"] = (decision.get("proposal") or decision.get("recommended_option")
@@ -2196,9 +2217,19 @@ class Orchestrator:
         if plan_path not in self.state["artifact_references"]:
             self.state["artifact_references"].append(plan_path)
         orchestration["plan_reference"] = plan_path
-        existing_ids = {row.get("increment_id") for row in orchestration["increments"] if isinstance(row, dict)}
+        planned_ids = {item["increment_id"] for item in plan["increments"]}
+        orchestration["increments"] = [row for row in orchestration["increments"]
+            if not (isinstance(row, dict) and row.get("requirement_version") == version and
+                    row.get("status") == "pending" and row.get("increment_id") not in planned_ids)]
         for item in plan["increments"]:
-            if item["increment_id"] in existing_ids:
+            existing = next((row for row in orchestration["increments"] if isinstance(row, dict) and
+                             row.get("increment_id") == item["increment_id"] and
+                             row.get("requirement_version", 1) == version), None)
+            if existing is not None:
+                if existing.get("status") == "pending":
+                    existing.update({**item, "status": "pending", "requirement_version": version})
+                elif any(existing.get(key) != value for key, value in item.items()):
+                    raise OrchestratorError("An approved plan increment changed after implementation had started")
                 continue
             orchestration["increments"].append({**item, "status": "pending", "requirement_version": version})
         self.state["phase"] = "IMPLEMENTATION"
@@ -2311,6 +2342,9 @@ class Orchestrator:
                "or High-risk approvals. Otherwise set it false. When the plan is READY, decision_context must be null. "
                "Complete engineering_discovery before finalizing the plan: classify requirements and quality constraints, enumerate proportionate failure/concurrency/recovery/security scenarios with expected behavior and verification, document assumptions and their impact/reversibility, and categorize decisions. Decide routine engineering matters autonomously; require user input only for consequential product/business choices or separately restricted operations. If one decision blocks only some increments, return the complete plan with decision=NEEDS_HUMAN_INPUT and mark only dependent increments blocked_by_decision=true; independent increments may proceed while the answer is pending. If no work is safely independent, return a decision-only response. Batch related questions when practical. Re-evaluate architecture, capabilities, dependencies, acceptance criteria, and validations from the current requirement version. Workspace paths describe review scope and do not require separate approval. Do not carry forward superseded decisions as approvals. Return only JSON matching the schema.\n"
                if stage == "PLANNING" else
+               "Evaluate every supplied Claude plan finding against the original task, repository guidance, and current plan. "
+               "Disposition each finding exactly once as ACCEPT or REJECT with a reason. Accepted recommendations must be reflected in the returned plan and identify the concrete plan_change; rejected recommendations must explain why and cite at least one supplied evidence reference. Preserve legitimate unresolved product/business questions and keep the plan within assignment scope. Do not write product source or tests. After the second review, no further Claude review is available; identify accepted final changes as not independently re-reviewed so the human can assess that limitation. Return only JSON matching the plan-refinement schema.\n"
+               if stage == "PLAN_REFINEMENT" else
                "Perform a read-only self-review of the exact current implementation increment against the current requirement, approved decisions, architecture context, selected skills and their repository patterns, acceptance criteria, and authorized review scope. Report every concrete implementation deviation. Use only workflow records available at the evidence_cutoff in Stage context; assess no record created after that cutoff. The controller-managed process evidence file is excluded from review and must not be required to describe this or any future self-review execution. If implementation findings exist, provide the minimal safe corrections as complete UTF-8 file contents in changes; do not claim unresolved findings are corrected. Do not write files directly. Return only JSON matching the self-review schema.\n"
                if stage == "SELF_REVIEW" else
                "Implement only the current increment by returning complete UTF-8 text for changed/new files in the JSON changes array. "
@@ -2431,10 +2465,20 @@ class Orchestrator:
                        if not isinstance(row, dict) or row.get("decision_id") not in invalidated_decision_ids]
             open_decisions = [row for row in pending if row.get("status") == "open"]
             if self.state["status"] == "WAITING_FOR_HUMAN":
+                current_version = self.state.get("orchestration", {}).get("current_requirement_version", 1)
+                plan_decision = next((row for row in pending
+                    if row.get("decision_category") == "implementation_plan_approval" and
+                    row.get("requirement_version", 1) == current_version), None)
+                plan_approved = (isinstance(plan_decision, dict) and plan_decision.get("status") == "resolved" and
+                                plan_decision.get("resolution_action") == "APPROVE")
+                blocking_open = [row for row in open_decisions if not (
+                    plan_approved and row.get("decision_category") == "functional_decision" and
+                    row.get("stage") == "PLANNING")]
                 if any(row.get("decision_id") in {"HUMAN-APPROVAL", "COMMIT-AUTHORIZATION"} and row.get("status") == "open"
-                       for row in pending) or open_decisions:
+                       for row in pending) or blocking_open:
                     return self._result()
-                if pending and any(not all(isinstance(row.get(key), str) and row[key].strip() for key in
+                if any(row.get("status") == "resolved" and not all(
+                        isinstance(row.get(key), str) and row[key].strip() for key in
                         ("resolution", "resolved_by", "resolved_at", "resolved_by_kind",
                          "resolved_by_identity_assurance")) for row in pending):
                     return self._result()
@@ -2484,6 +2528,9 @@ class Orchestrator:
                 runtime = Path(temp).resolve()
                 manifest = _runtime_bundle_files(runtime)
                 plan = self._planning(runtime)
+                if plan is None:
+                    return self._result()
+                plan = self._review_plan_and_wait_for_approval(plan, runtime)
                 if plan is None:
                     return self._result()
                 for increment in plan["increments"]:
@@ -2626,6 +2673,540 @@ class Orchestrator:
             "plan": plan})
         self._activate_plan(plan, plan_path, version)
         return plan
+
+    def _plan_artifact_value(self, plan: dict[str, Any], version: int) -> dict[str, Any]:
+        orchestration = self.state["orchestration"]
+        return {"artifact_schema_version": 1, "requirement_version": version,
+            "task_sha256": orchestration["task_sha256"],
+            "config_sha256": _planning_config_sha256(self.config), "plan": copy.deepcopy(plan)}
+
+    def _persist_plan_revision(self, plan: dict[str, Any], reference: str, version: int) -> str:
+        self.store.write(reference, self._plan_artifact_value(plan, version))
+        if reference not in self.state["artifact_references"]:
+            self.state["artifact_references"].append(reference)
+        return reference
+
+    def _plan_approval_proposal(self, plan: dict[str, Any], review: dict[str, Any]) -> str:
+        discovery = plan.get("engineering_discovery", {})
+        questions = []
+        for item in discovery.get("ambiguities", []):
+            if item.get("requires_human_input"):
+                questions.append(f"{item['id']}: {item['question']} — {item['impact']}")
+        for item in discovery.get("assumptions", []):
+            if item.get("requires_confirmation"):
+                questions.append(f"{item['id']}: confirm {item['description']} — {item['impact_if_wrong']}")
+        for item in discovery.get("decisions", []):
+            if item.get("requires_human_input"):
+                questions.append(f"{item['id']}: {item['decision']} — {item['rationale']}")
+        if isinstance(plan.get("decision_context"), dict):
+            item = plan["decision_context"]
+            questions.append(f"Open decision: {item['question']} Proposed: {item['proposal']} Impact: {item['reason']}")
+        review_lines = []
+        for row in review.get("reviews", []):
+            try:
+                report = self.store.read_json(row["report_reference"])
+            except (OSError, ValueError, json.JSONDecodeError):
+                report = {}
+            review_lines.append(f"Claude round {row['round_number']} ({row['decision']}): {report.get('summary', 'summary unavailable')}")
+            for finding in report.get("findings", []) if isinstance(report, dict) else []:
+                disposition = next((item for item in review.get("dispositions", [])
+                                    if item.get("round_number") == row["round_number"] and
+                                    item.get("finding_id") == finding.get("id")), None)
+                outcome = (f"Codex {disposition['decision']}: {disposition['rationale']}; "
+                           f"plan change: {disposition.get('plan_change') or 'none'}"
+                           if disposition else "Unresolved for human consideration")
+                review_lines.append(f"- [{finding.get('severity')}] {finding.get('rationale')} "
+                    f"Impact: {finding.get('impact')} Recommendation: {finding.get('recommendation')} {outcome}")
+        sections = [
+            "Implementation plan proposal for explicit human approval.",
+            f"Summary: {plan.get('summary', '')}",
+            "Architecture and components:\n" + "\n".join(f"- {item}" for item in plan.get("architecture_context", [])),
+            "Technical decisions and trade-offs:\n" + "\n".join(
+                f"- {item.get('decision')}: {item.get('rationale')} (alternatives: {', '.join(item.get('alternatives', []))})"
+                for item in discovery.get("decisions", [])),
+            "Requirements and acceptance criteria:\n" + "\n".join(
+                f"- {item['id']}: {item['text']}" for item in plan.get("requirements", []) + plan.get("acceptance_criteria", [])),
+            "Scenarios and validation:\n" + "\n".join(
+                f"- {item['id']}: {item['scenario']} Expected: {item['expected_behavior']} Verification: {item['verification']}"
+                for item in discovery.get("scenarios", [])),
+            "Planned increments:\n" + "\n".join(
+                f"- {item['increment_id']}: {item['title']} (code={', '.join(item['code_paths'])}; artifacts={', '.join(item['artifact_paths'])})"
+                for item in plan.get("increments", [])),
+            "Assumptions and limitations:\n" + "\n".join(
+                f"- {item['description']} Impact if wrong: {item['impact_if_wrong']}"
+                for item in discovery.get("assumptions", [])),
+            "Dependencies and recorded blockers:\n" + "\n".join(
+                [*(f"- Dependency: {item}" for item in plan.get("dependencies", [])),
+                 *(f"- Limitation or blocker: {item}" for item in plan.get("blockers", []))] or ["- None recorded."]),
+            "Claude plan review and Codex dispositions:\n" + "\n".join(review_lines),
+            "Unresolved product or business questions:\n" + ("\n".join(f"- {item}" for item in questions) if questions else "- None recorded."),
+            f"Current refined plan reference: {review.get('current_plan_reference')}",
+            f"Refined plan SHA-256: {review.get('proposal_sha256')}",
+            "Review limitation: any Codex refinements made after Claude's second report were not sent for a third independent review.",
+        ]
+        return "\n\n".join(sections)
+
+    def _refine_plan_from_review(self, plan: dict[str, Any], report: dict[str, Any],
+                                 plan_reference: str, round_number: int,
+                                 runtime: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        findings = report.get("findings", [])
+        if not findings:
+            return copy.deepcopy(plan), []
+        final_round = round_number == 2
+        context = {"increment": {"increment_id": f"plan-v{self.state['orchestration'].get('current_requirement_version', 1)}"},
+            "current_plan": copy.deepcopy(plan), "current_plan_reference": plan_reference,
+            "claude_report": copy.deepcopy(report), "findings": copy.deepcopy(findings),
+            "review_round": round_number, "final_round_no_more_claude_reviews": final_round,
+            "allowed_evidence_references": [plan_reference,
+                next((row.get("task_reference") for row in self.state["orchestration"].get("requirement_history", [])
+                      if row.get("version") == self.state["orchestration"].get("current_requirement_version")), "task")],
+            "instructions": ("Accept useful recommendations by updating the plan and reject the rest with evidence-based reasons. "
+                "After round 2, no further Claude review is available; identify accepted final changes as not independently re-reviewed so the human can assess that limitation.")}
+        self._set_stage("PLAN_REFINEMENT", "PLANNING")
+        result = self._run_codex("PLAN_REFINEMENT", context, runtime,
+            "orchestrator-plan-refinement.schema.json", sandbox="read-only")
+        if result.get("status") != "COMPLETED":
+            raise OrchestratorError("Codex could not complete disposition of the Claude plan findings")
+        revised = _plan_valid(result.get("plan"), self.config,
+            controller_artifact_paths=[self.store.directory])
+        dispositions = result.get("dispositions")
+        finding_ids = {row.get("id") for row in findings}
+        if (not isinstance(dispositions, list) or
+                any(not isinstance(row, dict) for row in dispositions) or
+                {row.get("finding_id") for row in dispositions} != finding_ids or
+                len(dispositions) != len(finding_ids)):
+            raise OrchestratorError("Codex plan refinement must disposition every Claude finding exactly once")
+        accepted = [row for row in dispositions if row.get("decision") == "ACCEPT"]
+        for row in dispositions:
+            if (row.get("decision") not in {"ACCEPT", "REJECT"} or
+                    not isinstance(row.get("rationale"), str) or not row["rationale"].strip()):
+                raise OrchestratorError("Every Claude plan finding needs an ACCEPT or REJECT decision with a reason")
+            refs = row.get("evidence_references")
+            if (not isinstance(refs, list) or any(not isinstance(ref, str) or not ref.strip() for ref in refs) or
+                    row["decision"] == "REJECT" and not refs):
+                raise OrchestratorError("Rejected plan recommendations require evidence references")
+            allowed_refs = set(context["allowed_evidence_references"])
+            if any(ref not in allowed_refs for ref in refs):
+                raise OrchestratorError("Plan finding disposition cites evidence outside the supplied proposal and assignment")
+            if row["decision"] == "ACCEPT" and (not isinstance(row.get("plan_change"), str) or not row["plan_change"].strip()):
+                raise OrchestratorError("Accepted plan recommendations must identify the concrete plan change")
+            if row["decision"] == "REJECT" and row.get("plan_change") is not None:
+                raise OrchestratorError("Rejected plan recommendations cannot claim a plan change")
+        if accepted and _sha(_json_bytes(revised)) == _sha(_json_bytes(plan)):
+            raise OrchestratorError("Codex accepted a plan recommendation without changing the plan")
+        if not accepted and _sha(_json_bytes(revised)) != _sha(_json_bytes(plan)):
+            raise OrchestratorError("Codex changed the plan without accepting a Claude recommendation")
+        return revised, dispositions
+
+    def _review_plan_and_wait_for_approval(self, plan: dict[str, Any], runtime: Path) -> dict[str, Any] | None:
+        orchestration = self.state["orchestration"]
+        version = orchestration.get("current_requirement_version", 1)
+        approval = next((row for row in self.state.get("pending_decisions", [])
+                         if row.get("decision_category") == "implementation_plan_approval" and
+                         row.get("requirement_version", 1) == version and
+                         row.get("invalidated_by_requirement_version") is None), None)
+        review = orchestration.get("plan_review")
+        if isinstance(review, dict) and review.get("requirement_version") == version:
+            if review.get("status") == "blocked":
+                return None
+            if review.get("status") == "approved":
+                if (not isinstance(approval, dict) or approval.get("status") != "resolved" or
+                        approval.get("resolution_action") != "APPROVE" or
+                        review.get("proposal_sha256") != _sha(_json_bytes(plan))):
+                    raise OrchestratorError("Plan approval does not match the current reviewed proposal")
+                self._activate_plan(plan, review["current_plan_reference"], version)
+                return plan
+            if isinstance(approval, dict) and approval.get("status") == "resolved":
+                if approval.get("resolution_action") != "APPROVE":
+                    return None
+                if review.get("proposal_sha256") != _sha(_json_bytes(plan)):
+                    raise OrchestratorError("The plan changed after human approval")
+                review["status"] = "approved"
+                self._save()
+                self._activate_plan(plan, review["current_plan_reference"], version)
+                return plan
+        else:
+            current_reference = f"{self.store.directory}/plan-review-current-v{version}.json"
+            self._persist_plan_revision(plan, current_reference, version)
+            synthetic_id = f"plan-v{version}"
+            cycle_id = claude.stable_review_cycle_id(str(self.target), synthetic_id)
+            proposal_sha = _sha(_json_bytes(plan))
+            review = {"requirement_version": version, "status": "reviewing", "cycle_id": cycle_id,
+                "review_round_count": 0, "current_plan_reference": current_reference,
+                "proposal_sha256": proposal_sha, "reviews": [], "dispositions": []}
+            orchestration["plan_review"] = review
+            orchestration["plan_reference"] = current_reference
+            self.state["scope"]["increment_id"] = synthetic_id
+            self.state["scope"].update({"included_paths": [current_reference], "code_paths": [],
+                "artifact_paths": [current_reference], "revision_paths": [current_reference]})
+            revision_id = "content:" + claude._scope_snapshot(self.target, [current_reference])
+            cycle = claude.new_review_cycle(cycle_id=cycle_id, scope_kind="plan", increment_id=synthetic_id,
+                assignment_reference=f"task:{self.workflow_id}", target_revision_id=revision_id,
+                scope_paths=[current_reference])
+            if any(row.get("cycle_id") == cycle_id for row in self.state.get("claude_review_cycles", [])):
+                raise OrchestratorError("A prior pre-implementation plan review cycle already exists for this requirement version")
+            self.state["claude_review_cycles"].append(cycle)
+            self._save()
+
+        cycle_matches = [row for row in self.state.get("claude_review_cycles", [])
+                         if row.get("cycle_id") == review["cycle_id"]]
+        if len(cycle_matches) != 1:
+            raise OrchestratorError("Plan review cycle is missing or ambiguous")
+        cycle = copy.deepcopy(cycle_matches[0])
+        if cycle.get("round_count", 0) >= 2:
+            if review.get("review_round_count") != 2:
+                raise OrchestratorError("Plan review cycle exhausted its two rounds without a complete approval proposal")
+            report = self._read_plan(review["current_plan_reference"])
+            del report
+        if cycle.get("rounds") and cycle["rounds"][-1].get("status") == "failed":
+            latest = cycle["rounds"][-1]
+            reason = "Claude plan review returned an unavailable or invalid result; it is not recorded as independently reviewed."
+            review["status"] = "blocked"
+            self.state["status"] = "BLOCKED"
+            self.state["phase"] = "PLANNING"
+            self.state["blocker"] = {"reason": reason, "affected_phase": "PLANNING", "recorded_at": _now(),
+                "safe_recovery_path": "Resolve the recorded Claude/Aily failure without exceeding the two plan-review rounds, then resume."}
+            self._save()
+            return None
+        if (cycle.get("rounds") and cycle["rounds"][-1].get("status") == "reserved" and
+                cycle["rounds"][-1].get("invocation_attempted_at")):
+            review["status"] = "blocked"
+            self.state["status"] = "BLOCKED"
+            self.state["phase"] = "PLANNING"
+            self.state["blocker"] = {"reason": "Claude plan review invocation was claimed but its result is missing; the one-shot call will not be repeated.",
+                "affected_phase": "PLANNING", "recorded_at": _now(),
+                "safe_recovery_path": "Resolve the recorded invocation without repeating it; do not claim independent plan review."}
+            self._save()
+            return None
+
+        if cycle.get("round_count", 0) < 2:
+            round_number = cycle.get("round_count", 0) + 1
+            current_reference = review["current_plan_reference"]
+            current_plan = self._read_plan(current_reference)
+            current_sha = _sha(_json_bytes(current_plan))
+            if not cycle.get("rounds") or cycle["rounds"][-1].get("status") != "reserved":
+                if round_number == 2:
+                    first_findings = self.store.read_json(review["reviews"][0]["report_reference"]).get("findings", [])
+                    decisions = [row for row in review["dispositions"] if row.get("round_number") == 1]
+                    decision_map = {row["finding_id"]: row for row in decisions}
+                    if {row.get("id") for row in first_findings} != set(decision_map):
+                        first_report = self.store.read_json(review["reviews"][0]["report_reference"])
+                        revised, dispositions = self._refine_plan_from_review(current_plan, first_report,
+                            current_reference, 1, runtime)
+                        for disposition in dispositions:
+                            review["dispositions"].append({"round_number": 1, **copy.deepcopy(disposition)})
+                        proposal_revision = f"{self.store.directory}/plan-review-refined-v{version}-round-1.json"
+                        self._persist_plan_revision(revised, proposal_revision, version)
+                        self._persist_plan_revision(revised, current_reference, version)
+                        orchestration["plan_reference"] = proposal_revision
+                        review["proposal_sha256"] = _sha(_json_bytes(revised))
+                        self._save()
+                        return self._review_plan_and_wait_for_approval(revised, runtime)
+                    for finding in first_findings:
+                        disposition = decision_map[finding["id"]]
+                        evidence = ([f"DIFF:{review['current_plan_reference']}"]
+                                    if disposition["decision"] == "REJECT" else [])
+                        cycle["finding_decisions"].append({
+                            "finding_id": finding["id"], "round_number": 1,
+                            "decision": disposition["decision"], "reason": disposition["rationale"],
+                            "evidence_references": evidence if disposition["decision"] == "REJECT" else [],
+                            "resolution_evidence_references": [f"PLAN-PROPOSAL-V{version}-R2"]
+                                if disposition["decision"] == "ACCEPT" else [],
+                            "resolution_status": "verified" if disposition["decision"] == "ACCEPT" else "resolved",
+                            "material_disagreement": False})
+                if round_number == 1:
+                    cycle["target_revision_id"] = "content:" + claude._scope_snapshot(self.target, [current_reference])
+                evidence_refs = ([f"PLAN-PROPOSAL-V{version}-R{round_number}"] if round_number == 2 else [])
+                cycle = claude.reserve_review_round(cycle,
+                    target_revision_id="content:" + claude._scope_snapshot(self.target, [current_reference]),
+                    verification_evidence_references=evidence_refs)
+                self.state["claude_review_cycles"] = [cycle if row.get("cycle_id") == cycle["cycle_id"] else row
+                    for row in self.state["claude_review_cycles"]]
+                self._save()
+            round_record = cycle["rounds"][-1]
+            round_number = round_record["round_number"]
+            proposal_archive = f"{self.store.directory}/plan-review-proposal-v{version}-round-{round_number}.json"
+            self._persist_plan_revision(current_plan, proposal_archive, version)
+            review["proposal_sha256"] = current_sha
+            review["review_round_count"] = cycle["round_count"]
+            review["current_plan_reference"] = current_reference
+            self.state["scope"]["increment_id"] = cycle["increment_id"]
+            self.state["scope"].update({"included_paths": [current_reference], "code_paths": [],
+                "artifact_paths": [current_reference], "revision_paths": [current_reference]})
+            context_paths = []
+            for value in self.config["review"].get("context_paths", []):
+                path = _relative(value, "review context path")
+                claude._safe_target_file(self.target, path)
+                context_paths.append(path)
+            evidence_artifacts = []
+            test_evidence = []
+            if round_number == 2:
+                raw = self.store.read_bytes(proposal_archive)
+                evidence_id = f"PLAN-PROPOSAL-V{version}-R{round_number}"
+                proposal_evidence_reference = f"{self.store.directory}/plan-review-evidence-record-v{version}-round-{round_number}.json"
+                proposal_evidence = {"evidence_id": evidence_id, "target_id": self.state["target"]["target_id"],
+                    "increment_id": cycle["increment_id"], "kind": "plan_review_proposal",
+                    "description": "Persisted refined proposal reviewed in Claude plan review round two.",
+                    "revision": {"revision_id": round_record["target_revision_id"]},
+                    "proposal_reference": proposal_archive, "proposal_sha256": _sha(raw)}
+                self.store.write(proposal_evidence_reference, proposal_evidence)
+                if proposal_evidence_reference not in self.state["artifact_references"]:
+                    self.state["artifact_references"].append(proposal_evidence_reference)
+                evidence_raw = self.store.read_bytes(proposal_evidence_reference)
+                evidence_artifacts = [{"evidence_id": evidence_id, "artifact_reference": proposal_evidence_reference,
+                    "sha256": _sha(evidence_raw), "media_type": "application/json"}]
+                test_evidence = [{"evidence_id": evidence_id, "command": "persisted plan proposal snapshot",
+                    "exit_code": 0, "result": "Plan artifact for review traceability; no product tests are claimed."}]
+            env = claude._git_environment()
+            changed_paths = claude._changed_path_names(self.target, env, self.state["baseline"]["commit"], [current_reference])
+            permitted_paths = claude._authorized_review_paths(self.target, [current_reference], context_paths,
+                [row["artifact_reference"] for row in evidence_artifacts])
+            authorized_input_paths = sorted(set(permitted_paths + changed_paths))
+            persistent_authorization, _remaining, authorization_error = self._persistent_claude_authorization(authorized_input_paths)
+            if authorization_error:
+                self._wait_for_claude_authorization({"increment_id": cycle["increment_id"]}, authorization_error,
+                    authorized_input_paths)
+                return None
+            assert persistent_authorization is not None
+            review_id = f"plan-review-{cycle['cycle_id'][-12:]}-r{round_number}"
+            authorization_id = f"AUTH-CLAUDE-{self.workflow_id}-PLAN-V{version}-R{round_number}"
+            now = datetime.now(timezone.utc)
+            stamp = lambda value: value.isoformat(timespec="seconds").replace("+00:00", "Z")
+            permitted_data = ["task", "requirements", "acceptance_criteria", "reviewer_contract", "assigned_diff",
+                "context_files", "verification_evidence", "workflow_identity", "revision_manifest",
+                "implementation_plan", "prior_plan_review_findings_and_dispositions"]
+            authorization = {
+                "authorization_id": authorization_id, "operation": "contact_external_services",
+                "resource": "Claude through Aily", "scope": f"Read-only pre-implementation plan review for target {self.target}, workflow {self.workflow_id}, requirement version {version}.",
+                "target_id": self.state["target"]["target_id"], "workflow_id": self.workflow_id,
+                "increment_id": cycle["increment_id"], "assignment_reference": f"task:{self.workflow_id}",
+                "review_id": review_id, "reviewer": "Claude through Aily",
+                "reviewer_role": "Senior Software Architect, Senior Software Engineer, and Senior Product Engineer",
+                "permitted_paths": authorized_input_paths, "permitted_data": permitted_data,
+                "limits": [f"Persistent authorization {persistent_authorization['authorization_id']}; read-only proposal review; no commands, writes, network tools, remote mutation, secrets, or unrelated files."],
+                "authorizer_identity": persistent_authorization["authorizer_identity"], "authorizer_kind": "human",
+                "authorizer_role": "Requesting user", "authorizer_identity_assurance": persistent_authorization["identity_assurance"],
+                "authorizer_authentication_reference": persistent_authorization["authorizer_authentication_reference"],
+                "authorizer_session_identity": None, "authority_reference": persistent_authorization["authorization_reference"],
+                "operation_effects": {"may_mutate_state": False, "may_incur_cost": True,
+                    "cost_limit": f"USD {self._claude_total_budget(persistent_authorization):.2f} total"},
+                "authorized_at": persistent_authorization["authorized_at"],
+                "source_reference": persistent_authorization["authorization_reference"],
+                "expires_at": persistent_authorization["expires_at"],
+                "expires_or_revocation": f"Persistent authorization {persistent_authorization['authorization_id']} expires at expires_at or when revoked in workflow configuration.",
+                "revoked": False,
+                "workflow_owner_verification": {"verified_by": self.state["authorization_verifier"]["identity"], "verified_at": stamp(now),
+                    "source_reference": persistent_authorization["authorization_reference"],
+                    "identity_assurance": persistent_authorization["identity_assurance"], "verified_scope_sha256": ""}}
+            authorization["workflow_owner_verification"]["verified_scope_sha256"] = claude.authorization_scope_fingerprint(authorization)
+            self.state["authorizations"].append(authorization)
+            self.state["authorization_verifier"]["source_reference"] = authorization["source_reference"]
+            existing_use_ids = {row.get("use_id") for row in orchestration.get("claude_authorization_uses", []) if isinstance(row, dict)}
+            use_id = _claude_authorization_use_id(review_id, round_number, round_record.get("attempt_number", 1), existing_use_ids)
+            use = {"use_id": use_id, "authorization_id": persistent_authorization["authorization_id"],
+                "review_id": review_id, "review_cycle_id": cycle["cycle_id"], "increment_id": cycle["increment_id"],
+                "revision_id": round_record["target_revision_id"], "round_number": round_number,
+                "invocation_attempt_number": round_record.get("attempt_number", 1),
+                "permitted_paths": authorized_input_paths, "mode": "read_only",
+                "budget_limit_usd": self._claude_total_budget(persistent_authorization),
+                "invocation_attempted": False, "status": "reserved", "started_at": stamp(now), "finished_at": None,
+                "invocation_id": None, "session_identity": None, "duration_ms": None,
+                "model": None, "usage": None, "cost_usd": None}
+            orchestration.setdefault("claude_authorization_uses", []).append(use)
+            self.state["status"] = "ACTIVE"
+            self.state["phase"] = "PLANNING"
+            orchestration["current_stage"] = "PLAN_REVIEW"
+            self._save()
+            contract_path = HARNESS_ROOT / "harness" / "verification" / "plan-reviewer-contract.md"
+            previous_findings = []
+            codex_decisions = []
+            if round_number == 2:
+                previous_findings = self.store.read_json(review["reviews"][0]["report_reference"]).get("findings", [])
+                codex_decisions = []
+                for row in review["dispositions"]:
+                    if row.get("round_number") != 1:
+                        continue
+                    codex_decisions.append({**row,
+                        "evidence_references": ([f"DIFF:{current_reference}"]
+                            if row["decision"] == "REJECT" else []),
+                        "resolution_evidence_references": ([f"PLAN-PROPOSAL-V{version}-R2"]
+                            if row["decision"] == "ACCEPT" else []),
+                        "material_disagreement": False})
+            request = {"target_path": str(self.target), "target_id": self.state["target"]["target_id"],
+                "workflow_id": self.workflow_id, "increment_id": cycle["increment_id"],
+                "assignment_reference": f"task:{self.workflow_id}", "reviewer_role": authorization["reviewer_role"],
+                "review_id": review_id, "review_scope_kind": "plan",
+                "target_revision_id": round_record["target_revision_id"],
+                "baseline_commit": self.state["baseline"]["commit"], "source_state": "working_tree",
+                "scope_paths": [current_reference], "workflow_states_root": ".engineering/workflows",
+                "workflow_state_path": self.store.state_path, "evidence_artifacts": evidence_artifacts,
+                "external_authorization_reference": authorization_id, "external_authorization": authorization,
+                "task": self.task, "requirements": plan["requirements"],
+                "acceptance_criteria": plan["acceptance_criteria"],
+                "architecture_context": plan["architecture_context"], "context_paths": context_paths,
+                "test_evidence": test_evidence, "documentation_context": plan["documentation_context"],
+                "reviewer_contract_reference": "harness/verification/plan-reviewer-contract.md",
+                "reviewer_contract": contract_path.read_text(encoding="utf-8"),
+                "previous_findings": previous_findings, "codex_finding_decisions": codex_decisions,
+                "review_cycle": cycle, "max_budget_usd": self._claude_total_budget(persistent_authorization),
+                "implementation_plan": copy.deepcopy(plan)}
+            result = claude.run_claude_review(request, aily_executable=self.aily,
+                timeout_seconds=min(self.config["stage_timeout_seconds"], 900))
+            self.state = self.store.read_state()
+            orchestration = self.state["orchestration"]
+            review = orchestration["plan_review"]
+            approval = next((row for row in self.state.get("pending_decisions", [])
+                if row.get("decision_category") == "implementation_plan_approval" and
+                row.get("requirement_version", 1) == version and
+                row.get("invalidated_by_requirement_version") is None), None)
+            persisted_uses = [row for row in self.state["orchestration"].get("claude_authorization_uses", [])
+                if isinstance(row, dict) and row.get("use_id") == use_id]
+            if len(persisted_uses) != 1:
+                raise OrchestratorError("Plan review authorization usage record is missing or ambiguous")
+            process = result.get("process") if isinstance(result.get("process"), dict) else {}
+            persisted_use = persisted_uses[0]
+            cost = process.get("cost_usd")
+            failure_kind = result.get("failure_kind")
+            persisted_use.update({"invocation_attempted": bool(process.get("invocation_attempted_at")),
+                "status": "RESERVATION_RELEASED" if not process.get("invocation_attempted_at") else
+                    "REVIEW_COMPLETED" if result.get("report_valid") is True else
+                    "REVIEW_REJECTED" if failure_kind == "invalid_reviewer_report" else "INVOCATION_FAILED",
+                "finished_at": _now(), "invocation_id": process.get("invocation_id") or
+                    ((process.get("response_metadata") or {}).get("invocation_id") if isinstance(process.get("response_metadata"), dict) else None),
+                "session_identity": process.get("reviewer_session_identity"), "duration_ms": process.get("duration_ms"),
+                "model": process.get("model"), "usage": process.get("usage"),
+                "cost_usd": cost if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None})
+            if not process.get("invocation_attempted_at"):
+                review["status"] = "blocked"
+                reason = _redact(str(result.get("error") or "Claude invocation was not claimed"))
+                self.state["blocker"] = {"reason": f"Claude plan review failed before an auditable invocation: {reason}; the plan is not independently reviewed.",
+                    "affected_phase": "PLANNING", "recorded_at": _now(),
+                    "safe_recovery_path": "Resolve the recorded adapter failure; the plan is not independently reviewed."}
+                self.state["status"] = "BLOCKED"
+                self.state["phase"] = "PLANNING"
+                self._save()
+                return None
+            report_reference = None
+            if result.get("report_valid") is True:
+                report_reference = f"{self.store.directory}/plan-review-report-v{version}-round-{round_number}.json"
+                self.store.write(report_reference, result["report"])
+                if report_reference not in self.state["artifact_references"]:
+                    self.state["artifact_references"].append(report_reference)
+                self._save()
+            evidence_reference = f"{self.store.directory}/plan-review-evidence-v{version}-round-{round_number}.json"
+            evidence_record = claude.build_review_evidence_record(result, request,
+                evidence_id=f"PLAN-REVIEW-V{version}-R{round_number}", report_reference=report_reference)
+            self.store.write(evidence_reference, evidence_record)
+            if evidence_reference not in self.state["artifact_references"]:
+                self.state["artifact_references"].append(evidence_reference)
+            completed_cycle = claude.record_review_result(cycle, result,
+                report_reference=report_reference, evidence_reference=evidence_reference,
+                target_path=self.target, workflow_state_path=self.store.state_path)
+            if round_number == 1:
+                # Plan review always gets its explicit second challenge, even when Claude's
+                # first response is clean; code-review cycle completion is not the plan gate.
+                completed_cycle["status"] = "finding_analysis_pending"
+                completed_cycle["human_escalation"] = False
+            self.state["claude_review_cycles"] = [completed_cycle if row.get("cycle_id") == completed_cycle["cycle_id"] else row
+                for row in self.state["claude_review_cycles"]]
+            review_result = {"increment_id": cycle["increment_id"], "revision_id": round_record["target_revision_id"],
+                "status": completed_cycle["status"], "outcome": completed_cycle["rounds"][-1].get("outcome"),
+                "report_reference": report_reference, "evidence_reference": evidence_reference,
+                "model": process.get("model"), "usage": process.get("usage"), "cost_usd": cost}
+            self.state["orchestration"].setdefault("review_results", []).append(review_result)
+            if not result.get("report_valid"):
+                review["status"] = "blocked"
+                self.state["status"] = "BLOCKED"
+                self.state["phase"] = "PLANNING"
+                self.state["blocker"] = {"reason": "Claude plan review was unavailable or returned an invalid report; the proposal is not independently reviewed.",
+                    "affected_phase": "PLANNING", "recorded_at": _now(),
+                    "safe_recovery_path": "Resolve the recorded Claude/Aily failure without exceeding the two plan-review rounds, then resume."}
+                self._save()
+                return None
+            review["reviews"] = [row for row in review["reviews"] if row.get("round_number") != round_number]
+            review["reviews"].append({"round_number": round_number, "reviewed_plan_sha256": current_sha,
+                "report_reference": report_reference, "evidence_reference": evidence_reference,
+                "decision": result["report"]["decision"]})
+            review["reviews"].sort(key=lambda row: row["round_number"])
+            review["review_round_count"] = completed_cycle["round_count"]
+            review["proposal_sha256"] = current_sha
+            self.state["claude_review_cycles"] = [completed_cycle if row.get("cycle_id") == completed_cycle["cycle_id"] else row
+                for row in self.state["claude_review_cycles"]]
+            self._save()
+            revised, dispositions = self._refine_plan_from_review(current_plan, result["report"], current_reference,
+                round_number, runtime)
+            for disposition in dispositions:
+                review["dispositions"].append({"round_number": round_number, **copy.deepcopy(disposition)})
+            if round_number == 1:
+                current_reference = review["current_plan_reference"]
+                proposal_revision = f"{self.store.directory}/plan-review-refined-v{version}-round-1.json"
+                self._persist_plan_revision(revised, proposal_revision, version)
+                self._persist_plan_revision(revised, current_reference, version)
+                orchestration["plan_reference"] = proposal_revision
+                review["proposal_sha256"] = _sha(_json_bytes(revised))
+            else:
+                review["proposal_sha256"] = _sha(_json_bytes(revised))
+            self._save()
+            plan = revised
+            cycle = completed_cycle
+            if round_number == 1:
+                return self._review_plan_and_wait_for_approval(plan, runtime)
+
+        # The second valid Claude report is the final independent plan review.
+        if review.get("review_round_count") != 2:
+            return None
+        second_review = next((row for row in review.get("reviews", []) if row.get("round_number") == 2), None)
+        if not isinstance(second_review, dict):
+            raise OrchestratorError("The second plan review report is missing")
+        second_report = self.store.read_json(second_review["report_reference"])
+        second_findings = second_report.get("findings", [])
+        final_dispositions = [row for row in review.get("dispositions", []) if row.get("round_number") == 2]
+        if {row.get("finding_id") for row in final_dispositions} != {row.get("id") for row in second_findings}:
+            latest_reviewed_plan = self._read_plan(review["current_plan_reference"])
+            revised, dispositions = self._refine_plan_from_review(latest_reviewed_plan, second_report,
+                review["current_plan_reference"], 2, runtime)
+            for disposition in dispositions:
+                review["dispositions"].append({"round_number": 2, **copy.deepcopy(disposition)})
+            plan = revised
+            final_reference = f"{self.store.directory}/plan-review-refined-v{version}-round-2.json"
+            self._persist_plan_revision(plan, final_reference, version)
+            orchestration["plan_reference"] = final_reference
+            review["proposal_sha256"] = _sha(_json_bytes(plan))
+            self._save()
+        cycle = next(row for row in self.state["claude_review_cycles"] if row.get("cycle_id") == review["cycle_id"])
+        cycle["status"] = "complete"
+        cycle["human_escalation"] = False
+        cycle["unresolved_finding_ids"] = []
+        review["status"] = "awaiting_human_approval"
+        review["proposal_sha256"] = _sha(_json_bytes(plan))
+        final_reference = f"{self.store.directory}/plan-review-refined-v{version}-round-2.json"
+        self._persist_plan_revision(plan, final_reference, version)
+        review["current_plan_reference"] = final_reference
+        orchestration["plan_reference"] = final_reference
+        if not isinstance(approval, dict):
+            proposal = self._plan_approval_proposal(plan, review)
+            requested_at = _now()
+            decision_id = "PLAN-APPROVAL" if version == 1 else f"PLAN-APPROVAL-V{version}"
+            self.state["pending_decisions"].append({
+                "decision_id": decision_id, "workflow_id": self.workflow_id,
+                "requirement_version": version,
+                "decision_category": "implementation_plan_approval", "stage": "PLANNING",
+                "question": "Do you explicitly approve this Claude-reviewed implementation plan so product implementation may begin?",
+                "proposal": proposal,
+                "reason": "Implementation is held until the human approves the refined plan after the bounded independent Claude review.",
+                "policy_or_skill_reference": "harness/orchestrator.py#pre-implementation-plan-approval",
+                "interactive_resolution_allowed": False, "response_history": [],
+                "question_or_action": "Approve the refined implementation plan before product code is written?",
+                "impact": "Approval permits the listed implementation increments to start. Rejection or requested changes keep implementation blocked.",
+                "recommended_option": "Review the proposal, Claude findings, Codex dispositions, assumptions, limitations, and open product questions; respond with APPROVE only when implementation may begin.",
+                "alternatives": ["Reject the plan", "Request changes and submit a revised requirement version"],
+                "required_authority": "requesting human",
+                "affected_phase": "PLANNING", "requested_at": requested_at, "status": "open"})
+        self.state["status"] = "WAITING_FOR_HUMAN"
+        self.state["phase"] = "PLANNING"
+        orchestration["current_stage"] = "PLAN_APPROVAL"
+        self._save()
+        return None
 
     def _implementation_context(self, plan: dict[str, Any], increment: dict[str, Any]) -> dict[str, Any]:
         orchestration = self.state["orchestration"]
@@ -4030,6 +4611,16 @@ class Orchestrator:
             result["git_state"] = self._git_status_report()
         except (OSError, OrchestratorError, ValueError) as exc:
             result["git_state"] = {"available": False, "reason": _redact(str(exc))}
+        approval = next((row for row in self.state.get("pending_decisions", [])
+                         if isinstance(row, dict) and row.get("decision_category") == "implementation_plan_approval" and
+                         row.get("requirement_version", 1) == self.state.get("orchestration", {}).get("current_requirement_version", 1) and
+                         row.get("status") == "open"), None)
+        if approval is not None:
+            result["plan_approval"] = {"decision_id": approval["decision_id"],
+                "question": approval.get("question"), "proposal": approval.get("proposal"),
+                "required_authority": approval.get("required_authority")}
+        if isinstance(self.state.get("blocker"), dict):
+            result["blocker"] = copy.deepcopy(self.state["blocker"])
         return result
 
 
