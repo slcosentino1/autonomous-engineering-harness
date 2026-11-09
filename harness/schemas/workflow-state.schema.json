@@ -139,6 +139,46 @@
             "self_review_count": {"type": "integer", "minimum": 0},
             "validation_count": {"type": "integer", "minimum": 0}
           }},
+        "process_evidence_archive": {"type": "object", "additionalProperties": false,
+          "required": ["artifact_reference", "sha256", "archived_at"],
+          "properties": {
+            "artifact_reference": {"type": "string", "minLength": 1},
+            "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+            "archived_at": {"type": "string", "format": "date-time"}
+          }},
+        "metadata_removals": {"type": "array", "items": {
+          "type": "object", "additionalProperties": false,
+          "required": ["path", "sha256", "artifact_reference", "reason", "status", "preserved_at", "removed_at", "operation_evidence"],
+          "properties": {
+            "path": {"const": "src/.DS_Store"},
+            "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+            "artifact_reference": {"type": "string", "minLength": 1},
+            "reason": {"type": "string", "minLength": 1},
+            "status": {"enum": ["preserved_pending_removal", "removed"]},
+            "preserved_at": {"type": "string", "format": "date-time"},
+            "removed_at": {"type": ["string", "null"], "format": "date-time"},
+            "operation_evidence": {"type": ["object", "null"]}
+          }
+        }},
+        "claude_authorization_use_reconciliations": {"type": "array", "items": {
+          "type": "object", "additionalProperties": false,
+          "required": ["event_id", "action", "authorization_id", "use_id", "use_index", "review_cycle_id", "round_number", "attempt_number", "source_reference", "source_sha256", "cost_usd", "reason", "recorded_at"],
+          "properties": {
+            "event_id": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+            "action": {"enum": ["reservation_released", "invocation_cost_reconciled"]},
+            "authorization_id": {"type": "string", "minLength": 1},
+            "use_id": {"type": ["string", "null"]},
+            "use_index": {"type": ["integer", "null"], "minimum": 0},
+            "review_cycle_id": {"type": ["string", "null"]},
+            "round_number": {"type": ["integer", "null"], "minimum": 1},
+            "attempt_number": {"type": ["integer", "null"], "minimum": 1},
+            "source_reference": {"type": "string", "minLength": 1},
+            "source_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+            "cost_usd": {"type": ["number", "null"], "minimum": 0},
+            "reason": {"type": "string", "minLength": 1},
+            "recorded_at": {"type": "string", "format": "date-time"}
+          }
+        }},
         "self_review_recovery_authorizations": {"type": "array", "maxItems": 1, "items": {
           "type": "object", "additionalProperties": false,
           "required": ["authorization_id", "operation", "target_id", "workflow_id", "stage", "blocker_sha256", "reason", "source_reference", "authorizer_identity", "identity_assurance", "authorized_at", "status", "consumed_at", "resume_attempt_number"],
@@ -899,7 +939,9 @@
         "increment_id": {"type": "string", "minLength": 1}, "revision_id": {"type": "string", "pattern": "^content:[a-f0-9]{64}$"},
         "permitted_paths": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
         "mode": {"const": "read_only"}, "budget_limit_usd": {"type": "number", "exclusiveMinimum": 0},
-        "invocation_attempted": {"type": "boolean"}, "status": {"enum": ["reserved", "INVOCATION_FAILED", "REVIEW_REJECTED", "REVIEW_COMPLETED"]},
+        "invocation_attempted": {"type": "boolean"}, "status": {"enum": ["reserved", "RESERVATION_RELEASED", "INVOCATION_FAILED", "REVIEW_REJECTED", "REVIEW_COMPLETED"]},
+        "round_number": {"type": "integer", "minimum": 1},
+        "invocation_attempt_number": {"type": "integer", "minimum": 1},
         "started_at": {"type": "string", "format": "date-time"}, "finished_at": {"type": ["string", "null"], "format": "date-time"},
         "invocation_id": {"type": ["string", "null"]}, "session_identity": {"type": ["string", "null"]},
         "duration_ms": {"type": ["integer", "null"], "minimum": 0}, "model": {"type": ["string", "null"]},

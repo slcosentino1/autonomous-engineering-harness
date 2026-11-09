@@ -12,7 +12,8 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(ROOT / "harness"))
-from safe_writer import SafeWriteError, create_directories, create_file, replace_file
+from safe_writer import (SafeWriteError, create_directories, create_file,
+                         remove_ohpen_finder_metadata, replace_file)
 
 
 def clean_git_env():
@@ -81,6 +82,45 @@ class SafeWriterTests(unittest.TestCase):
             create_file(self.root, self.config_path, "src/new.txt", b"replacement\n")
         self.assertEqual((self.root / "src/new.txt").read_bytes(), b"new\n")
 
+    def test_exact_ohpen_finder_metadata_removal_preserves_git_and_hash_protections(self):
+        subprocess.run(["git", "init", "-q", "-b", "main", str(self.root)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "user.name", "Fixture"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "user.email", "fixture@example.invalid"], check=True)
+        (self.root / "README.md").write_text("baseline\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-q", "-m", "baseline"], check=True)
+        path = "src/.DS_Store"
+        payload = b"\x00\x00\x00\x01Bud1" + b"\x00" * 48
+        destination = self.root / path
+        destination.write_bytes(payload)
+        self.write_config({path})
+
+        evidence = remove_ohpen_finder_metadata(
+            self.root, self.config_path, path, expected_sha256=self.digest(payload),
+            workflow_id="migration-jobs-api-harness-v2")
+
+        self.assertFalse(destination.exists())
+        self.assertEqual(evidence["operation"], "remove_ohpen_finder_metadata")
+        self.assertEqual(evidence["before_sha256"], self.digest(payload))
+        self.assertEqual(evidence["path"], path)
+
+        for workflow_id, requested_path, expected in [
+                ("another-workflow", path, self.digest(payload)),
+                ("migration-jobs-api-harness-v2", "src/other.DS_Store", self.digest(payload)),
+                ("migration-jobs-api-harness-v2", path, "0" * 64)]:
+            destination.write_bytes(payload)
+            with self.subTest(workflow_id=workflow_id, requested_path=requested_path), self.assertRaises(SafeWriteError):
+                remove_ohpen_finder_metadata(
+                    self.root, self.config_path, requested_path, expected_sha256=expected,
+                    workflow_id=workflow_id)
+            self.assertEqual(destination.read_bytes(), payload)
+
+        subprocess.run(["git", "-C", str(self.root), "add", path], check=True)
+        with self.assertRaisesRegex(SafeWriteError, "Tracked or staged"):
+            remove_ohpen_finder_metadata(
+                self.root, self.config_path, path, expected_sha256=self.digest(payload),
+                workflow_id="migration-jobs-api-harness-v2")
+        self.assertEqual(destination.read_bytes(), payload)
     def test_creates_one_directory_and_reports_identity_evidence(self):
         result = create_directories(self.root, self.config_path, "src/new-dir")
         created = self.root / "src/new-dir"

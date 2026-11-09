@@ -7,6 +7,7 @@ target-local workflow-state.json remains the durable workflow record.
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import getpass
 import hashlib
@@ -30,7 +31,8 @@ from typing import Any, Callable
 HARNESS_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HARNESS_ROOT / "harness"))
 from preflight import Preflight, PreflightError, canonical  # noqa: E402
-from safe_writer import create_directories, create_file, replace_file  # noqa: E402
+from safe_writer import (create_directories, create_file, remove_ohpen_finder_metadata,
+                         replace_file)  # noqa: E402
 import claude_reviewer as claude  # noqa: E402
 from runner import _runtime_bundle_files, _runtime_bundle_unchanged  # noqa: E402
 
@@ -57,6 +59,12 @@ SNAPSHOT_MIGRATION_AUTHORIZATION_LIMITS = [
 OHPEN_RECOVERY_WORKFLOW_ID = "migration-jobs-api-harness-v2"
 OHPEN_RECOVERY_BLOCKER_SHA256 = "158828cddd275fb5eae34934810e3ea88653d311ee0c446b61bea663aa4ee6e9"
 OHPEN_RECOVERY_EXPECTED_ATTEMPTS = 14
+OHPEN_FINDER_METADATA_PATH = "src/.DS_Store"
+OHPEN_FINDER_METADATA_SIGNATURE = b"\x00\x00\x00\x01Bud1"
+OHPEN_FINDER_METADATA_REASON = "Claude CR-3 confirmed this untracked file is macOS Finder metadata and the user authorized its removal."
+OHPEN_CORRECTION_RESUME_SOURCE = (
+    "conversation: Fix correction-stage restrictions and authorization ledger — finish Ohpen workflow"
+)
 
 
 class OrchestratorError(ValueError):
@@ -69,6 +77,17 @@ def _now() -> str:
 
 def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _claude_authorization_use_id(review_id: str, round_number: int,
+                                 attempt_number: int, existing_ids: set[str]) -> str:
+    base = f"{review_id}-round-{round_number}-attempt-{attempt_number}-use"
+    candidate = base
+    suffix = 2
+    while candidate in existing_ids:
+        candidate = f"{base}-{suffix}"
+        suffix += 1
+    return candidate
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -1742,7 +1761,10 @@ class Orchestrator:
         new_review.pop("authorization", None)
         previous_auth = previous.get("review", {}).get("authorization")
         current_auth = self.config.get("review", {}).get("authorization")
-        return old_review == new_review and old == new and previous_auth != current_auth
+        previous_budget = old.pop("claude_budget_usd", None)
+        current_budget = new.pop("claude_budget_usd", None)
+        return (old_review == new_review and old == new and
+                (previous_auth != current_auth or previous_budget != current_budget))
 
     def _ensure_requirement_metadata(self, existing: dict[str, Any]) -> None:
         orchestration = existing["orchestration"]
@@ -2135,6 +2157,63 @@ class Orchestrator:
         return {"cli_version": self._codex_version, "model": self._codex_model,
                 "provider": self._codex_provider, "python_runtime": platform.python_version()}
 
+    def _matches_recorded_legacy_plan_config(self, saved: dict[str, Any]) -> bool:
+        """Accept a legacy plan hash only when workflow artifacts prove its exact config."""
+        if self.state is None:
+            return False
+        orchestration = self.state.get("orchestration")
+        if not isinstance(orchestration, dict):
+            return False
+        version = saved.get("requirement_version")
+        task_sha256 = saved.get("task_sha256")
+        config_sha256 = saved.get("config_sha256")
+        if (isinstance(version, bool) or not isinstance(version, int) or
+                version != orchestration.get("current_requirement_version") or
+                task_sha256 != orchestration.get("task_sha256") or
+                not isinstance(config_sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", config_sha256)):
+            return False
+
+        history = orchestration.get("requirement_history")
+        current_rows = [row for row in history if isinstance(row, dict) and
+                        row.get("version") == version and row.get("status") == "current"] \
+            if isinstance(history, list) else []
+        if len(current_rows) != 1 or current_rows[0].get("task_sha256") != task_sha256:
+            return False
+        requirement_reference = current_rows[0].get("task_reference")
+        if (not isinstance(requirement_reference, str) or
+                requirement_reference not in self.state.get("artifact_references", [])):
+            return False
+        try:
+            requirement = self.store.read_json(requirement_reference)
+        except (OSError, UnicodeError, json.JSONDecodeError, OrchestratorError):
+            return False
+        if (not isinstance(requirement, dict) or requirement.get("workflow_id") != self.workflow_id or
+                requirement.get("version") != version or requirement.get("task_sha256") != task_sha256 or
+                requirement.get("configuration_sha256") != config_sha256):
+            return False
+
+        authorization = orchestration.get("claude_authorization")
+        authorization_id = authorization.get("authorization_id") if isinstance(authorization, dict) else None
+        uses = orchestration.get("claude_authorization_uses", [])
+        if not isinstance(uses, list) or not isinstance(authorization_id, str):
+            return False
+        historical_budgets = {
+            float(use["budget_limit_usd"]) for use in uses
+            if isinstance(use, dict) and use.get("authorization_id") == authorization_id and
+            use.get("invocation_attempted") is True and
+            use.get("status") in {"INVOCATION_FAILED", "REVIEW_COMPLETED", "REVIEW_REJECTED"} and
+            isinstance(use.get("budget_limit_usd"), (int, float)) and
+            not isinstance(use.get("budget_limit_usd"), bool) and
+            math.isfinite(float(use["budget_limit_usd"])) and use["budget_limit_usd"] > 0
+        }
+        for historical_budget in historical_budgets:
+            historical_config = copy.deepcopy(self.config)
+            historical_config["claude_budget_usd"] = historical_budget
+            if (_legacy_plan_config_sha256(historical_config) == config_sha256 and
+                    _planning_config_sha256(historical_config) == _planning_config_sha256(self.config)):
+                return True
+        return False
+
     def _read_plan(self, relative: str) -> dict[str, Any]:
         saved = self.store.read_json(relative)
         version = self.state["orchestration"].get("current_requirement_version", 1)
@@ -2144,7 +2223,8 @@ class Orchestrator:
             valid_config_hashes = {_planning_config_sha256(self.config),
                                    _legacy_plan_config_sha256(self.config)}
             if (any(saved.get(key) != value for key, value in expected.items()) or
-                    saved.get("config_sha256") not in valid_config_hashes):
+                    (saved.get("config_sha256") not in valid_config_hashes and
+                     not self._matches_recorded_legacy_plan_config(saved))):
                 raise OrchestratorError("Stored plan does not match the current requirement/configuration version")
             plan = saved.get("plan")
             if not isinstance(plan, dict):
@@ -2384,12 +2464,60 @@ class Orchestrator:
             self._save()
             return result
 
+    def _resolve_authorized_ohpen_correction_deferral(self) -> None:
+        """Record the user's explicit instruction to retry this correction with controller support."""
+        assert self.state is not None
+        orchestration = self.state.get("orchestration", {})
+        if (self.workflow_id != OHPEN_RECOVERY_WORKFLOW_ID or
+                self.state.get("status") != "WAITING_FOR_HUMAN" or
+                self.state.get("phase") != "CORRECTION" or
+                orchestration.get("current_stage") != "CORRECTION"):
+            return
+        matches = [row for row in self.state.get("pending_decisions", [])
+                   if isinstance(row, dict) and row.get("decision_id") == "CLAUDE-FINDING-DECISION" and
+                   row.get("status") == "open"]
+        if len(matches) != 1:
+            return
+        expected_findings = {"CR-1", "CR-2", "CR-3", "CR-4", "CR-5"}
+        cycles = [row for row in self.state.get("claude_review_cycles", [])
+                  if isinstance(row, dict) and row.get("increment_id") == orchestration.get("current_increment_id")]
+        if len(cycles) != 1 or not cycles[0].get("rounds"):
+            return
+        latest = cycles[0]["rounds"][-1]
+        if latest.get("status") != "completed" or set(latest.get("finding_ids", [])) != expected_findings:
+            return
+        decision = matches[0]
+        if (decision.get("decision_category") != "unclassified_human_decision" or
+                decision.get("reason") != "Codex could not safely determine or correct this issue within the authorized scope."):
+            return
+        now = _now()
+        response = (
+            "I authorize the existing correction attempt to continue: the controller will refresh its managed "
+            "process evidence and remove only the confirmed untracked src/.DS_Store metadata; Codex will address "
+            "the remaining reviewed findings within the existing correction limit."
+        )
+        decision.setdefault("response_history", []).append({
+            "response_id": f"USER-CORRECTION-RESUME-{self.workflow_id}-{_sha(response.encode())[:12]}",
+            "action": "REQUEST_CHANGES", "response": response, "responded_at": now,
+            "source": "conversation_user_message", "source_reference": OHPEN_CORRECTION_RESUME_SOURCE,
+            "operator_identity": "Requesting user", "identity_assurance": "declared",
+        })
+        decision.update({
+            "status": "resolved", "resolution_action": "REQUEST_CHANGES", "resolution": response,
+            "resolved_by": "Requesting user", "resolved_by_kind": "human",
+            "resolved_by_identity_assurance": "declared", "resolved_at": now,
+        })
+        self.state["status"] = "ACTIVE"
+        self.state.pop("blocker", None)
+        self._save()
+
     def run(self) -> dict[str, Any]:
         try:
             self.initialize()
             assert self.state is not None
             if self.state["status"] == "COMPLETED":
                 return self._result()
+            self._resolve_authorized_ohpen_correction_deferral()
             invalidated_decision_ids = {row.get("decision_id") for row in self.state.get("pending_decisions", [])
                                         if isinstance(row, dict) and row.get("invalidated_by_requirement_version") is not None}
             pending = [row for row in self.state.get("pending_decisions", [])
@@ -2761,20 +2889,22 @@ class Orchestrator:
     def _process_evidence_content(self, existing: str) -> str:
         orchestration = self.state["orchestration"]
         attempts = orchestration.get("attempts", [])
-        rows = [PROCESS_EVIDENCE_START,
-            "## Controller-managed workflow evidence",
+        archive = orchestration.get("process_evidence_archive")
+        rows = ["# AI process evidence", "",
+            "This document is generated by the workflow controller from persisted records. It is not an independent review or approval.",
+            "", PROCESS_EVIDENCE_START, "## Controller-managed workflow evidence", "",
+            "Self-review uses only records available at its recorded evidence cutoff. Controller-managed process evidence is excluded from implementation revision fingerprints; a review does not require its own future result.",
             "",
-            "This section is generated from the persisted workflow state. Self-review assesses implementation quality using records available at each recorded evidence cutoff; it does not require this section to contain its own or future review results.",
+            (f"The prior authored narrative is preserved at {archive['artifact_reference']} (SHA-256 {archive['sha256']})."
+             if isinstance(archive, dict) else "No prior authored narrative archive was needed."),
             "",
-            f"- Workflow: `{self.workflow_id}`",
-            f"- Status/stage when generated: `{self.state.get('status')}` / `{orchestration.get('current_stage')}`",
-            f"- Requirement version: `{orchestration.get('current_requirement_version', 1)}`",
+            f"- Workflow: {self.workflow_id}",
+            f"- Status/stage when generated: {self.state.get('status')} / {orchestration.get('current_stage')}",
+            f"- Requirement version: {orchestration.get('current_requirement_version', 1)}",
             f"- Persisted execution attempts: {len(attempts)}",
             f"- Persisted successful self-reviews: {len(orchestration.get('self_reviews', []))}",
             f"- Persisted validation results: {len(orchestration.get('validation_results', []))}",
-            "",
-            "### Execution attempts",
-            "",
+            "", "### Execution attempts", "",
             "| # | Stage | Started | Finished | Exit | Outcome | Summary |",
             "|---:|---|---|---|---:|---|---|"]
         for index, attempt in enumerate(attempts, 1):
@@ -2787,17 +2917,17 @@ class Orchestrator:
             review_result = trace.get("self_review_result") if isinstance(trace, dict) else None
             if isinstance(review_result, dict):
                 cutoff = review_result.get("evidence_cutoff", {})
-                rows.extend(["", f"Self-review evidence cutoff: `{cutoff.get('observed_at')}`; "
+                rows.extend(["", f"Self-review evidence cutoff: {cutoff.get('observed_at')}; "
                     f"{cutoff.get('attempt_count')} attempts, {cutoff.get('self_review_count')} self-review results, "
                     f"{cutoff.get('validation_count')} validations, and {cutoff.get('review_count')} review records were available at review start.",
-                    f"Correction round: {review_result.get('correction_round')}; outcome: `{review_result.get('outcome')}`."])
+                    f"Correction round: {review_result.get('correction_round')}; outcome: {review_result.get('outcome')}."])
                 for finding in review_result.get("findings", []):
-                    rows.append(f"- Finding `{self._markdown_cell(finding.get('id'))}` "
-                        f"({self._markdown_cell(finding.get('severity'))}, `{self._markdown_cell(finding.get('file'))}`): "
+                    rows.append(f"- Finding {self._markdown_cell(finding.get('id'))} "
+                        f"({self._markdown_cell(finding.get('severity'))}, {self._markdown_cell(finding.get('file'))}): "
                         f"{self._markdown_cell(finding.get('description'))} Recommendation: "
                         f"{self._markdown_cell(finding.get('recommendation'))}")
                 paths = review_result.get("correction_paths", [])
-                rows.append("- Proposed correction paths: " + (", ".join(f"`{self._markdown_cell(path)}`" for path in paths) or "none"))
+                rows.append("- Proposed correction paths: " + (", ".join(self._markdown_cell(path) for path in paths) or "none"))
         rows.extend(["", "### Successful self-reviews", "",
             "| Requirement | Increment | Completed | Result | Correction passes | Findings | Revision |",
             "|---:|---|---|---|---:|---:|---|"])
@@ -2813,20 +2943,78 @@ class Orchestrator:
             rows.append("| " + " | ".join(self._markdown_cell(value) for value in (
                 result.get("evidence_id"), shlex.join(result.get("argv", [])), result.get("started_at"),
                 result.get("finished_at"), result.get("exit_code"), result.get("observed_result"))) + " |")
+        rows.extend(["", "### Independent review cycles", ""])
+        cycles = self.state.get("claude_review_cycles", [])
+        if not cycles:
+            rows.append("No independent review cycle is recorded.")
+        for cycle in cycles:
+            rows.extend([f"Cycle {self._markdown_cell(cycle.get('cycle_id'))}",
+                f"- Status: {self._markdown_cell(cycle.get('status'))}; rounds completed: {cycle.get('round_count', 0)}."])
+            for round_record in cycle.get("rounds", []):
+                rows.append(f"- Round {round_record.get('round_number')}: {self._markdown_cell(round_record.get('outcome') or round_record.get('status'))}; "
+                    f"findings: {', '.join(self._markdown_cell(value) for value in round_record.get('finding_ids', [])) or 'none'}; "
+                    f"report: {self._markdown_cell(round_record.get('report_reference'))}.")
+                for attempt in round_record.get("invocation_attempts", []):
+                    metadata = attempt.get("response_metadata", {}) if isinstance(attempt, dict) else {}
+                    rows.append(f"- Invocation attempt {attempt.get('attempt_number')}: {self._markdown_cell(attempt.get('outcome'))}; "
+                        f"started {self._markdown_cell(attempt.get('invocation_attempted_at'))}; "
+                        f"finished {self._markdown_cell(attempt.get('completed_at'))}; "
+                        f"cost USD {self._markdown_cell(metadata.get('cost_usd'))}; "
+                        f"failure {self._markdown_cell(attempt.get('failure_kind'))}.")
+            for finding in cycle.get("finding_decisions", []):
+                rows.append(f"- Finding {self._markdown_cell(finding.get('finding_id'))}: "
+                    f"{self._markdown_cell(finding.get('decision'))} / {self._markdown_cell(finding.get('resolution_status'))} — "
+                    f"{self._markdown_cell(finding.get('reason'))}")
+        rows.extend(["", "### Controller-managed metadata removals", ""])
+        removals = orchestration.get("metadata_removals", [])
+        if not removals:
+            rows.append("No product metadata removal is recorded.")
+        for removal in removals:
+            rows.append(f"- {self._markdown_cell(removal.get('path'))}: {self._markdown_cell(removal.get('status'))}; "
+                f"SHA-256 {self._markdown_cell(removal.get('sha256'))}; {self._markdown_cell(removal.get('reason'))}; "
+                f"preserved at {self._markdown_cell(removal.get('artifact_reference'))}.")
+        reconciliations = orchestration.get("claude_authorization_use_reconciliations", [])
+        rows.extend(["", "### Authorization-use ledger reconciliations", ""])
+        if not reconciliations:
+            rows.append("No authorization-use ledger reconciliation is recorded.")
+        for event in reconciliations:
+            rows.append(f"- {self._markdown_cell(event.get('action'))}: {self._markdown_cell(event.get('source_reference'))}; "
+                f"cost USD {self._markdown_cell(event.get('cost_usd'))}; {self._markdown_cell(event.get('reason'))}")
         blocker = self.state.get("blocker")
-        rows.extend(["", "### Current disposition", "",
-            self._markdown_cell(blocker.get("reason")) if isinstance(blocker, dict) else
-            ("No blocker is recorded." if self.state.get("status") not in {"WAITING_FOR_HUMAN"} else
-             "The workflow is waiting for human input; see the workflow state for the exact decision."),
-            "", PROCESS_EVIDENCE_END])
-        generated = "\n".join(rows).rstrip() + "\n"
-        start = existing.find(PROCESS_EVIDENCE_START)
-        end = existing.find(PROCESS_EVIDENCE_END)
-        if (start == -1) != (end == -1) or (start != -1 and end < start):
-            raise OrchestratorError("Controller-managed process evidence markers are malformed")
-        if start >= 0:
-            return existing[:start] + generated + existing[end + len(PROCESS_EVIDENCE_END):].lstrip("\n")
-        return existing.rstrip() + "\n\n" + generated if existing.strip() else generated
+        disposition = (self._markdown_cell(blocker.get("reason")) if isinstance(blocker, dict) else
+            ("The workflow is waiting for human input; see the workflow state for the exact decision."
+             if self.state.get("status") == "WAITING_FOR_HUMAN" else "No blocker is recorded."))
+        rows.extend(["", "### Current disposition", "", disposition, "", PROCESS_EVIDENCE_END])
+        return "\n".join(rows).rstrip() + "\n"
+
+    def _archive_original_process_evidence(self) -> None:
+        orchestration = self.state["orchestration"]
+        if orchestration.get("process_evidence_archive") is not None:
+            return
+        path = self.target / PROCESS_EVIDENCE_PATH
+        if not path.exists():
+            return
+        if path.is_symlink() or not path.is_file():
+            raise OrchestratorError("Controller-managed process evidence is not a regular file")
+        content = path.read_text(encoding="utf-8")
+        if not content.strip():
+            return
+        artifact_reference = f"{self.store.directory}/evidence/process-evidence-original.json"
+        if (self.target / artifact_reference).exists():
+            raise OrchestratorError("An unrecorded process-evidence archive already exists")
+        digest = _sha(content.encode("utf-8"))
+        archived_at = _now()
+        self.store.write(artifact_reference, {
+            "path": PROCESS_EVIDENCE_PATH, "sha256": digest, "archived_at": archived_at,
+            "reason": "Preserve the complete prior process narrative before the controller refreshes it from authoritative workflow records.",
+            "content_utf8": content,
+        })
+        if artifact_reference not in self.state["artifact_references"]:
+            self.state["artifact_references"].append(artifact_reference)
+        orchestration["process_evidence_archive"] = {
+            "artifact_reference": artifact_reference, "sha256": digest, "archived_at": archived_at,
+        }
+        self._save()
 
     def _sync_process_evidence(self, increment: dict[str, Any]) -> None:
         if not _contained(PROCESS_EVIDENCE_PATH, increment.get("artifact_paths", [])):
@@ -2837,6 +3025,7 @@ class Orchestrator:
         if path.exists() and not path.is_file():
             raise OrchestratorError("Controller-managed process evidence is not a regular file")
         existing = path.read_text(encoding="utf-8") if path.exists() else ""
+        self._archive_original_process_evidence()
         content = self._process_evidence_content(existing).encode("utf-8")
         digest = _sha(content)
         if not path.exists() or path.read_bytes() != content:
@@ -3177,6 +3366,106 @@ class Orchestrator:
         self.state["orchestration"]["current_stage"] = "REVIEW"
         self._save()
 
+    def _reconcile_claude_authorization_uses(self, authorization_id: str) -> None:
+        """Append auditable repairs for duplicate legacy reservations and omitted attempt costs."""
+        orchestration = self.state["orchestration"]
+        uses = orchestration.get("claude_authorization_uses", [])
+        if not isinstance(uses, list):
+            raise OrchestratorError("Claude authorization use ledger is malformed")
+        events = orchestration.setdefault("claude_authorization_use_reconciliations", [])
+        if not isinstance(events, list):
+            raise OrchestratorError("Claude authorization reconciliation history is malformed")
+
+        def event_exists(action: str, source_reference: str) -> bool:
+            return any(isinstance(row, dict) and row.get("authorization_id") == authorization_id and
+                       row.get("action") == action and row.get("source_reference") == source_reference
+                       for row in events)
+
+        groups: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+        for index, use in enumerate(uses):
+            if isinstance(use, dict) and isinstance(use.get("use_id"), str):
+                groups.setdefault(use["use_id"], []).append((index, use))
+        for use_id, group in groups.items():
+            if len(group) == 1:
+                continue
+            terminal = [(index, row) for index, row in group
+                        if row.get("authorization_id") == authorization_id and
+                        row.get("invocation_attempted") is True and
+                        row.get("status") in {"INVOCATION_FAILED", "REVIEW_REJECTED", "REVIEW_COMPLETED"}]
+            reservations = [(index, row) for index, row in group
+                            if row.get("authorization_id") == authorization_id and
+                            row.get("status") == "reserved" and row.get("invocation_attempted") is False and
+                            row.get("cost_usd") is None]
+            same_operation = (len(terminal) == 1 and len(reservations) == 1 and
+                all(terminal[0][1].get(key) == reservations[0][1].get(key)
+                    for key in ("authorization_id", "review_id", "review_cycle_id", "increment_id", "revision_id")))
+            if len(group) != 2 or not same_operation:
+                raise OrchestratorError(f"Duplicate Claude authorization use ID is ambiguous: {use_id}")
+            index, row = reservations[0]
+            source_reference = f"authorization-use:{use_id}:row:{index}"
+            if not event_exists("reservation_released", source_reference):
+                events.append({
+                    "event_id": _sha(f"{authorization_id}\\0reservation_released\\0{source_reference}".encode()),
+                    "action": "reservation_released", "authorization_id": authorization_id,
+                    "use_id": use_id, "use_index": index, "review_cycle_id": row["review_cycle_id"],
+                    "round_number": row.get("round_number"), "attempt_number": row.get("invocation_attempt_number"),
+                    "source_reference": source_reference, "source_sha256": _sha(_json_bytes(row)),
+                    "cost_usd": None,
+                    "reason": "The duplicate legacy reservation had no invocation claim; it is preserved as history and released by append-only reconciliation.",
+                    "recorded_at": _now(),
+                })
+
+        review_results = orchestration.get("review_results", [])
+        for cycle_index, cycle in enumerate(self.state.get("claude_review_cycles", [])):
+            if not isinstance(cycle, dict):
+                continue
+            cycle_id = cycle.get("cycle_id")
+            cycle_uses = [row for row in uses if isinstance(row, dict) and
+                          row.get("authorization_id") == authorization_id and row.get("review_cycle_id") == cycle_id]
+            if not cycle_uses:
+                continue
+            for round_record in cycle.get("rounds", []):
+                for attempt in round_record.get("invocation_attempts", []):
+                    metadata = attempt.get("response_metadata") if isinstance(attempt, dict) else None
+                    cost = metadata.get("cost_usd") if isinstance(metadata, dict) else None
+                    if (not isinstance(attempt, dict) or not attempt.get("invocation_attempted_at") or
+                            isinstance(cost, bool) or not isinstance(cost, (int, float)) or
+                            not math.isfinite(float(cost)) or cost < 0):
+                        continue
+                    round_number = round_record.get("round_number")
+                    attempt_number = attempt.get("attempt_number")
+                    matching_uses = [row for row in cycle_uses if row.get("invocation_attempted") is True and
+                        row.get("cost_usd") == cost and
+                        (row.get("round_number") is None or row.get("round_number") == round_number) and
+                        (row.get("invocation_attempt_number") is None or
+                         row.get("invocation_attempt_number") == attempt_number)]
+                    if matching_uses:
+                        continue
+                    source_reference = f"claude-cycle:{cycle_id}:round:{round_number}:attempt:{attempt_number}"
+                    if event_exists("invocation_cost_reconciled", source_reference):
+                        continue
+                    result_matches = [row for row in review_results if isinstance(row, dict) and
+                        row.get("increment_id") == cycle.get("increment_id") and
+                        row.get("revision_id") == attempt.get("target_revision_id") and row.get("cost_usd") == cost]
+                    if not result_matches:
+                        raise OrchestratorError("A Claude cycle cost is missing from the authorization ledger and has no matching review result")
+                    reconciled_use_id = "legacy-use-" + _sha(source_reference.encode())[:24]
+                    existing_use_ids = {row.get("use_id") for row in uses if isinstance(row, dict)}
+                    if reconciled_use_id in existing_use_ids:
+                        raise OrchestratorError("A reconciled historical invocation use ID collides with an existing record")
+                    events.append({
+                        "event_id": _sha(f"{authorization_id}\\0invocation_cost_reconciled\\0{source_reference}".encode()),
+                        "action": "invocation_cost_reconciled", "authorization_id": authorization_id,
+                        "use_id": reconciled_use_id, "use_index": None, "review_cycle_id": cycle_id,
+                        "round_number": round_number, "attempt_number": attempt_number,
+                        "source_reference": source_reference, "source_sha256": _sha(_json_bytes(attempt)),
+                        "cost_usd": float(cost),
+                        "reason": "Persisted invocation evidence records a priced Claude attempt without a matching legacy use row; the cost is counted once without rewriting history.",
+                        "recorded_at": _now(),
+                    })
+        if events:
+            self._save()
+
     def _persistent_claude_authorization(self, permitted_paths: list[str]) -> tuple[dict[str, Any] | None, float, str | None]:
         authorization = self.state.get("orchestration", {}).get("claude_authorization")
         if not isinstance(authorization, dict):
@@ -3209,22 +3498,39 @@ class Orchestrator:
             return None, 0.0, "The review packet includes paths outside the persistent Claude authorization."
         if not CLAUDE_AUTH_EXCLUSIONS.issubset(set(authorization.get("sensitive_exclusions", []))):
             return None, 0.0, "The persistent Claude authorization does not include all required sensitive-data exclusions."
-        total_limit = min(float(authorization["max_budget_usd"]), float(self.config["claude_budget_usd"]))
+        total_limit = self._claude_total_budget(authorization)
+        self._reconcile_claude_authorization_uses(authorization["authorization_id"])
         spent = 0.0
-        for use in self.state.get("orchestration", {}).get("claude_authorization_uses", []):
+        released_rows = {(row.get("authorization_id"), row.get("use_index"), row.get("source_sha256"))
+                         for row in self.state["orchestration"].get("claude_authorization_use_reconciliations", [])
+                         if isinstance(row, dict) and row.get("action") == "reservation_released"}
+        for index, use in enumerate(self.state.get("orchestration", {}).get("claude_authorization_uses", [])):
             if not isinstance(use, dict) or use.get("authorization_id") != authorization.get("authorization_id"):
                 continue
             if use.get("status") == "reserved":
+                if (authorization["authorization_id"], index, _sha(_json_bytes(use))) in released_rows:
+                    continue
                 return None, 0.0, "A prior persistent-authorization use was reserved without a terminal result; remaining budget cannot be verified."
             if use.get("invocation_attempted") is True:
                 cost = use.get("cost_usd")
                 if isinstance(cost, bool) or not isinstance(cost, (int, float)) or not math.isfinite(float(cost)):
                     return None, 0.0, "Prior Claude authorization usage has unknown cost; remaining budget cannot be verified."
                 spent += float(cost)
+        for event in self.state["orchestration"].get("claude_authorization_use_reconciliations", []):
+            if (isinstance(event, dict) and event.get("authorization_id") == authorization["authorization_id"] and
+                    event.get("action") == "invocation_cost_reconciled"):
+                cost = event.get("cost_usd")
+                if isinstance(cost, bool) or not isinstance(cost, (int, float)) or not math.isfinite(float(cost)):
+                    return None, 0.0, "A reconciled Claude invocation has unknown cost; remaining budget cannot be verified."
+                spent += float(cost)
         remaining = total_limit - spent
         if remaining <= 0:
             return None, 0.0, "The persistent Claude authorization budget is exhausted."
         return authorization, remaining, None
+
+    def _claude_total_budget(self, authorization: dict[str, Any]) -> float:
+        """Return the workflow-wide cap; the reviewer subtracts recorded cycle spend once."""
+        return min(float(authorization["max_budget_usd"]), float(self.config["claude_budget_usd"]))
 
     def _waiting_for_human(self, reason: str, *, authority: str) -> None:
         self.state["status"] = "WAITING_FOR_HUMAN"
@@ -3383,9 +3689,14 @@ class Orchestrator:
         review_id = f"review-{increment['increment_id']}-{cycle['rounds'][-1]['round_number']}"
         now = datetime.now(timezone.utc)
         stamp = lambda value: value.isoformat(timespec="seconds").replace("+00:00", "Z")
-        invocation_limit = min(remaining_authorization_budget, float(self.config["claude_budget_usd"]))
+        # The adapter enforces this total against already recorded cycle spend.
+        # Passing the controller's remaining amount here would subtract that spend twice.
+        invocation_limit = self._claude_total_budget(persistent_authorization)
         persistent_auth_id = persistent_authorization["authorization_id"]
         source_reference = persistent_authorization["authorization_reference"]
+        review_round = cycle["rounds"][-1]
+        round_number = review_round["round_number"]
+        invocation_attempt_number = review_round.get("attempt_number", 1)
         authorization = {
             "authorization_id": f"AUTH-CLAUDE-{self.workflow_id}-{increment['increment_id']}-R{cycle['rounds'][-1]['round_number']}", "operation": "contact_external_services",
             "resource": "Claude through Aily", "scope": f"Read-only review of target {self.target}, workflow {self.workflow_id}, increment {increment['increment_id']}, revision {revision_id}.",
@@ -3418,9 +3729,14 @@ class Orchestrator:
         self.state["scope"].update({"included_paths": increment["code_paths"] + increment["artifact_paths"],
             "code_paths": increment["code_paths"], "artifact_paths": increment["artifact_paths"],
             "revision_paths": increment["revision_paths"]})
-        use = {"use_id": f"{review_id}-use", "authorization_id": persistent_auth_id,
+        existing_use_ids = {row.get("use_id") for row in self.state["orchestration"].get("claude_authorization_uses", [])
+                            if isinstance(row, dict)}
+        use_id = _claude_authorization_use_id(
+            review_id, round_number, invocation_attempt_number, existing_use_ids)
+        use = {"use_id": use_id, "authorization_id": persistent_auth_id,
             "review_id": review_id, "review_cycle_id": cycle["cycle_id"],
             "increment_id": increment["increment_id"], "revision_id": revision_id,
+            "round_number": round_number, "invocation_attempt_number": invocation_attempt_number,
             "permitted_paths": authorized_input_paths, "mode": "read_only",
             "budget_limit_usd": invocation_limit, "invocation_attempted": False,
             "status": "reserved", "started_at": stamp(now), "finished_at": None,
@@ -3453,13 +3769,15 @@ class Orchestrator:
         process = result.get("process") if isinstance(result.get("process"), dict) else {}
         # The adapter claims the round in the target state immediately before Aily; reload that record.
         self.state = self.store.read_state()
-        persisted_use = next((row for row in self.state["orchestration"].get("claude_authorization_uses", [])
-                              if isinstance(row, dict) and row.get("use_id") == use["use_id"]), None)
-        if persisted_use is None:
-            raise OrchestratorError("Persistent Claude authorization usage record disappeared during invocation")
+        persisted_uses = [row for row in self.state["orchestration"].get("claude_authorization_uses", [])
+                          if isinstance(row, dict) and row.get("use_id") == use["use_id"]]
+        if len(persisted_uses) != 1:
+            raise OrchestratorError("Persistent Claude authorization usage record is missing or ambiguous after invocation")
+        persisted_use = persisted_uses[0]
         process_cost = process.get("cost_usd")
         failure_kind = result.get("failure_kind")
-        usage_status = ("REVIEW_COMPLETED" if result.get("report_valid") is True else
+        usage_status = ("RESERVATION_RELEASED" if not process.get("invocation_attempted_at") else
+                        "REVIEW_COMPLETED" if result.get("report_valid") is True else
                         "REVIEW_REJECTED" if failure_kind == "invalid_reviewer_report" else "INVOCATION_FAILED")
         persisted_use.update({"invocation_attempted": bool(process.get("invocation_attempted_at")),
             "status": usage_status,
@@ -3506,6 +3824,7 @@ class Orchestrator:
             "model": process.get("model"), "usage": process.get("usage"), "cost_usd": process.get("cost_usd"),
         })
         self._save()
+        self._sync_process_evidence(increment)
         if not result.get("report_valid"):
             return None
         findings = result["report"]["findings"]
@@ -3513,10 +3832,90 @@ class Orchestrator:
             finalized = claude.finalize_review_cycle(completed_cycle)
             self.state = claude.apply_review_cycle_to_workflow_state(self.state, finalized)
             self._save()
+            self._sync_process_evidence(increment)
             return result["report"] if finalized["status"] == "complete" else None
         if not findings:
             return result["report"]
         return self._correct_and_reverify(plan, increment, result["report"], completed_cycle)
+
+    def _remove_ohpen_finder_metadata(self, increment: dict[str, Any]) -> dict[str, Any]:
+        if (self.workflow_id != OHPEN_RECOVERY_WORKFLOW_ID or
+                not _contained(OHPEN_FINDER_METADATA_PATH, increment.get("code_paths", [])) or
+                not _contained(OHPEN_FINDER_METADATA_PATH, increment.get("revision_paths", []))):
+            raise OrchestratorError("The metadata removal is outside the exact authorized Ohpen product scope")
+        orchestration = self.state["orchestration"]
+        removals = orchestration.setdefault("metadata_removals", [])
+        prior = [row for row in removals if isinstance(row, dict) and row.get("path") == OHPEN_FINDER_METADATA_PATH]
+        if len(prior) > 1:
+            raise OrchestratorError("Workflow state contains duplicate Finder metadata removal records")
+        record = prior[0] if prior else None
+        source = self.target / OHPEN_FINDER_METADATA_PATH
+        if record is not None and record.get("status") == "removed":
+            if source.exists() or source.is_symlink():
+                raise OrchestratorError("Previously removed Finder metadata reappeared; it remains protected")
+            return record
+        if record is not None and not (record.get("status") == "preserved_pending_removal" and
+                                       not source.exists() and not source.is_symlink()):
+            raise OrchestratorError("Existing Finder metadata removal record cannot be safely resumed")
+        if source.exists() or source.is_symlink():
+            if source.is_symlink() or not source.is_file() or _index_has_path(self.target, OHPEN_FINDER_METADATA_PATH):
+                raise OrchestratorError("Tracked, staged, linked, or non-regular src/.DS_Store remains protected")
+            payload = source.read_bytes()
+            if not payload.startswith(OHPEN_FINDER_METADATA_SIGNATURE):
+                raise OrchestratorError("src/.DS_Store does not have the confirmed Finder metadata signature")
+            digest = _sha(payload)
+            if record is not None and record.get("sha256") != digest:
+                raise OrchestratorError("src/.DS_Store differs from the preserved removal intent")
+            if record is None:
+                artifact_reference = f"{self.store.directory}/evidence/src-ds-store-original.json"
+                if (self.target / artifact_reference).exists():
+                    raise OrchestratorError("An unrecorded Finder metadata archive already exists")
+                self.store.write(artifact_reference, {
+                    "path": OHPEN_FINDER_METADATA_PATH, "sha256": digest, "size_bytes": len(payload),
+                    "content_base64": base64.b64encode(payload).decode("ascii"),
+                    "reason": OHPEN_FINDER_METADATA_REASON, "preserved_at": _now(),
+                })
+                if artifact_reference not in self.state["artifact_references"]:
+                    self.state["artifact_references"].append(artifact_reference)
+                record = {
+                    "path": OHPEN_FINDER_METADATA_PATH, "sha256": digest,
+                    "artifact_reference": artifact_reference, "reason": OHPEN_FINDER_METADATA_REASON,
+                    "status": "preserved_pending_removal", "preserved_at": _now(), "removed_at": None,
+                    "operation_evidence": None,
+                }
+                removals.append(record)
+                self._save()
+            with tempfile.TemporaryDirectory(prefix="harness-finder-removal-scope-") as temp:
+                config_path = self.store._config(Path(temp), self.target, OHPEN_FINDER_METADATA_PATH,
+                                                 classification="code")
+                evidence = remove_ohpen_finder_metadata(
+                    self.target, config_path, OHPEN_FINDER_METADATA_PATH,
+                    expected_sha256=digest, workflow_id=self.workflow_id)
+            record["operation_evidence"] = evidence
+        else:
+            if record is None:
+                raise OrchestratorError("src/.DS_Store disappeared without a preserved controller removal record")
+            record["reason"] = record.get("reason", OHPEN_FINDER_METADATA_REASON) + (
+                " The source path was absent on retry after the controller had preserved its removal intent.")
+        record["status"] = "removed"
+        record["removed_at"] = _now()
+        self._save()
+        return record
+
+    def _controller_finding_decision(self, finding: dict[str, Any],
+                                     increment: dict[str, Any]) -> dict[str, Any] | None:
+        if finding.get("file") == PROCESS_EVIDENCE_PATH:
+            if not _contained(PROCESS_EVIDENCE_PATH, increment.get("artifact_paths", [])):
+                raise OrchestratorError("Claude process-evidence finding is outside controller-managed artifact scope")
+            return {"finding_id": finding["id"], "decision": "ACCEPT",
+                "reason": "Controller-owned process evidence is archived and regenerated from persisted workflow records; Codex is not asked to edit it.",
+                "evidence_references": []}
+        if finding.get("file") == OHPEN_FINDER_METADATA_PATH:
+            removal = self._remove_ohpen_finder_metadata(increment)
+            return {"finding_id": finding["id"], "decision": "ACCEPT",
+                "reason": f"The controller preserved and removed the confirmed untracked Finder metadata; evidence: {removal['artifact_reference']}.",
+                "evidence_references": []}
+        return None
 
     def _correct_and_reverify(self, plan: dict[str, Any], increment: dict[str, Any],
                               report: dict[str, Any], cycle: dict[str, Any]) -> dict[str, Any] | None:
@@ -3532,23 +3931,35 @@ class Orchestrator:
             return None
         orchestration["iteration"] += 1
         self._set_stage("CORRECTION", "CORRECTION")
-        with tempfile.TemporaryDirectory(prefix="orchestrator-correction-runtime-") as temp:
-            runtime = Path(temp).resolve()
-            runtime_manifest = _runtime_bundle_files(runtime)
-            correction_context = self._implementation_context(plan, increment)
-            correction_context.update({"findings": report["findings"],
-                "instruction": "Triage every finding as ACCEPT, REJECT, or DEFER. Fix every accepted finding within the same allowlist; use DIFF:path evidence for rejected findings. Do not change requirements."})
-            result = self._run_codex("CORRECTION", correction_context,
-                runtime, "orchestrator-stage-result.schema.json", sandbox="read-only")
-            if not _runtime_bundle_unchanged(runtime, runtime_manifest):
-                raise OrchestratorError("Ephemeral harness tool snapshot changed during correction")
+        controller_decisions = []
+        codex_findings = []
+        for finding in report["findings"]:
+            decision = self._controller_finding_decision(finding, increment)
+            if decision is None:
+                codex_findings.append(finding)
+            else:
+                controller_decisions.append(decision)
+        if codex_findings:
+            with tempfile.TemporaryDirectory(prefix="orchestrator-correction-runtime-") as temp:
+                runtime = Path(temp).resolve()
+                runtime_manifest = _runtime_bundle_files(runtime)
+                correction_context = self._implementation_context(plan, increment)
+                correction_context.update({"findings": codex_findings,
+                    "instruction": "Triage each supplied finding as ACCEPT, REJECT, or DEFER. Fix every accepted finding within the same allowlist; use DIFF:path evidence for rejected findings. Controller-managed findings have already been resolved and are intentionally omitted. Do not change requirements."})
+                result = self._run_codex("CORRECTION", correction_context,
+                    runtime, "orchestrator-stage-result.schema.json", sandbox="read-only")
+                if not _runtime_bundle_unchanged(runtime, runtime_manifest):
+                    raise OrchestratorError("Ephemeral harness tool snapshot changed during correction")
+        else:
+            result = {"status": "COMPLETED", "summary": "All findings were resolved by controller-managed actions.",
+                      "changes": [], "finding_decisions": []}
         _stage_valid(result, correction=True)
         if result["status"] != "COMPLETED":
             raise OrchestratorError(result.get("summary", "Codex correction did not complete"))
         decisions = result.get("finding_decisions")
-        if not isinstance(decisions, list) or {row.get("finding_id") for row in decisions} != {f["id"] for f in report["findings"]}:
-            raise OrchestratorError("Codex correction must decide every Claude finding exactly once")
-        if len(decisions) != len(report["findings"]):
+        if not isinstance(decisions, list) or {row.get("finding_id") for row in decisions} != {f["id"] for f in codex_findings}:
+            raise OrchestratorError("Codex correction must decide every Codex-assigned Claude finding exactly once")
+        if len(decisions) != len(codex_findings):
             raise OrchestratorError("Codex correction returned duplicate finding decisions")
         if any(row["decision"] == "DEFER" for row in decisions):
             self.state["status"] = "WAITING_FOR_HUMAN"
@@ -3568,6 +3979,7 @@ class Orchestrator:
             })
             self._save()
             return None
+        decisions = controller_decisions + decisions
         self._apply_changes(result.get("changes"), increment)
         with tempfile.TemporaryDirectory(prefix="orchestrator-correction-self-review-") as temp:
             runtime = Path(temp).resolve()
@@ -3613,6 +4025,7 @@ class Orchestrator:
                 "material_disagreement": False})
         self.state = claude.apply_review_cycle_to_workflow_state(self.state, cycle)
         self._save()
+        self._sync_process_evidence(increment)
         # Follow-up consumes the sole remaining round and reuses the same target/increment cycle.
         return self._review_increment(plan, increment, current_manifest_id, cycle=cycle,
             previous_findings=report["findings"], prior_decisions=decision_rows)

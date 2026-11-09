@@ -15,6 +15,7 @@ import os
 import re
 import secrets
 import stat
+import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -257,6 +258,76 @@ def _open_existing(parent_fd: int, name: str) -> tuple[int, os.stat_result, str]
     except BaseException:
         os.close(fd)
         raise
+
+
+def remove_ohpen_finder_metadata(target: str | Path, config_path: str | Path,
+                                 relative_path: str, *, expected_sha256: str,
+                                 workflow_id: str) -> dict[str, Any]:
+    """Remove only the explicitly authorized Ohpen src/.DS_Store metadata file."""
+    exact_path = "src/.DS_Store"
+    if workflow_id != "migration-jobs-api-harness-v2" or relative_path != exact_path:
+        raise SafeWriteError("Finder metadata removal is limited to the exact Ohpen workflow path")
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        raise SafeWriteError("expected_sha256 must be a lowercase SHA-256 digest")
+    root, config_file, relative, report, config_digest = _prepare_preflight(
+        target, config_path, relative_path
+    )
+    parts = tuple(PurePosixPath(relative).parts)
+    parent_parts, name = parts[:-1], parts[-1]
+    root_fd, parent_fd = _open_root_and_parent(root, parent_parts)
+    file_fd: int | None = None
+    try:
+        _verify_parent_still_named(root, parent_parts, root_fd, parent_fd)
+        file_fd, original_info, digest = _open_existing(parent_fd, name)
+        signature = os.pread(file_fd, 8, 0)
+        if signature != b"\x00\x00\x00\x01Bud1":
+            raise SafeWriteError("The exact src/.DS_Store path is not confirmed Finder metadata")
+        if digest != expected_sha256:
+            raise SafeWriteError("Finder metadata content differs from its recorded fingerprint")
+
+        def is_indexed() -> bool:
+            env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+            env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                        "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"})
+            result = subprocess.run(
+                ["git", "-c", "core.fsmonitor=false", "-C", str(root),
+                 "ls-files", "--error-unmatch", "--", exact_path],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, check=False,
+            )
+            if result.returncode not in {0, 1}:
+                raise SafeWriteError("Could not safely determine whether Finder metadata is tracked or staged")
+            return result.returncode == 0
+
+        if is_indexed():
+            raise SafeWriteError("Tracked or staged Finder metadata remains protected")
+        _assert_config_unchanged(config_file, config_digest)
+        _verify_parent_still_named(root, parent_parts, root_fd, parent_fd)
+        current_entry = _stat_destination(parent_fd, name)
+        current_info = os.fstat(file_fd)
+        current_digest = _sha256_fd(file_fd)
+        if (_identity(current_entry) != _identity(original_info) or
+                _identity(current_info) != _identity(original_info) or
+                current_digest != expected_sha256 or is_indexed()):
+            raise SafeWriteError("Finder metadata identity, index status, or content changed before removal")
+        os.unlink(name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        try:
+            _stat_destination(parent_fd, name)
+        except FileNotFoundError:
+            pass
+        else:
+            raise SafeWriteError("Finder metadata removal completed but the path remains present")
+        evidence = _evidence_context(root, config_digest, report, root_fd, parent_fd)
+        return {**evidence, "operation": "remove_ohpen_finder_metadata", "path": exact_path,
+                "before_sha256": digest, "device": original_info.st_dev,
+                "inode": original_info.st_ino, "link_count": original_info.st_nlink,
+                "mode": stat.S_IMODE(original_info.st_mode)}
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        if parent_fd != root_fd:
+            os.close(parent_fd)
+        os.close(root_fd)
 
 
 def create_file(target: str | Path, config_path: str | Path, relative_path: str,

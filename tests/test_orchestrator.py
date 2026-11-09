@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import subprocess
@@ -171,6 +172,52 @@ class OrchestratorTests(unittest.TestCase):
             "acceptance_criteria_ids": ["AC-1"], "validation_ids": ["tests"]}
         return target, runner, plan(increments=[increment]), increment
 
+    def test_process_evidence_refresh_archives_prior_narrative_and_keeps_review_revision_stable(self):
+        target, runner, current_plan, increment = self.process_evidence_fixture("process-evidence-controller-owned")
+        before_revision, _, _ = runner._revision_manifest(increment)
+        original = (target / orchestrator.PROCESS_EVIDENCE_PATH).read_text(encoding="utf-8")
+        ready = {"overall_result": "READY", "target_path": str(target.resolve())}
+
+        with patch("safe_writer._run_preflight", return_value=ready):
+            runner._sync_process_evidence(increment)
+            refreshed = (target / orchestrator.PROCESS_EVIDENCE_PATH).read_text(encoding="utf-8")
+            archive_ref = runner.state["orchestration"]["process_evidence_archive"]["artifact_reference"]
+            archived = runner.store.read_json(archive_ref)
+            runner._sync_process_evidence(increment)
+
+        after_revision, _, _ = runner._revision_manifest(increment)
+        self.assertEqual(before_revision, after_revision)
+        self.assertIn("Controller-managed workflow evidence", refreshed)
+        self.assertNotIn("Prior process notes.", refreshed)
+        self.assertEqual(archived["content_utf8"], original)
+        self.assertEqual(archived["sha256"], orchestrator._sha(original.encode("utf-8")))
+        self.assertEqual(runner.state["artifact_references"].count(archive_ref), 1)
+        self.assertIn(archive_ref, (target / orchestrator.PROCESS_EVIDENCE_PATH).read_text(encoding="utf-8"))
+
+    def test_controller_resolves_only_confirmed_ohpen_finder_metadata_and_records_evidence(self):
+        finder = b"\x00\x00\x00\x01Bud1" + b"\x00" * 64
+        target, runner = self.new_git_workflow(
+            "ohpen-finder-metadata", workflow_id=orchestrator.OHPEN_RECOVERY_WORKFLOW_ID,
+            files={"src/.DS_Store": finder})
+        increment = {"increment_id": "req2-jobs-api", "code_paths": ["src"],
+            "artifact_paths": [".engineering/workflows/migration-jobs-api-harness-v2", "docs"],
+            "revision_paths": ["README.md", "docs", "src", "tests"]}
+        finding = {"id": "CR-3", "file": "src/.DS_Store"}
+        ready = {"overall_result": "READY", "target_path": str(target.resolve())}
+
+        with patch("safe_writer._run_preflight", return_value=ready):
+            decision = runner._controller_finding_decision(finding, increment)
+
+        self.assertEqual(decision["decision"], "ACCEPT")
+        self.assertFalse((target / "src/.DS_Store").exists())
+        removal = runner.state["orchestration"]["metadata_removals"][0]
+        self.assertEqual(removal["status"], "removed")
+        self.assertEqual(removal["sha256"], orchestrator._sha(finder))
+        saved = runner.store.read_json(removal["artifact_reference"])
+        self.assertEqual(base64.b64decode(saved["content_base64"]), finder)
+        self.assertEqual(saved["reason"], orchestrator.OHPEN_FINDER_METADATA_REASON)
+        self.assertEqual(removal["operation_evidence"]["operation"], "remove_ohpen_finder_metadata")
+
     @staticmethod
     def self_review_response(decision="PASS", *, findings=None, changes=None, summary=None):
         return {"decision": decision, "summary": summary or f"Self-review {decision.lower()}.",
@@ -232,6 +279,23 @@ class OrchestratorTests(unittest.TestCase):
         self.assertTrue(self.runner._is_authorization_only_config_change({
             "config_sha256": orchestrator._sha(orchestrator._json_bytes(old_config))}))
 
+    def test_review_budget_and_authorization_update_preserves_existing_plan_scope(self):
+        old_auth = persistent_claude_authorization(self.target, max_budget_usd=0.01)
+        old_config = orchestrator.validate_config(config(
+            claude_budget_usd=0.01, review={"enabled": True, "authorization": old_auth}))
+        new_auth = copy.deepcopy(old_auth)
+        new_auth["max_budget_usd"] = 2.0
+        new_auth["authorization_reference"] = "conversation: explicit $2 review authorization"
+        self.runner.config = orchestrator.validate_config(config(
+            claude_budget_usd=2.0, review={"enabled": True, "authorization": new_auth}))
+
+        self.assertTrue(self.runner._is_authorization_only_config_change({"config_snapshot": old_config}))
+
+        planning_change = copy.deepcopy(self.runner.config)
+        planning_change["authorized_code_paths"] = ["src", "lib"]
+        self.runner.config = orchestrator.validate_config(planning_change)
+        self.assertFalse(self.runner._is_authorization_only_config_change({"config_snapshot": old_config}))
+
     def test_persisted_authorization_resolves_transfer_pause_without_authenticating_identity(self):
         old_config = self.runner.config
         auth = persistent_claude_authorization(self.target)
@@ -270,17 +334,106 @@ class OrchestratorTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(accepted["authorization_id"], auth["authorization_id"])
         self.assertEqual(remaining, 2.0)
+        self.assertEqual(self.runner._claude_total_budget(auth), 2.0)
         _auth, _remaining, denied = self.runner._persistent_claude_authorization(["private/other.txt"])
         self.assertIn("outside the persistent Claude authorization", denied)
         self.runner.state["orchestration"]["claude_authorization_uses"].append({
             "authorization_id": auth["authorization_id"], "status": "REVIEW_COMPLETED",
-            "invocation_attempted": True, "cost_usd": 0.75})
+            "invocation_attempted": True, "cost_usd": 0.334493})
         _auth, remaining, error = self.runner._persistent_claude_authorization(["src/module.cs"])
         self.assertIsNone(error)
-        self.assertEqual(remaining, 1.25)
+        self.assertAlmostEqual(remaining, 1.665507)
+        self.assertEqual(self.runner._claude_total_budget(auth), 2.0)
         self.runner.state["orchestration"]["claude_authorization_uses"][0]["cost_usd"] = None
         _auth, _remaining, denied = self.runner._persistent_claude_authorization(["src/module.cs"])
         self.assertIn("unknown cost", denied)
+
+    def test_claude_authorization_use_ids_are_unique_per_round_and_attempt(self):
+        first = orchestrator._claude_authorization_use_id("review-inc-1-1", 1, 1, set())
+        retry = orchestrator._claude_authorization_use_id("review-inc-1-1", 1, 2, {first})
+        second_round = orchestrator._claude_authorization_use_id("review-inc-1-2", 2, 1, {first, retry})
+        duplicate_reservation = orchestrator._claude_authorization_use_id(
+            "review-inc-1-1", 1, 1, {first, retry, second_round})
+        self.assertEqual(len({first, retry, second_round, duplicate_reservation}), 4)
+
+    def test_legacy_duplicate_reservation_and_missing_attempt_cost_reconcile_append_only(self):
+        authorization = persistent_claude_authorization(
+            self.target, authorization_id="AUTH-OHPEN-AILY-20261109", max_budget_usd=2.0)
+        self.runner.config = orchestrator.validate_config(config(
+            claude_budget_usd=2.0, review={"enabled": True, "authorization": authorization}))
+        cycle_id = "cycle-ohpen"
+        review_id = "review-inc-1-1"
+        revision = "content:" + "a" * 64
+        completed_use = {
+            "use_id": f"{review_id}-use", "authorization_id": authorization["authorization_id"],
+            "review_id": review_id, "review_cycle_id": cycle_id, "increment_id": "inc-1",
+            "revision_id": revision, "permitted_paths": ["src/feature.py"], "mode": "read_only",
+            "budget_limit_usd": 2.0, "invocation_attempted": True, "status": "REVIEW_COMPLETED",
+            "started_at": orchestrator._now(), "finished_at": orchestrator._now(),
+            "invocation_id": None, "session_identity": None, "duration_ms": 10, "model": None,
+            "usage": {}, "cost_usd": 0.3821072,
+        }
+        stale_reservation = copy.deepcopy(completed_use)
+        stale_reservation.update({"invocation_attempted": False, "status": "reserved",
+            "finished_at": None, "cost_usd": None, "usage": None, "duration_ms": None})
+        self.runner.state = {
+            "claude_review_cycles": [{"cycle_id": cycle_id, "increment_id": "inc-1", "round_count": 1,
+                "rounds": [{"round_number": 1, "invocation_attempts": [
+                    {"attempt_number": 1, "invocation_attempted_at": orchestrator._now(),
+                     "target_revision_id": revision, "response_metadata": {"cost_usd": 0.334493}},
+                    {"attempt_number": 2, "invocation_attempted_at": orchestrator._now(),
+                     "target_revision_id": revision, "response_metadata": {"cost_usd": 0.3821072}},
+                ]}]}],
+            "orchestration": {
+                "claude_authorization": authorization,
+                "claude_authorization_uses": [completed_use, stale_reservation],
+                "review_results": [
+                    {"increment_id": "inc-1", "revision_id": revision, "cost_usd": 0.334493},
+                    {"increment_id": "inc-1", "revision_id": revision, "cost_usd": 0.3821072},
+                ],
+            },
+        }
+        self.runner._save = lambda: None
+        original_uses = copy.deepcopy(self.runner.state["orchestration"]["claude_authorization_uses"])
+
+        _auth, remaining, error = self.runner._persistent_claude_authorization(["src/feature.py"])
+        self.assertIsNone(error)
+        self.assertAlmostEqual(remaining, 1.2833998)
+        self.assertEqual(self.runner.state["orchestration"]["claude_authorization_uses"], original_uses)
+        events = self.runner.state["orchestration"]["claude_authorization_use_reconciliations"]
+        self.assertEqual({event["action"] for event in events},
+                         {"reservation_released", "invocation_cost_reconciled"})
+        self.assertAlmostEqual(sum(event["cost_usd"] or 0 for event in events), 0.334493)
+        historical_invocation = next(event for event in events if event["action"] == "invocation_cost_reconciled")
+        self.assertTrue(historical_invocation["use_id"].startswith("legacy-use-"))
+
+        _auth, remaining_again, error_again = self.runner._persistent_claude_authorization(["src/feature.py"])
+        self.assertIsNone(error_again)
+        self.assertAlmostEqual(remaining_again, remaining)
+        self.assertEqual(len(self.runner.state["orchestration"]["claude_authorization_use_reconciliations"]), 2)
+
+    def test_authorized_ohpen_correction_deferral_is_resolved_with_auditable_user_source(self):
+        decision = {"decision_id": "CLAUDE-FINDING-DECISION", "workflow_id": self.flow,
+            "decision_category": "unclassified_human_decision", "status": "open",
+            "reason": "Codex could not safely determine or correct this issue within the authorized scope.",
+            "response_history": []}
+        self.runner.workflow_id = orchestrator.OHPEN_RECOVERY_WORKFLOW_ID
+        self.runner.state = {
+            "status": "WAITING_FOR_HUMAN", "phase": "CORRECTION", "workflow_id": self.runner.workflow_id,
+            "pending_decisions": [decision],
+            "claude_review_cycles": [{"increment_id": "req2-jobs-api", "rounds": [
+                {"status": "completed", "finding_ids": ["CR-1", "CR-2", "CR-3", "CR-4", "CR-5"]}]}],
+            "orchestration": {"current_stage": "CORRECTION", "current_increment_id": "req2-jobs-api"},
+        }
+        self.runner._save = lambda: None
+
+        self.runner._resolve_authorized_ohpen_correction_deferral()
+
+        self.assertEqual(self.runner.state["status"], "ACTIVE")
+        self.assertEqual(decision["status"], "resolved")
+        self.assertEqual(decision["response_history"][0]["source_reference"],
+                         orchestrator.OHPEN_CORRECTION_RESUME_SOURCE)
+        self.assertEqual(decision["response_history"][0]["identity_assurance"], "declared")
 
     def test_validation_command_policy_rejects_shells_and_implicit_restore(self):
         with self.assertRaisesRegex(orchestrator.OrchestratorError, "prohibited"):
@@ -565,8 +718,14 @@ class OrchestratorTests(unittest.TestCase):
         changed_config = config(branch="feature/task", claude_budget_usd=1.0)
         resumed = orchestrator.Orchestrator(str(target), "Add the requested backend behavior.",
             changed_config, "flow-initialize")
+        resumed.initialize()
+        self.assertEqual(resumed.state["orchestration"]["config_snapshot"]["claude_budget_usd"], 1.0)
+        changed_planning_config = config(branch="feature/task", claude_budget_usd=1.0,
+            validations=[{"id": "other-tests", "argv": ["python3", "-m", "unittest", "tests.test_other"]}])
+        planning_update = orchestrator.Orchestrator(str(target), "Add the requested backend behavior.",
+            changed_planning_config, "flow-initialize")
         with self.assertRaisesRegex(orchestrator.OrchestratorError, "configuration changed"):
-            resumed.initialize()
+            planning_update.initialize()
         changed_task = orchestrator.Orchestrator(str(target), "A materially revised task.",
             config(branch="feature/task"), "flow-initialize")
         with self.assertRaisesRegex(orchestrator.OrchestratorError, "different task text"):
@@ -1049,6 +1208,89 @@ class OrchestratorTests(unittest.TestCase):
                                     "Stored plan does not match the current requirement/configuration version"):
             self.runner._read_plan(plan_path)
 
+    def _recorded_legacy_plan_fixture(self, *, current_task="Add a feature", saved_config_sha=None,
+                                      requirement_config_sha=None):
+        historical_config = orchestrator.validate_config(config(claude_budget_usd=0.01))
+        original_config_sha = orchestrator._legacy_plan_config_sha256(historical_config)
+        auth = persistent_claude_authorization(self.target, authorization_id="AUTH-HISTORICAL-PLAN",
+                                               max_budget_usd=2.0)
+        current_config = orchestrator.validate_config(config(
+            claude_budget_usd=2.0, review={"enabled": True, "authorization": auth}))
+        self.runner.config = current_config
+
+        requirement_reference = f"{self.runner.store.directory}/requirements-v2.json"
+        plan_reference = f"{self.runner.store.directory}/plan-v2.json"
+        requirement_path = self.target / requirement_reference
+        plan_path = self.target / plan_reference
+        requirement_path.parent.mkdir(parents=True, exist_ok=True)
+        current_task_sha = orchestrator._sha(current_task.encode())
+        original_task_sha = orchestrator._sha(b"Add a feature")
+        requirement_path.write_text(json.dumps({
+            "workflow_id": self.flow, "version": 2, "task": current_task,
+            "task_sha256": current_task_sha,
+            "configuration_sha256": requirement_config_sha or original_config_sha,
+        }), encoding="utf-8")
+        plan_path.write_text(json.dumps({
+            "artifact_schema_version": 1, "requirement_version": 2,
+            "task_sha256": original_task_sha,
+            "config_sha256": saved_config_sha or original_config_sha,
+            "plan": plan(),
+        }), encoding="utf-8")
+        self.runner.state = {
+            "workflow_id": self.flow,
+            "artifact_references": [requirement_reference],
+            "orchestration": {
+                "current_requirement_version": 2,
+                "task_sha256": current_task_sha,
+                "config_sha256": orchestrator._sha(orchestrator._json_bytes(current_config)),
+                "requirement_history": [{
+                    "version": 2, "task_reference": requirement_reference,
+                    "task_sha256": current_task_sha, "status": "current",
+                }],
+                "claude_authorization": auth,
+                "claude_authorization_uses": [{
+                    "authorization_id": auth["authorization_id"],
+                    "invocation_attempted": True, "status": "INVOCATION_FAILED",
+                    "budget_limit_usd": 0.01, "cost_usd": 0.334493,
+                }],
+            },
+        }
+        return plan_reference, original_config_sha
+
+    def test_recorded_legacy_ohpen_plan_survives_review_budget_and_authorization_changes(self):
+        plan_reference, original_config_sha = self._recorded_legacy_plan_fixture()
+
+        recovered = self.runner._read_plan(plan_reference)
+
+        self.assertEqual(recovered, plan())
+        self.assertEqual(json.loads((self.target / self.runner.store.directory / "requirements-v2.json").read_text(
+            encoding="utf-8"))["configuration_sha256"], original_config_sha)
+        self.assertEqual(self.runner.config["claude_budget_usd"], 2.0)
+
+    def test_recorded_legacy_plan_rejects_planning_config_and_requirement_changes(self):
+        plan_reference, _original_config_sha = self._recorded_legacy_plan_fixture()
+        changed_config = copy.deepcopy(self.runner.config)
+        changed_config["validations"] = [{
+            "id": "different-tests", "argv": ["python3", "-m", "unittest", "tests.test_other"],
+        }]
+        self.runner.config = orchestrator.validate_config(changed_config)
+        with self.subTest(change="planning configuration"), self.assertRaisesRegex(
+                orchestrator.OrchestratorError, "Stored plan does not match"):
+            self.runner._read_plan(plan_reference)
+
+        plan_reference, _original_config_sha = self._recorded_legacy_plan_fixture(current_task="A changed feature")
+        with self.subTest(change="requirements"), self.assertRaisesRegex(
+                orchestrator.OrchestratorError, "Stored plan does not match"):
+            self.runner._read_plan(plan_reference)
+
+    def test_recorded_legacy_plan_rejects_unknown_or_unrelated_fingerprints(self):
+        for saved_sha, requirement_sha in [("f" * 64, None), ("e" * 64, "e" * 64)]:
+            with self.subTest(saved_sha=saved_sha[:8]):
+                plan_reference, _original_config_sha = self._recorded_legacy_plan_fixture(
+                    saved_config_sha=saved_sha, requirement_config_sha=requirement_sha)
+                with self.assertRaisesRegex(orchestrator.OrchestratorError, "Stored plan does not match"):
+                    self.runner._read_plan(plan_reference)
+
     def test_self_review_corrects_findings_and_requires_a_passing_followup(self):
         increment = plan()["increments"][0]
         self.runner.state = {"scope": {"increment_id": "inc-1", "included_paths": ["src"]},
@@ -1320,7 +1562,9 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(self.runner.state["claude_review_cycles"][0]["round_count"], 0)
         use = self.runner.state["orchestration"]["claude_authorization_uses"][0]
         self.assertEqual(use["authorization_id"], authorization["authorization_id"])
+        self.assertEqual(use["use_id"], "review-inc-1-1-round-1-attempt-1-use")
         self.assertFalse(use["invocation_attempted"])
+        self.assertEqual(use["status"], "RESERVATION_RELEASED")
 
     def test_review_gate_dispatches_claude_automatically_after_validated_increment(self):
         revision_id = "content:" + "d" * 64
@@ -1346,6 +1590,10 @@ class OrchestratorTests(unittest.TestCase):
 
         finding = {"id": "CF-1", "severity": "medium", "file": "src/feature.txt",
                    "description": "A defect needs correction.", "recommendation": "Correct it."}
+        managed_process = {"id": "CF-2", "severity": "medium", "file": orchestrator.PROCESS_EVIDENCE_PATH,
+                   "description": "Controller process evidence is stale.", "recommendation": "Refresh from records."}
+        managed_metadata = {"id": "CF-3", "severity": "low", "file": orchestrator.OHPEN_FINDER_METADATA_PATH,
+                   "description": "Confirmed Finder metadata is in the product tree.", "recommendation": "Remove the metadata."}
         old_revision = "content:" + "1" * 64
         new_revision = "content:" + "2" * 64
         cycle = claude_reviewer.new_review_cycle(
@@ -1357,10 +1605,11 @@ class OrchestratorTests(unittest.TestCase):
                                                      verification_evidence_references=["VAL-OLD"])
         cycle["rounds"][0].update({"status": "completed", "outcome": "REVIEW_COMPLETED",
             "report_valid": True, "envelope_valid": True, "reviewer_status": "CHANGES_REQUESTED",
-            "finding_ids": ["CF-1"], "report_reference": ".engineering/reports/first.json"})
+            "finding_ids": ["CF-1", "CF-2", "CF-3"], "report_reference": ".engineering/reports/first.json"})
         cycle["round_count"] = 1
         cycle["status"] = "finding_analysis_pending"
-        report = {"decision": "CHANGES_REQUESTED", "summary": "One issue found.", "findings": [finding]}
+        report = {"decision": "CHANGES_REQUESTED", "summary": "Three issues found.",
+                  "findings": [finding, managed_process, managed_metadata]}
         self.runner.state = {
             "status": "ACTIVE", "phase": "INDEPENDENT_VERIFICATION", "updated_at": "",
             "workflow_id": self.flow, "scope": {}, "artifact_references": [],
@@ -1395,29 +1644,41 @@ class OrchestratorTests(unittest.TestCase):
         def run_correction(_stage, _context, runtime, _schema, **_kwargs):
             observed_runtime["path"] = runtime
             self.assertTrue((runtime / "runtime-marker.txt").is_file())
+            captured["codex_finding_ids"] = [item["id"] for item in _context["findings"]]
             return corrected
 
         def prepare_runtime(destination):
             (destination / "runtime-marker.txt").write_text("policy snapshot", encoding="utf-8")
             return {"runtime-marker.txt": "marker-hash"}
 
+        controller_decisions = {
+            "CF-2": {"finding_id": "CF-2", "decision": "ACCEPT", "reason": "Controller refreshed evidence.", "evidence_references": []},
+            "CF-3": {"finding_id": "CF-3", "decision": "ACCEPT", "reason": "Controller removed confirmed metadata.", "evidence_references": []},
+        }
         with patch("orchestrator._runtime_bundle_files", side_effect=prepare_runtime), \
              patch("orchestrator._runtime_bundle_unchanged", return_value=True), \
              patch.object(self.runner, "_run_codex", side_effect=run_correction), \
+             patch.object(self.runner, "_controller_finding_decision",
+                          side_effect=lambda item, _increment: controller_decisions.get(item["id"])), \
              patch.object(self.runner, "_apply_changes"), \
              patch.object(self.runner, "_self_review"), \
              patch.object(self.runner, "_revision_manifest", return_value=(new_revision, {"revision_id": new_revision}, ".engineering/workflows/flow-test-1/revision-manifest-inc-1.json")), \
              patch.object(self.runner.store, "write", return_value={}), \
              patch.object(self.runner, "_validate", side_effect=validate), \
              patch.object(self.runner, "_finalize_revision", return_value=new_revision), \
+             patch.object(self.runner, "_sync_process_evidence"), \
              patch.object(self.runner, "_review_increment", side_effect=followup_review):
-            result = self.runner._correct_and_reverify(plan(), plan()["increments"][0], report, cycle)
+            correction_increment = {**plan()["increments"][0], "artifact_paths": ["docs"]}
+            result = self.runner._correct_and_reverify(plan(), correction_increment, report, cycle)
         self.assertEqual(result, followup)
+        self.assertEqual(captured["codex_finding_ids"], ["CF-1"])
         self.assertTrue(observed_runtime["path"].is_absolute())
         self.assertEqual(captured["revision_id"], new_revision)
-        self.assertEqual(captured["previous_findings"], [finding])
-        self.assertEqual(captured["prior_decisions"][0]["decision"], "ACCEPT")
-        self.assertEqual(captured["prior_decisions"][0]["resolution_evidence_references"], ["VAL-NEW"])
+        self.assertEqual(captured["previous_findings"], [finding, managed_process, managed_metadata])
+        self.assertEqual({row["finding_id"] for row in captured["prior_decisions"]}, {"CF-1", "CF-2", "CF-3"})
+        self.assertTrue(all(row["decision"] == "ACCEPT" for row in captured["prior_decisions"]))
+        self.assertTrue(all(row["resolution_evidence_references"] == ["VAL-NEW"]
+                            for row in captured["prior_decisions"]))
 
     def test_multiple_increments_are_controlled_by_the_orchestrator(self):
         increments = plan()["increments"] + [{
