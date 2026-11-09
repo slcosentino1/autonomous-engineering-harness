@@ -112,6 +112,53 @@
       "required": ["version", "task_sha256", "config_sha256", "branch", "current_stage", "max_iterations", "iteration", "current_increment_id", "plan_reference", "increments", "attempts", "validation_results", "review_results", "correction_status", "preexisting_hashes", "commit_authorization_fingerprint", "current_requirement_version", "requirement_history", "invalidations", "self_reviews"],
       "properties": {
         "version": {"const": 1},
+        "snapshot_policy": {"const": "untracked_ds_store_v1"},
+        "snapshot_migrations": {"type": "array", "maxItems": 1, "items": {
+          "type": "object", "additionalProperties": false,
+          "required": ["migration_id", "policy_id", "path", "old_sha256", "current_sha256", "reason", "recorded_at", "original_bytes_recovered", "original_bytes_note", "authorization_id"],
+          "properties": {
+            "migration_id": {"const": "untracked_ds_store_root_v1"},
+            "policy_id": {"const": "untracked_ds_store_v1"},
+            "path": {"const": ".DS_Store"},
+            "old_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+            "current_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+            "reason": {"type": "string", "minLength": 1},
+            "recorded_at": {"type": "string", "format": "date-time"},
+            "original_bytes_recovered": {"const": false},
+            "original_bytes_note": {"type": "string", "minLength": 1},
+            "authorization_id": {"type": "string", "minLength": 1}
+          }
+        }},
+        "process_evidence": {"type": "object", "additionalProperties": false,
+          "required": ["path", "sha256", "updated_at", "attempt_count", "self_review_count", "validation_count"],
+          "properties": {
+            "path": {"const": "docs/ai-process.md"},
+            "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+            "updated_at": {"type": "string", "format": "date-time"},
+            "attempt_count": {"type": "integer", "minimum": 0},
+            "self_review_count": {"type": "integer", "minimum": 0},
+            "validation_count": {"type": "integer", "minimum": 0}
+          }},
+        "self_review_recovery_authorizations": {"type": "array", "maxItems": 1, "items": {
+          "type": "object", "additionalProperties": false,
+          "required": ["authorization_id", "operation", "target_id", "workflow_id", "stage", "blocker_sha256", "reason", "source_reference", "authorizer_identity", "identity_assurance", "authorized_at", "status", "consumed_at", "resume_attempt_number"],
+          "properties": {
+            "authorization_id": {"type": "string", "minLength": 1},
+            "operation": {"const": "resume_blocked_self_review_once"},
+            "target_id": {"type": "string", "minLength": 1},
+            "workflow_id": {"const": "migration-jobs-api-harness-v2"},
+            "stage": {"const": "SELF_REVIEW"},
+            "blocker_sha256": {"const": "158828cddd275fb5eae34934810e3ea88653d311ee0c446b61bea663aa4ee6e9"},
+            "reason": {"type": "string", "minLength": 1},
+            "source_reference": {"type": "string", "minLength": 1},
+            "authorizer_identity": {"type": "string", "minLength": 1},
+            "identity_assurance": {"const": "declared"},
+            "authorized_at": {"type": "string", "format": "date-time"},
+            "status": {"enum": ["authorized", "consumed"]},
+            "consumed_at": {"type": ["string", "null"], "format": "date-time"},
+            "resume_attempt_number": {"type": ["integer", "null"], "minimum": 1}
+          }
+        }},
         "task_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
         "config_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
         "branch": {"type": "string", "minLength": 1},
@@ -150,9 +197,31 @@
             "exit_code": {"type": "integer"}, "duration_ms": {"type": "integer", "minimum": 0},
             "result_sha256": {"type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"},
             "blocker_sha256": {"type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"},
-            "resume_basis": {"enum": ["corrected_validation_revision"]},
+            "resume_basis": {"enum": ["corrected_validation_revision", "changed_execution_context", "authorized_self_review_recovery"]},
+            "recovery_authorization_id": {"type": "string", "minLength": 1},
             "previous_revision_id": {"type": "string", "pattern": "^content:[a-f0-9]{64}$"},
             "current_revision_id": {"type": "string", "pattern": "^content:[a-f0-9]{64}$"},
+            "recovery_context_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+            "recovery_context": {"type": "object", "additionalProperties": false,
+              "required": ["workflow_id", "stage", "blocker_sha256", "requirement_version", "task_sha256", "config_sha256", "target_baseline_commit", "revision_id", "harness_orchestrator_sha256", "runtime_bundle_sha256", "codex"],
+              "properties": {
+                "workflow_id": {"type": "string", "minLength": 1},
+                "stage": {"type": ["string", "null"]},
+                "blocker_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+                "requirement_version": {"type": "integer", "minimum": 1},
+                "task_sha256": {"type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"},
+                "config_sha256": {"type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"},
+                "target_baseline_commit": {"type": ["string", "null"]},
+                "revision_id": {"type": ["string", "null"], "pattern": "^content:[a-f0-9]{64}$"},
+                "harness_orchestrator_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+                "runtime_bundle_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+                "codex": {"type": "object", "additionalProperties": false,
+                  "required": ["cli_version", "model", "provider", "python_runtime"],
+                  "properties": {
+                    "cli_version": {"type": "string"}, "model": {"type": "string"},
+                    "provider": {"type": "string"}, "python_runtime": {"type": "string"}
+                  }}
+              }},
             "trace": {
               "type": "object", "additionalProperties": false,
               "properties": {
@@ -171,6 +240,7 @@
                 "python_runtime": {"type": "string", "maxLength": 64},
                 "prompt_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
                 "normalized_result_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+                "reviewed_revision_id": {"type": "string", "pattern": "^content:[a-f0-9]{64}$"},
                 "permissions": {"type": "object", "properties": {"sandbox": {"type": "string"}, "mcp": {"type": "string"}, "plugins": {"type": "string"}, "controller_applies_changes": {"type": "boolean"}, "write_scope": {"type": "object"}, "tool_inventory": {"type": "string", "maxLength": 200}}, "additionalProperties": false},
                 "capabilities": {
                   "type": "object", "additionalProperties": false,
@@ -201,7 +271,8 @@
                 "diagnostic": {"type": ["string", "null"], "maxLength": 3000},
                 "changed_paths": {"type": "array", "items": {"type": "string", "maxLength": 1000}},
                 "changed_content_sha256": {"type": "array", "items": {"type": "string", "pattern": "^[a-f0-9]{64}$"}},
-                "finding_count": {"type": "integer", "minimum": 0}
+                "finding_count": {"type": "integer", "minimum": 0},
+                "self_review_result": {"type": "object"}
               }
             }
           },
@@ -209,6 +280,14 @@
             {
               "if": {"properties": {"resume_basis": {"const": "corrected_validation_revision"}}, "required": ["resume_basis"]},
               "then": {"required": ["previous_revision_id", "current_revision_id"]}
+            },
+            {
+              "if": {"properties": {"resume_basis": {"const": "changed_execution_context"}}, "required": ["resume_basis"]},
+              "then": {"required": ["recovery_context_sha256", "recovery_context"]}
+            },
+            {
+              "if": {"properties": {"resume_basis": {"const": "authorized_self_review_recovery"}}, "required": ["resume_basis"]},
+              "then": {"required": ["recovery_context_sha256", "recovery_context", "recovery_authorization_id"]}
             }
           ]
         }},

@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import copy
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from io import StringIO
@@ -100,6 +101,91 @@ class OrchestratorTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def new_git_workflow(self, name, *, files=None, workflow_id=None):
+        target = Path(self.temp.name) / name
+        git_fixture(target)
+        (target / "src").mkdir()
+        for relative, content in (files or {}).items():
+            path = target / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        flow = workflow_id or f"flow-{name}"
+        runner = orchestrator.Orchestrator(
+            str(target), "Add a feature", config(), flow,
+            process_runner=lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, b"ok", b""),
+        )
+        runner.initialize()
+        return target, runner
+
+    def legacy_snapshot_migration_fixture(self, name="migration-fixture"):
+        target, runner = self.new_git_workflow(
+            name, workflow_id=orchestrator.SNAPSHOT_MIGRATION_WORKFLOW_ID,
+            files={".DS_Store": b"current metadata", "src/.DS_Store": b"nested user metadata",
+                   "notes.txt": b"preserve this user file"},
+        )
+        state = copy.deepcopy(runner.state)
+        old_hash = orchestrator.SNAPSHOT_MIGRATION_OLD_HASH_PREFIX + "0" * 56
+        state["baseline"]["preexisting_changes"].append({
+            "path": ".DS_Store", "index_state": "added", "working_tree_state": "untracked",
+        })
+        state["orchestration"]["preexisting_hashes"].append({
+            "path": ".DS_Store", "worktree_sha256": old_hash,
+            "index_sha256": None, "protected_path": False,
+        })
+        nested_hash = orchestrator._sha((target / "src/.DS_Store").read_bytes())
+        state["baseline"]["preexisting_changes"].append({
+            "path": "src/.DS_Store", "index_state": "added", "working_tree_state": "untracked",
+        })
+        state["orchestration"]["preexisting_hashes"].append({
+            "path": "src/.DS_Store", "worktree_sha256": nested_hash,
+            "index_sha256": None, "protected_path": False,
+        })
+        state["status"] = "BLOCKED"
+        state["phase"] = "IMPLEMENTATION"
+        state["orchestration"]["current_stage"] = "SELF_REVIEW"
+        state["orchestration"].pop("snapshot_policy", None)
+        state["orchestration"].pop("snapshot_migrations", None)
+        runner.store.save(state)
+        runner.state = state
+        return target, runner, old_hash, orchestrator._sha((target / ".DS_Store").read_bytes())
+
+    def process_evidence_fixture(self, name):
+        target = Path(self.temp.name) / name
+        git_fixture(target)
+        (target / "src").mkdir()
+        (target / "src/feature.py").write_text("value = 1\n", encoding="utf-8")
+        (target / "docs").mkdir()
+        workflow_id = f"flow-{name}"
+        runner = orchestrator.Orchestrator(str(target), "Add a feature",
+            config(authorized_artifact_paths=["docs"]), workflow_id,
+            process_runner=lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, b"ok", b""))
+        runner.initialize()
+        (target / orchestrator.PROCESS_EVIDENCE_PATH).write_text("Prior process notes.\n", encoding="utf-8")
+        runner.state["scope"].update({"increment_id": "inc-1", "included_paths": ["src", "docs"],
+            "code_paths": ["src"], "artifact_paths": ["docs"], "revision_paths": ["src", "docs"]})
+        runner.state["orchestration"]["increments"] = [{"increment_id": "inc-1", "changed_paths": []}]
+        runner._save()
+        increment = {"increment_id": "inc-1", "title": "Implement feature", "code_paths": ["src"],
+            "artifact_paths": ["docs"], "revision_paths": ["src", "docs"],
+            "acceptance_criteria_ids": ["AC-1"], "validation_ids": ["tests"]}
+        return target, runner, plan(increments=[increment]), increment
+
+    @staticmethod
+    def self_review_response(decision="PASS", *, findings=None, changes=None, summary=None):
+        return {"decision": decision, "summary": summary or f"Self-review {decision.lower()}.",
+            "findings": findings or [], "changes": changes or []}
+
+    @staticmethod
+    def record_mock_self_review_attempt(runner, result):
+        now = orchestrator._now()
+        trace = {"result_status": result["decision"], "result_summary": result["summary"],
+            "finding_count": len(result["findings"]), "changed_paths": [row["path"] for row in result["changes"]],
+            "changed_content_sha256": [orchestrator._sha(row["content"].encode()) for row in result["changes"]]}
+        runner.state["orchestration"]["attempts"].append({"stage": "SELF_REVIEW",
+            "schema": "orchestrator-self-review.schema.json", "started_at": now, "finished_at": now,
+            "exit_code": 0, "duration_ms": 1, "result_sha256": orchestrator._sha(orchestrator._json_bytes(result)),
+            "blocker_sha256": None, "trace": trace})
 
     @staticmethod
     def write_state(runner, status="ACTIVE", stage="PLANNING", pending=None, attempts=None):
@@ -486,6 +572,157 @@ class OrchestratorTests(unittest.TestCase):
         with self.assertRaisesRegex(orchestrator.OrchestratorError, "different task text"):
             changed_task.initialize()
 
+    def test_new_snapshot_excludes_untracked_root_ds_store(self):
+        target, runner = self.new_git_workflow("untracked-root-ds-store", files={".DS_Store": b"root metadata"})
+        self.assertEqual(runner.state["orchestration"]["snapshot_policy"],
+                         orchestrator.SNAPSHOT_POLICY_UNTRACKED_DS_STORE)
+        self.assertNotIn(".DS_Store", {row["path"] for row in runner.state["baseline"]["preexisting_changes"]})
+        self.assertNotIn(".DS_Store", {row["path"] for row in runner.state["orchestration"]["preexisting_hashes"]})
+        self.assertNotIn(".DS_Store", orchestrator._status(target, exclude_untracked_ds_store=True))
+
+    def test_new_snapshot_excludes_untracked_nested_ds_store(self):
+        target, runner = self.new_git_workflow("untracked-nested-ds-store", files={"src/.DS_Store": b"nested metadata"})
+        self.assertNotIn("src/.DS_Store", {row["path"] for row in runner.state["baseline"]["preexisting_changes"]})
+        self.assertNotIn("src/.DS_Store", {row["path"] for row in runner.state["orchestration"]["preexisting_hashes"]})
+
+    def test_tracked_ds_store_remains_protected(self):
+        target = Path(self.temp.name) / "tracked-ds-store"
+        git_fixture(target)
+        (target / ".DS_Store").write_bytes(b"committed metadata")
+        subprocess.run(["git", "-C", str(target), "add", ".DS_Store"], check=True)
+        subprocess.run(["git", "-C", str(target), "commit", "-q", "-m", "track metadata"], check=True)
+        (target / ".DS_Store").write_bytes(b"pre-existing tracked edit")
+        runner = orchestrator.Orchestrator(str(target), "Add a feature", config(), "flow-tracked-ds-store")
+        runner.initialize()
+        self.assertIn(".DS_Store", {row["path"] for row in runner.state["orchestration"]["preexisting_hashes"]})
+        (target / ".DS_Store").write_bytes(b"later tracked edit")
+        resumed = orchestrator.Orchestrator(str(target), "Add a feature", config(), "flow-tracked-ds-store")
+        with self.assertRaisesRegex(orchestrator.OrchestratorError, "Pre-existing change changed"):
+            resumed.initialize()
+
+    def test_staged_ds_store_remains_protected(self):
+        target = Path(self.temp.name) / "staged-ds-store"
+        git_fixture(target)
+        (target / ".DS_Store").write_bytes(b"staged metadata")
+        subprocess.run(["git", "-C", str(target), "add", ".DS_Store"], check=True)
+        runner = orchestrator.Orchestrator(str(target), "Add a feature", config(), "flow-staged-ds-store")
+        runner.initialize()
+        saved = next(row for row in runner.state["orchestration"]["preexisting_hashes"] if row["path"] == ".DS_Store")
+        self.assertIsNotNone(saved["index_sha256"])
+        (target / ".DS_Store").write_bytes(b"changed after staging")
+        resumed = orchestrator.Orchestrator(str(target), "Add a feature", config(), "flow-staged-ds-store")
+        with self.assertRaisesRegex(orchestrator.OrchestratorError, "Pre-existing change changed"):
+            resumed.initialize()
+
+    def test_other_untracked_files_remain_protected(self):
+        target, runner = self.new_git_workflow("other-untracked-protected", files={"notes.txt": b"user notes"})
+        self.assertIn("notes.txt", {row["path"] for row in runner.state["orchestration"]["preexisting_hashes"]})
+        (target / "notes.txt").write_bytes(b"changed notes")
+        resumed = orchestrator.Orchestrator(str(target), "Add a feature", config(), runner.workflow_id)
+        with self.assertRaisesRegex(orchestrator.OrchestratorError, "Pre-existing change changed since workflow start: notes.txt"):
+            resumed.initialize()
+
+    def test_snapshot_and_resume_share_ds_store_policy(self):
+        target, runner = self.new_git_workflow("same-snapshot-policy", files={".DS_Store": b"initial metadata"})
+        (target / ".DS_Store").write_bytes(b"changed volatile metadata")
+        resumed = orchestrator.Orchestrator(str(target), "Add a feature", config(), runner.workflow_id)
+        resumed.initialize()
+        self.assertEqual(resumed.state["orchestration"]["snapshot_policy"],
+                         orchestrator.SNAPSHOT_POLICY_UNTRACKED_DS_STORE)
+        subprocess.run(["git", "-C", str(target), "add", ".DS_Store"], check=True)
+        self.assertIn(".DS_Store", orchestrator._status_for_workflow(target, resumed.state))
+
+    def test_revision_manifest_excludes_only_untracked_ds_store(self):
+        target, runner = self.new_git_workflow("manifest-ds-store")
+        (target / "src" / ".DS_Store").write_bytes(b"untracked metadata")
+        (target / "src" / "feature.py").write_text("value = 1\n", encoding="utf-8")
+        increment = {"increment_id": "inc-1", "revision_paths": ["src"]}
+        _revision_id, manifest, _reference = runner._revision_manifest(increment)
+        names = {row["path"] for row in manifest["manifest"]}
+        self.assertIn("src/feature.py", names)
+        self.assertNotIn("src/.DS_Store", names)
+        subprocess.run(["git", "-C", str(target), "add", "src/.DS_Store"], check=True)
+        _revision_id, staged_manifest, _reference = runner._revision_manifest(increment)
+        self.assertIn("src/.DS_Store", {row["path"] for row in staged_manifest["manifest"]})
+
+    def test_historical_snapshot_migration_is_auditable_and_idempotent(self):
+        target, runner, old_hash, current_hash = self.legacy_snapshot_migration_fixture()
+        baseline_before = copy.deepcopy(runner.state["baseline"])
+        hashes_before = copy.deepcopy(runner.state["orchestration"]["preexisting_hashes"])
+        unrelated_before = {row["path"]: row for row in hashes_before if row["path"] != ".DS_Store"}
+        reference = "user-task:Harness Improvement — Normalize volatile OS metadata in workflow snapshots"
+        with unittest.mock.patch.object(orchestrator, "SNAPSHOT_MIGRATION_CURRENT_HASH_PREFIX", current_hash[:8]):
+            result = orchestrator.migrate_untracked_ds_store(
+                str(target.resolve()), orchestrator.SNAPSHOT_MIGRATION_WORKFLOW_ID,
+                expected_old_sha256=old_hash, expected_current_sha256=current_hash,
+                authorization_reference=reference,
+            )
+            migrated = runner.store.read_state()
+            row = migrated["orchestration"]["snapshot_migrations"][0]
+            self.assertTrue(result["changed"])
+            self.assertEqual(row["path"], ".DS_Store")
+            self.assertEqual(row["old_sha256"], old_hash)
+            self.assertEqual(row["current_sha256"], current_hash)
+            self.assertTrue(row["reason"])
+            self.assertFalse(row["original_bytes_recovered"])
+            self.assertIn("could not be recovered", row["original_bytes_note"])
+            datetime.fromisoformat(row["recorded_at"].replace("Z", "+00:00"))
+            self.assertEqual(migrated["baseline"], baseline_before)
+            self.assertEqual(migrated["orchestration"]["preexisting_hashes"], hashes_before)
+            self.assertEqual({item["path"]: item for item in migrated["orchestration"]["preexisting_hashes"]
+                              if item["path"] != ".DS_Store"}, unrelated_before)
+            auth_count = len(migrated["authorizations"])
+            repeated = orchestrator.migrate_untracked_ds_store(
+                str(target.resolve()), orchestrator.SNAPSHOT_MIGRATION_WORKFLOW_ID,
+                expected_old_sha256=old_hash, expected_current_sha256=current_hash,
+                authorization_reference=reference,
+            )
+            self.assertFalse(repeated["changed"])
+            self.assertEqual(len(runner.store.read_state()["authorizations"]), auth_count)
+        resumed = orchestrator.Orchestrator(
+            str(target), "Add a feature", config(), orchestrator.SNAPSHOT_MIGRATION_WORKFLOW_ID,
+        )
+        resumed.initialize()
+        self.assertEqual(resumed.state["status"], "BLOCKED")
+        self.assertEqual(resumed.state["orchestration"]["current_stage"], "SELF_REVIEW")
+        subprocess.run(["git", "-C", str(target), "add", ".DS_Store"], check=True)
+        staged_check = orchestrator.Orchestrator(
+            str(target), "Add a feature", config(), orchestrator.SNAPSHOT_MIGRATION_WORKFLOW_ID,
+        )
+        with self.assertRaisesRegex(orchestrator.OrchestratorError, r"Pre-existing change changed since workflow start: \.DS_Store"):
+            staged_check.initialize()
+        subprocess.run(["git", "-C", str(target), "reset", "-q", "--", ".DS_Store"], check=True)
+        (target / "src/.DS_Store").write_bytes(b"changed unrelated metadata")
+        checked = orchestrator.Orchestrator(
+            str(target), "Add a feature", config(), orchestrator.SNAPSHOT_MIGRATION_WORKFLOW_ID,
+        )
+        with self.assertRaisesRegex(orchestrator.OrchestratorError, r"Pre-existing change changed since workflow start: src/\.DS_Store"):
+            checked.initialize()
+
+    def test_migration_requires_authorization_and_does_not_touch_other_paths(self):
+        target, runner, old_hash, current_hash = self.legacy_snapshot_migration_fixture("migration-auth-required")
+        before = runner.store.read_state()
+        with self.assertRaisesRegex(orchestrator.OrchestratorError, "authorization provenance"):
+            orchestrator.migrate_untracked_ds_store(
+                str(target.resolve()), orchestrator.SNAPSHOT_MIGRATION_WORKFLOW_ID,
+                expected_old_sha256=old_hash, expected_current_sha256=current_hash,
+                authorization_reference="",
+            )
+        self.assertEqual(runner.store.read_state(), before)
+
+    def test_legacy_workflow_without_migration_keeps_original_ds_store_checks(self):
+        target, runner, old_hash, _current_hash = self.legacy_snapshot_migration_fixture("legacy-ds-store-check")
+        state = runner.store.read_state()
+        state["orchestration"].pop("snapshot_policy", None)
+        state["orchestration"].pop("snapshot_migrations", None)
+        runner.store.save(state)
+        (target / ".DS_Store").write_bytes(b"changed current metadata")
+        resumed = orchestrator.Orchestrator(
+            str(target), "Add a feature", config(), orchestrator.SNAPSHOT_MIGRATION_WORKFLOW_ID,
+        )
+        with self.assertRaisesRegex(orchestrator.OrchestratorError, r"Pre-existing change changed since workflow start: \.DS_Store"):
+            resumed.initialize()
+
     def test_remote_ref_movement_is_recorded_without_replacing_workflow_baseline(self):
         target, base = git_fixture(Path(self.temp.name) / "git-target-ref-movement")
         subprocess.run(["git", "-C", str(target), "update-ref", "refs/remotes/origin/main", base], check=True)
@@ -731,9 +968,10 @@ class OrchestratorTests(unittest.TestCase):
         current_plan["increments"] = [increment]
         task_hash = "a" * 64
         config_hash = orchestrator._sha(orchestrator._json_bytes(self.runner.config))
+        planning_hash = orchestrator._planning_config_sha256(self.runner.config)
         plan_path = f"{self.runner.store.directory}/plan-v2.json"
         wrapper = {"artifact_schema_version": 1, "requirement_version": 2,
-            "task_sha256": task_hash, "config_sha256": config_hash, "plan": current_plan}
+            "task_sha256": task_hash, "config_sha256": planning_hash, "plan": current_plan}
         with patch("safe_writer._run_preflight", return_value={"overall_result": "READY", "target_path": str(self.target.resolve())}):
             self.runner.store.write(plan_path, wrapper)
         self.runner.state = {"status": "ACTIVE", "phase": "PLANNING", "updated_at": "",
@@ -748,6 +986,69 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(self.runner.state["orchestration"]["plan_reference"], plan_path)
         self.assertEqual(self.runner.state["orchestration"]["increments"][0]["requirement_version"], 2)
 
+    def test_authorization_only_config_change_preserves_existing_stored_plan(self):
+        old_config = self.runner.config
+        old_config_hash = orchestrator._sha(orchestrator._json_bytes(old_config))
+        auth = persistent_claude_authorization(self.target)
+        self.runner.config = orchestrator.validate_config(config(
+            review={"enabled": True, "authorization": auth}))
+        current_config_hash = orchestrator._sha(orchestrator._json_bytes(self.runner.config))
+        plan_path = f"{self.runner.store.directory}/plan-v1.json"
+        plan_path_abs = self.target / plan_path
+        plan_path_abs.parent.mkdir(parents=True, exist_ok=True)
+        expected_plan = plan()
+        plan_path_abs.write_text(json.dumps({"artifact_schema_version": 1,
+            "requirement_version": 1, "task_sha256": orchestrator._sha(b"Add a feature"),
+            "config_sha256": old_config_hash, "plan": expected_plan}), encoding="utf-8")
+        self.runner.state = {"orchestration": {"current_requirement_version": 1,
+            "task_sha256": orchestrator._sha(b"Add a feature"), "config_sha256": current_config_hash}}
+
+        recovered = self.runner._read_plan(plan_path)
+
+        self.assertEqual(recovered, expected_plan)
+        self.assertEqual(json.loads(plan_path_abs.read_text(encoding="utf-8"))["config_sha256"], old_config_hash)
+
+    def test_reviewer_configuration_changes_do_not_change_planning_fingerprint(self):
+        initial_config = self.runner.config
+        planning_hash = orchestrator._planning_config_sha256(initial_config)
+        auth = persistent_claude_authorization(self.target)
+        changed_review_config = orchestrator.validate_config(config(
+            claude_budget_usd=0.5,
+            review={"enabled": True, "context_paths": ["docs/api.md"], "authorization": auth}))
+        current_config_hash = orchestrator._sha(orchestrator._json_bytes(changed_review_config))
+        plan_path = f"{self.runner.store.directory}/plan-v1.json"
+        plan_path_abs = self.target / plan_path
+        plan_path_abs.parent.mkdir(parents=True, exist_ok=True)
+        expected_plan = plan()
+        plan_path_abs.write_text(json.dumps({"artifact_schema_version": 1,
+            "requirement_version": 1, "task_sha256": orchestrator._sha(b"Add a feature"),
+            "config_sha256": planning_hash, "plan": expected_plan}), encoding="utf-8")
+        self.runner.config = changed_review_config
+        self.runner.state = {"orchestration": {"current_requirement_version": 1,
+            "task_sha256": orchestrator._sha(b"Add a feature"), "config_sha256": current_config_hash}}
+
+        self.assertEqual(self.runner._read_plan(plan_path), expected_plan)
+
+    def test_genuine_planning_config_change_still_invalidates_stored_plan(self):
+        original_config = self.runner.config
+        planning_hash = orchestrator._planning_config_sha256(original_config)
+        changed_config = orchestrator.validate_config(config(
+            validations=[{"id": "different-tests", "argv": ["python3", "-m", "unittest", "tests.test_other"]}]))
+        current_config_hash = orchestrator._sha(orchestrator._json_bytes(changed_config))
+        plan_path = f"{self.runner.store.directory}/plan-v1.json"
+        plan_path_abs = self.target / plan_path
+        plan_path_abs.parent.mkdir(parents=True, exist_ok=True)
+        plan_path_abs.write_text(json.dumps({"artifact_schema_version": 1,
+            "requirement_version": 1, "task_sha256": orchestrator._sha(b"Add a feature"),
+            "config_sha256": planning_hash, "plan": plan()}), encoding="utf-8")
+        self.runner.config = changed_config
+        self.runner.state = {"orchestration": {"current_requirement_version": 1,
+            "task_sha256": orchestrator._sha(b"Add a feature"), "config_sha256": current_config_hash}}
+
+        with self.assertRaisesRegex(orchestrator.OrchestratorError,
+                                    "Stored plan does not match the current requirement/configuration version"):
+            self.runner._read_plan(plan_path)
+
     def test_self_review_corrects_findings_and_requires_a_passing_followup(self):
         increment = plan()["increments"][0]
         self.runner.state = {"scope": {"increment_id": "inc-1", "included_paths": ["src"]},
@@ -755,7 +1056,7 @@ class OrchestratorTests(unittest.TestCase):
             "orchestration": {"current_requirement_version": 1,
                 "requirement_history": [{"version": 1, "task_reference": "requirements-v1.json", "task_sha256": "a" * 64}],
                 "invalidations": [], "self_reviews": [], "increments": [{"increment_id": "inc-1", "changed_paths": ["src/a.py"]}],
-                "attempts": []}}
+                "attempts": [], "validation_results": [], "review_results": []}}
         self.runner._save = lambda: None
         finding = {"id": "SELF-1", "severity": "medium", "file": "src/a.py",
             "description": "Missing edge case.", "recommendation": "Handle the edge case."}
@@ -765,17 +1066,22 @@ class OrchestratorTests(unittest.TestCase):
             {"decision": "PASS", "summary": "Correction verified.", "findings": [], "changes": []},
         ])
         contexts = []
+        def run_review(_stage, context, *_args, **_kwargs):
+            result = next(responses)
+            self.record_mock_self_review_attempt(self.runner, result)
+            contexts.append(json.loads(json.dumps(context)))
+            return result
         with patch.object(self.runner, "_set_stage"), \
              patch.object(self.runner, "_revision_manifest", side_effect=[
                  ("content:" + "a" * 64, {}, "manifest-before.json"),
                  ("content:" + "b" * 64, {}, "manifest-after.json")]), \
-             patch.object(self.runner, "_run_codex", side_effect=lambda _stage, context, *_args, **_kwargs:
-                          contexts.append(json.loads(json.dumps(context))) or next(responses)), \
+             patch.object(self.runner, "_run_codex", side_effect=run_review), \
              patch.object(self.runner, "_apply_changes") as apply_changes:
             self.runner._self_review(plan(), increment, Path(self.temp.name))
         apply_changes.assert_called_once()
         self.assertEqual(len(contexts), 2)
         self.assertEqual(contexts[0]["review_mode"], "self-review; not independent review or approval")
+        self.assertEqual(contexts[0]["evidence_cutoff"]["attempt_count"], 0)
         self.assertIn("prior_self_review_findings", contexts[1])
         record = self.runner.state["orchestration"]["self_reviews"][0]
         self.assertEqual(record["status"], "passed")
@@ -791,6 +1097,119 @@ class OrchestratorTests(unittest.TestCase):
         }]}
         with self.assertRaisesRegex(orchestrator.OrchestratorError, "outside the increment allowlist"):
             self.runner._self_review_valid(invalid, increment)
+        managed_finding = {"decision": "CORRECTED", "summary": "Process document is stale.",
+            "changes": [{"path": orchestrator.PROCESS_EVIDENCE_PATH, "content": "future evidence"}],
+            "findings": [{"id": "SELF-EVIDENCE", "severity": "medium",
+                "file": orchestrator.PROCESS_EVIDENCE_PATH,
+                "description": "It omits this review.", "recommendation": "Update it."}]}
+        with self.assertRaisesRegex(orchestrator.OrchestratorError, "controller-managed process evidence"):
+            self.runner._self_review_valid(managed_finding, increment)
+
+    def test_self_review_uses_record_cutoff_and_finalizes_evidence_after_persisting_pass(self):
+        target, runner, current_plan, increment = self.process_evidence_fixture("process-evidence-pass")
+        before_id, before_manifest, _ = runner._revision_manifest(increment)
+        response = self.self_review_response(summary="Implementation review passed.")
+        contexts = []
+
+        def run_review(_stage, context, *_args, **_kwargs):
+            contexts.append(copy.deepcopy(context))
+            self.record_mock_self_review_attempt(runner, response)
+            return response
+
+        original_sync = runner._sync_process_evidence
+        observed_finalization = []
+
+        def sync_after_persisted_review(item):
+            review = runner.state["orchestration"]["self_reviews"][-1]
+            attempt = runner.state["orchestration"]["attempts"][-1]
+            persisted = runner.store.read_state()
+            self.assertEqual(review["status"], "passed")
+            self.assertEqual(attempt["trace"]["self_review_result"]["outcome"], "passed")
+            self.assertEqual(persisted["orchestration"]["self_reviews"][-1]["status"], "passed")
+            self.assertEqual(persisted["orchestration"]["attempts"][-1]["trace"]["self_review_result"]["outcome"], "passed")
+            self.assertEqual(runner.state["orchestration"]["current_stage"], "SELF_REVIEW")
+            observed_finalization.append(True)
+            original_sync(item)
+
+        with patch.object(runner, "_run_codex", side_effect=run_review), \
+             patch.object(runner, "_sync_process_evidence", side_effect=sync_after_persisted_review):
+            runner._self_review(current_plan, increment, Path(self.temp.name))
+
+        self.assertEqual(len(contexts), 1)
+        self.assertEqual(contexts[0]["evidence_cutoff"]["attempt_count"], 0)
+        self.assertEqual(contexts[0]["constraints"]["revision_exclusions"], [orchestrator.PROCESS_EVIDENCE_PATH])
+        self.assertEqual(contexts[0]["constraints"]["revision_paths"], ["src", "docs"])
+        self.assertEqual(contexts[0]["review_checklist"][-2:], ["acceptance criteria", "authorized implementation paths"])
+        self.assertEqual(observed_finalization, [True])
+        after_id, after_manifest, _ = runner._revision_manifest(increment)
+        self.assertEqual(after_id, before_id)
+        self.assertNotIn(orchestrator.PROCESS_EVIDENCE_PATH,
+                         {row["path"] for row in after_manifest["manifest"]})
+        self.assertEqual(before_manifest["excluded_paths"], [orchestrator.PROCESS_EVIDENCE_PATH])
+        evidence = (target / orchestrator.PROCESS_EVIDENCE_PATH).read_text(encoding="utf-8")
+        self.assertIn("Controller-managed workflow evidence", evidence)
+        self.assertIn("Implementation review passed.", evidence)
+        self.assertIn("0 attempts", evidence)
+        metadata = runner.state["orchestration"]["process_evidence"]
+        self.assertEqual(metadata["attempt_count"], 1)
+        self.assertEqual(metadata["self_review_count"], 1)
+        self.assertEqual(metadata["sha256"], orchestrator._sha((target / orchestrator.PROCESS_EVIDENCE_PATH).read_bytes()))
+
+    def test_failed_self_review_attempts_and_two_correction_round_limit_are_preserved(self):
+        target, runner, current_plan, increment = self.process_evidence_fixture("process-evidence-failed-reviews")
+        finding = {"id": "SELF-FAIL", "severity": "medium", "file": "src/feature.py",
+            "description": "A concrete implementation issue remains.", "recommendation": "Correct the issue."}
+        response = self.self_review_response("CORRECTED", findings=[finding],
+            changes=[{"path": "src/feature.py", "content": "value = 2\n"}],
+            summary="Correction proposed; review did not pass.")
+        calls = []
+
+        def run_review(_stage, _context, *_args, **_kwargs):
+            calls.append(True)
+            self.record_mock_self_review_attempt(runner, response)
+            return response
+
+        with patch.object(runner, "_run_codex", side_effect=run_review), \
+             patch.object(runner, "_apply_changes"), \
+             self.assertRaisesRegex(orchestrator.OrchestratorError, "bounded correction loop"):
+            runner._self_review(current_plan, increment, Path(self.temp.name))
+
+        attempts = runner.state["orchestration"]["attempts"]
+        self.assertEqual(runner.config["max_iterations"], 2)
+        self.assertEqual(len(calls), runner.config["max_iterations"] + 1)
+        self.assertEqual([row["trace"]["self_review_result"]["correction_round"] for row in attempts], [0, 1, 2])
+        self.assertEqual([row["trace"]["self_review_result"]["outcome"] for row in attempts],
+                         ["corrections_applied", "corrections_applied", "correction_limit_reached"])
+        self.assertTrue(all(row["trace"]["self_review_result"]["findings"] == [finding] for row in attempts))
+        self.assertEqual(runner.state["orchestration"]["self_reviews"], [])
+        evidence = (target / orchestrator.PROCESS_EVIDENCE_PATH).read_text(encoding="utf-8")
+        self.assertEqual(evidence.count("Self-review evidence cutoff:"), 3)
+        self.assertIn("correction_limit_reached", evidence)
+        self.assertIn("A concrete implementation issue remains.", evidence)
+
+    def test_increment_enters_testing_after_self_review_and_evidence_finalization(self):
+        _target, runner, current_plan, increment = self.process_evidence_fixture("process-evidence-testing-stage")
+        runner.state["orchestration"]["increments"][0].update({"status": "implemented", "requirement_version": 1})
+        runner._save()
+        response = self.self_review_response(summary="Implementation is ready for validation.")
+
+        def run_review(_stage, _context, *_args, **_kwargs):
+            self.record_mock_self_review_attempt(runner, response)
+            return response
+
+        def enter_testing(_plan, _increment, _revision_id):
+            self.assertEqual(runner.state["orchestration"]["self_reviews"][-1]["status"], "passed")
+            self.assertEqual(runner.state["orchestration"]["process_evidence"]["self_review_count"], 1)
+            self.assertEqual(runner.state["orchestration"]["current_stage"], "SELF_REVIEW")
+            runner._set_stage("VALIDATION", "TESTING")
+
+        with patch.object(runner, "_run_codex", side_effect=run_review), \
+             patch.object(runner, "_validate", side_effect=enter_testing):
+            runner._increment(current_plan, increment, Path(self.temp.name))
+
+        self.assertEqual(runner.state["orchestration"]["current_stage"], "VALIDATION")
+        self.assertEqual(runner.state["phase"], "TESTING")
+        self.assertEqual(runner.state["orchestration"]["increments"][0]["status"], "implemented")
 
     def test_resume_rejects_changed_target_head(self):
         target = Path(self.temp.name) / "git-target-changed-head"
@@ -1239,10 +1658,19 @@ class OrchestratorTests(unittest.TestCase):
         self.runner.initialize = lambda: None
         self.runner._save = lambda: None
         self.runner._planning = lambda runtime: None
-        with patch("orchestrator._runtime_bundle_files", return_value={}):
+        blocker_hash = orchestrator._blocker_fingerprint(blocker)
+        context = {"workflow_id": self.flow, "stage": "TESTING", "blocker_sha256": blocker_hash,
+            "requirement_version": 1, "task_sha256": "a" * 64, "config_sha256": "b" * 64,
+            "target_baseline_commit": None, "revision_id": None,
+            "harness_orchestrator_sha256": "c" * 64, "runtime_bundle_sha256": "d" * 64,
+            "codex": {"cli_version": "codex test", "model": "model test", "provider": "provider test",
+                "python_runtime": "3.x"}}
+        with patch.object(self.runner, "_recovery_context", return_value=context), \
+             patch("orchestrator._runtime_bundle_files", return_value={}):
             result = self.runner.run()
         self.assertEqual(result["status"], "ACTIVE")
         self.assertEqual(self.runner.state["orchestration"]["attempts"][0]["stage"], "RESUME")
+        self.assertRegex(self.runner.state["orchestration"]["attempts"][0]["recovery_context_sha256"], r"^[a-f0-9]{64}$")
         self.assertNotIn("blocker", self.runner.state)
 
     def test_repeated_same_blocker_does_not_loop_on_resume(self):
@@ -1255,8 +1683,140 @@ class OrchestratorTests(unittest.TestCase):
         self.runner.state["blocker"] = blocker
         self.runner.initialize = lambda: None
         self.runner._planning = lambda runtime: self.fail("repeated blocker must not retry")
-        result = self.runner.run()
+        fixed_context = {"workflow_id": self.flow, "stage": "TESTING", "blocker_sha256": blocker_hash,
+            "requirement_version": 1, "task_sha256": "a" * 64, "config_sha256": "b" * 64,
+            "target_baseline_commit": None, "revision_id": None,
+            "harness_orchestrator_sha256": "c" * 64, "runtime_bundle_sha256": "d" * 64,
+            "codex": {"cli_version": "codex test", "model": "model test", "provider": "provider test",
+                "python_runtime": "3.x"}}
+        with patch.object(self.runner, "_recovery_context", return_value=fixed_context):
+            result = self.runner.run()
         self.assertEqual(result["status"], "BLOCKED")
+
+    def test_legacy_repeated_blocker_retries_once_after_execution_context_changes(self):
+        blocker = {"reason": "Self-review findings remain", "affected_phase": "IMPLEMENTATION",
+            "recorded_at": "now", "safe_recovery_path": "review the changed harness context"}
+        blocker_hash = orchestrator._blocker_fingerprint(blocker)
+        prior_resume = {"stage": "RESUME", "blocker_sha256": blocker_hash}
+        prior_review = {"stage": "SELF_REVIEW", "trace": {
+            "harness_orchestrator_sha256": "1" * 64, "runtime_bundle_sha256": "2" * 64,
+            "reviewed_revision_id": "content:" + "a" * 64}}
+        self.write_state(self.runner, status="BLOCKED", stage="SELF_REVIEW", attempts=[prior_resume, prior_review])
+        self.runner.state["orchestration"]["current_stage"] = "SELF_REVIEW"
+        self.runner.state["orchestration"]["current_increment_id"] = "inc-1"
+        self.runner.state["blocker"] = blocker
+        self.runner.initialize = lambda: None
+        self.runner._save = lambda: None
+        self.runner._planning = lambda runtime: None
+        current = {"workflow_id": self.flow, "stage": "SELF_REVIEW", "blocker_sha256": blocker_hash,
+            "requirement_version": 1, "task_sha256": "a" * 64, "config_sha256": "b" * 64,
+            "target_baseline_commit": "base", "revision_id": "content:" + "a" * 64,
+            "harness_orchestrator_sha256": "3" * 64, "runtime_bundle_sha256": "4" * 64,
+            "codex": {"cli_version": "codex test", "model": "model test", "provider": "provider test",
+                "python_runtime": "3.x"}}
+        with patch.object(self.runner, "_recovery_context", return_value=current), \
+             patch("orchestrator._runtime_bundle_files", return_value={}):
+            result = self.runner.run()
+        self.assertEqual(result["status"], "ACTIVE")
+        self.assertEqual(self.runner.state["orchestration"]["attempts"][-1]["resume_basis"], "changed_execution_context")
+        self.assertEqual(self.runner.state["orchestration"]["attempts"][-1]["recovery_context"], current)
+        self.assertEqual(self.runner.state["orchestration"]["attempts"][0], prior_resume)
+        self.runner.state["status"] = "BLOCKED"
+        self.runner.state["blocker"] = blocker
+        with patch.object(self.runner, "_recovery_context", return_value=current):
+            result = self.runner.run()
+        self.assertEqual(result["status"], "BLOCKED")
+
+    def test_ohpen_recovery_authorization_is_persisted_consumed_and_single_use(self):
+        runner = orchestrator.Orchestrator(str(self.target), "Add a feature", config(),
+            orchestrator.OHPEN_RECOVERY_WORKFLOW_ID)
+        blocker = {"affected_phase": "IMPLEMENTATION",
+            "reason": "Self-review findings remain after the bounded correction loop",
+            "recorded_at": "2026-11-09T13:41:01Z",
+            "safe_recovery_path": "Resolve the recorded blocker and resume with the same target, task, and workflow ID."}
+        blocker_hash = orchestrator._blocker_fingerprint(blocker)
+        self.write_state(runner, status="BLOCKED", stage="SELF_REVIEW", attempts=[
+            {"stage": "RESUME", "blocker_sha256": blocker_hash},
+            *({"stage": "SELF_REVIEW", "trace": {}} for _ in range(13)),
+        ])
+        runner.state["target"] = {"target_id": "TARGET-TEST"}
+        runner.state["blocker"] = blocker
+        runner.state["orchestration"]["current_stage"] = "SELF_REVIEW"
+        runner.state["orchestration"]["current_increment_id"] = None
+        runner.initialize = lambda: None
+        runner._save = lambda: None
+        runner._planning = lambda _runtime: None
+        runner.self_review_recovery_authorization_reference = (
+            "conversation: user approved one-use recovery after escalation review")
+        current_context = {"workflow_id": runner.workflow_id, "stage": "SELF_REVIEW",
+            "blocker_sha256": blocker_hash, "requirement_version": 2, "task_sha256": "a" * 64,
+            "config_sha256": "b" * 64, "target_baseline_commit": "base", "revision_id": "content:" + "c" * 64,
+            "harness_orchestrator_sha256": "d" * 64, "runtime_bundle_sha256": "e" * 64,
+            "codex": {"cli_version": "codex test", "model": "model", "provider": "provider",
+                "python_runtime": "3.x"}}
+        with patch.object(runner, "_recovery_context", return_value=current_context), \
+             patch("orchestrator._runtime_bundle_files", return_value={}):
+            result = runner.run()
+        self.assertEqual(result["status"], "ACTIVE")
+        self.assertEqual(len(runner.state["orchestration"]["attempts"]), 15)
+        authorization = runner.state["orchestration"]["self_review_recovery_authorizations"][0]
+        resume = runner.state["orchestration"]["attempts"][-1]
+        self.assertEqual(authorization["status"], "consumed")
+        self.assertEqual(authorization["blocker_sha256"], blocker_hash)
+        self.assertEqual(authorization["resume_attempt_number"], 15)
+        self.assertEqual(resume["resume_basis"], "authorized_self_review_recovery")
+        self.assertEqual(resume["recovery_authorization_id"], authorization["authorization_id"])
+        self.assertEqual(runner.state["orchestration"]["attempts"][0]["blocker_sha256"], blocker_hash)
+
+        runner.state["status"] = "BLOCKED"
+        runner.state["blocker"] = blocker
+        runner.self_review_recovery_authorization_reference = None
+        with patch.object(runner, "_planning", side_effect=AssertionError("consumed recovery must not run again")):
+            repeated = runner.run()
+        self.assertEqual(repeated["status"], "BLOCKED")
+        self.assertEqual(len(runner.state["orchestration"]["attempts"]), 15)
+        self.assertEqual(len(runner.state["orchestration"]["self_review_recovery_authorizations"]), 1)
+
+    def test_ohpen_recovery_authorization_rejects_stale_attempt_count(self):
+        runner = orchestrator.Orchestrator(str(self.target), "Add a feature", config(),
+            orchestrator.OHPEN_RECOVERY_WORKFLOW_ID)
+        blocker = {"affected_phase": "IMPLEMENTATION",
+            "reason": "Self-review findings remain after the bounded correction loop",
+            "recorded_at": "2026-11-09T13:41:01Z",
+            "safe_recovery_path": "Resolve the recorded blocker and resume with the same target, task, and workflow ID."}
+        self.write_state(runner, status="BLOCKED", stage="SELF_REVIEW", attempts=[{}] * 13)
+        runner.state["target"] = {"target_id": "TARGET-TEST"}
+        runner.state["blocker"] = blocker
+        runner.state["orchestration"]["current_stage"] = "SELF_REVIEW"
+        runner.self_review_recovery_authorization_reference = "conversation: approved recovery"
+        runner.initialize = lambda: None
+        runner._save = lambda: None
+        with self.assertRaisesRegex(orchestrator.OrchestratorError, "does not match the recorded Ohpen workflow state"):
+            runner.run()
+        self.assertEqual(runner.state["orchestration"].get("self_review_recovery_authorizations", []), [])
+
+    def test_cli_passes_ohpen_recovery_authorization_source_to_controller(self):
+        task_path = Path(self.temp.name) / "task.txt"
+        config_path = Path(self.temp.name) / "config.json"
+        task_path.write_text("Resume the existing workflow.\n", encoding="utf-8")
+        config_path.write_text(json.dumps(config()), encoding="utf-8")
+        captured = {}
+
+        class FakeOrchestrator:
+            def __init__(self, *_args, **kwargs):
+                captured.update(kwargs)
+            def run(self):
+                return {"status": "ACTIVE", "workflow_id": orchestrator.OHPEN_RECOVERY_WORKFLOW_ID}
+
+        with patch.object(orchestrator, "Orchestrator", FakeOrchestrator), redirect_stdout(StringIO()):
+            result = orchestrator.main(["--target", str(self.target), "--branch", "feature/task",
+                "--workflow-id", orchestrator.OHPEN_RECOVERY_WORKFLOW_ID,
+                "--task-file", str(task_path), "--config", str(config_path),
+                "--authorize-ohpen-self-review-recovery",
+                "--recovery-authorization-reference", "conversation: explicit one-use authorization"])
+        self.assertEqual(result, 3)
+        self.assertEqual(captured["self_review_recovery_authorization_reference"],
+                         "conversation: explicit one-use authorization")
 
     def test_repeated_validation_blocker_resumes_only_after_revision_changes(self):
         blocker = {"reason": "Required validation tests failed (exit 1)", "affected_phase": "TESTING",

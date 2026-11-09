@@ -37,6 +37,26 @@ from runner import _runtime_bundle_files, _runtime_bundle_unchanged  # noqa: E40
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 RISK = {"low": 0, "medium": 1, "high": 2}
 SECRET_PATH = re.compile(r"(?i)(^|/)(\.env(?:\..*)?|id_rsa|id_ed25519|.*\.(?:pem|key))$")
+DS_STORE_BASENAME = ".DS_Store"
+PROCESS_EVIDENCE_PATH = "docs/ai-process.md"
+PROCESS_EVIDENCE_START = "<!-- harness-process-evidence:start -->"
+PROCESS_EVIDENCE_END = "<!-- harness-process-evidence:end -->"
+SNAPSHOT_POLICY_UNTRACKED_DS_STORE = "untracked_ds_store_v1"
+SNAPSHOT_MIGRATION_ID = "untracked_ds_store_root_v1"
+SNAPSHOT_MIGRATION_WORKFLOW_ID = "migration-jobs-api-harness-v2"
+SNAPSHOT_MIGRATION_OLD_HASH_PREFIX = "a13f09c3"
+SNAPSHOT_MIGRATION_CURRENT_HASH_PREFIX = "95bafdcf"
+SNAPSHOT_MIGRATION_AUTHORIZATION_SCOPE = (
+    "Append one root .DS_Store snapshot migration and its explicit authorization record; "
+    "preserve all existing workflow evidence and fingerprints."
+)
+SNAPSHOT_MIGRATION_AUTHORIZATION_LIMITS = [
+    "Only the root .DS_Store baseline entry is excluded while it remains an untracked regular file.",
+    "No other workflow path, baseline hash, implementation artifact, review record, or evidence may be changed.",
+]
+OHPEN_RECOVERY_WORKFLOW_ID = "migration-jobs-api-harness-v2"
+OHPEN_RECOVERY_BLOCKER_SHA256 = "158828cddd275fb5eae34934810e3ea88653d311ee0c446b61bea663aa4ee6e9"
+OHPEN_RECOVERY_EXPECTED_ATTEMPTS = 14
 
 
 class OrchestratorError(ValueError):
@@ -355,6 +375,10 @@ def _contained(path: str, roots: list[str]) -> bool:
     return any(path == root or path.startswith(root.rstrip("/") + "/") for root in roots)
 
 
+def _process_evidence_is_in_scope(increment: dict[str, Any]) -> bool:
+    return any(_contained(PROCESS_EVIDENCE_PATH, [path]) for path in increment.get("revision_paths", []))
+
+
 def _git(target: Path, *args: str, check: bool = True) -> bytes:
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
@@ -534,9 +558,11 @@ def _observe_git_references(target: Path, tracking: dict[str, Any],
     return changed
 
 
-def _status(target: Path) -> dict[str, dict[str, Any]]:
+def _status(target: Path, *, exclude_untracked_ds_store: bool = False,
+            preserve_untracked_paths: set[str] | None = None) -> dict[str, dict[str, Any]]:
     raw = _git(target, "status", "--porcelain=v1", "-z", "--untracked-files=all")
     rows, result, i = raw.split(b"\0"), {}, 0
+    preserved = preserve_untracked_paths or set()
     while i < len(rows):
         row = rows[i]
         i += 1
@@ -554,6 +580,14 @@ def _status(target: Path) -> dict[str, dict[str, Any]]:
             result[source] = {"index_state": "renamed", "working_tree_state": "renamed",
                               "worktree_sha256": None, "index_sha256": None}
         file = target / path
+        if (exclude_untracked_ds_store and x == "?" and
+                PurePosixPath(path).name == DS_STORE_BASENAME and path not in preserved):
+            try:
+                metadata = file.lstat()
+            except FileNotFoundError:
+                metadata = None
+            if metadata is not None and stat.S_ISREG(metadata.st_mode):
+                continue
         # Never open secret/config paths while recording the Git baseline.
         if SECRET_PATH.search(path):
             content_hash = None
@@ -571,6 +605,121 @@ def _status(target: Path) -> dict[str, dict[str, Any]]:
             "index_sha256": _sha(staged) if staged else None,
         }
     return result
+
+
+def _snapshot_migration_rows(state: dict[str, Any]) -> list[dict[str, Any]]:
+    orchestration = state.get("orchestration")
+    if not isinstance(orchestration, dict):
+        raise OrchestratorError("Workflow has no valid orchestration record")
+    rows = orchestration.get("snapshot_migrations", [])
+    if not isinstance(rows, list):
+        raise OrchestratorError("Workflow snapshot migration history is malformed")
+    if not rows:
+        return []
+    if orchestration.get("snapshot_policy") != SNAPSHOT_POLICY_UNTRACKED_DS_STORE:
+        raise OrchestratorError("A snapshot migration exists without its corresponding snapshot policy")
+    if len(rows) != 1:
+        raise OrchestratorError("Workflow contains duplicate or unsupported snapshot migrations")
+    row = rows[0]
+    required = {"migration_id", "policy_id", "path", "old_sha256", "current_sha256", "reason",
+                "recorded_at", "original_bytes_recovered", "original_bytes_note", "authorization_id"}
+    if (not isinstance(row, dict) or set(row) != required or
+            row.get("migration_id") != SNAPSHOT_MIGRATION_ID or
+            row.get("policy_id") != SNAPSHOT_POLICY_UNTRACKED_DS_STORE or
+            row.get("path") != DS_STORE_BASENAME or
+            not isinstance(row.get("old_sha256"), str) or not re.fullmatch(r"[a-f0-9]{64}", row["old_sha256"]) or
+            not isinstance(row.get("current_sha256"), str) or not re.fullmatch(r"[a-f0-9]{64}", row["current_sha256"]) or
+            not isinstance(row.get("reason"), str) or not row["reason"].strip() or
+            not isinstance(row.get("original_bytes_recovered"), bool) or row["original_bytes_recovered"] is not False or
+            not isinstance(row.get("original_bytes_note"), str) or not row["original_bytes_note"].strip() or
+            not isinstance(row.get("authorization_id"), str) or not row["authorization_id"].strip()):
+        raise OrchestratorError("Workflow snapshot migration record is malformed")
+    try:
+        timestamp = datetime.fromisoformat(row["recorded_at"].replace("Z", "+00:00"))
+        if timestamp.tzinfo is None:
+            raise ValueError("timezone is required")
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise OrchestratorError("Workflow snapshot migration timestamp is invalid") from exc
+    baseline_hashes = orchestration.get("preexisting_hashes")
+    matches = [item for item in baseline_hashes if isinstance(item, dict) and item.get("path") == row["path"]] \
+        if isinstance(baseline_hashes, list) else []
+    baseline_rows = state.get("baseline", {}).get("preexisting_changes", [])
+    status_matches = [item for item in baseline_rows if isinstance(item, dict) and item.get("path") == row["path"]] \
+        if isinstance(baseline_rows, list) else []
+    if (len(matches) != 1 or matches[0].get("worktree_sha256") != row["old_sha256"] or
+            matches[0].get("index_sha256") is not None or len(status_matches) != 1 or
+            status_matches[0].get("working_tree_state") != "untracked"):
+        raise OrchestratorError("Snapshot migration no longer matches the preserved original baseline")
+    authorizations = state.get("authorizations")
+    auth_matches = [item for item in authorizations if isinstance(item, dict) and
+                    item.get("authorization_id") == row["authorization_id"]] if isinstance(authorizations, list) else []
+    workflow_id = state.get("workflow_id")
+    expected_resource = f".engineering/workflows/{workflow_id}/workflow-state.json"
+    target = state.get("target")
+    expected_target_id = target.get("target_id") if isinstance(target, dict) else None
+    if (len(auth_matches) != 1 or auth_matches[0].get("operation") != "modify_workflow_state" or
+            auth_matches[0].get("workflow_id") != workflow_id or
+            auth_matches[0].get("resource") != expected_resource or
+            auth_matches[0].get("target_id") != expected_target_id or
+            auth_matches[0].get("scope") != SNAPSHOT_MIGRATION_AUTHORIZATION_SCOPE or
+            auth_matches[0].get("limits") != SNAPSHOT_MIGRATION_AUTHORIZATION_LIMITS or
+            auth_matches[0].get("authorizer_kind") != "human" or
+            auth_matches[0].get("authorizer_role") != "Requesting user" or
+            auth_matches[0].get("authorizer_identity_assurance") != "declared" or
+            auth_matches[0].get("authorizer_authentication_reference") is not None or
+            not isinstance(auth_matches[0].get("source_reference"), str) or
+            not auth_matches[0]["source_reference"].strip() or
+            auth_matches[0].get("authority_reference") != auth_matches[0].get("source_reference")):
+        raise OrchestratorError("Snapshot migration has no matching scoped workflow-state authorization")
+    return rows
+
+
+def _snapshot_policy(state: dict[str, Any]) -> str | None:
+    orchestration = state.get("orchestration")
+    if not isinstance(orchestration, dict):
+        raise OrchestratorError("Workflow has no valid orchestration record")
+    policy = orchestration.get("snapshot_policy")
+    rows = _snapshot_migration_rows(state)
+    if policy is None:
+        if rows:
+            raise OrchestratorError("Legacy workflow cannot contain a migrated snapshot exclusion")
+        return None
+    if policy != SNAPSHOT_POLICY_UNTRACKED_DS_STORE:
+        raise OrchestratorError("Workflow uses an unsupported snapshot policy")
+    return policy
+
+
+def _preexisting_untracked_ds_store_paths(state: dict[str, Any]) -> set[str]:
+    baseline_rows = state.get("baseline", {}).get("preexisting_changes", [])
+    if not isinstance(baseline_rows, list):
+        raise OrchestratorError("Workflow pre-existing baseline is malformed")
+    migrated = {row["path"] for row in _snapshot_migration_rows(state)}
+    return {row["path"] for row in baseline_rows if isinstance(row, dict) and
+            row.get("working_tree_state") == "untracked" and
+            PurePosixPath(row.get("path", "")).name == DS_STORE_BASENAME and
+            row["path"] not in migrated}
+
+
+def _status_for_workflow(target: Path, state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    policy = _snapshot_policy(state)
+    return _status(target,
+                   exclude_untracked_ds_store=policy == SNAPSHOT_POLICY_UNTRACKED_DS_STORE,
+                   preserve_untracked_paths=_preexisting_untracked_ds_store_paths(state))
+
+
+def _index_has_path(target: Path, relative: str) -> bool:
+    return bool(_git(target, "ls-files", "--stage", "--", relative).strip())
+
+
+def _is_regular_untracked_ds_store(target: Path, relative: str) -> bool:
+    if PurePosixPath(relative).name != DS_STORE_BASENAME or _index_has_path(target, relative):
+        return False
+    path = target / relative
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISREG(info.st_mode)
 
 
 class WorkflowStore:
@@ -679,6 +828,125 @@ class WorkflowStore:
 
     def save(self, state: dict[str, Any]) -> None:
         self.write(self.state_path, state)
+
+
+def migrate_untracked_ds_store(target: str, workflow_id: str, *, expected_old_sha256: str,
+                               expected_current_sha256: str,
+                               authorization_reference: str) -> dict[str, Any]:
+    """Append the one explicit root .DS_Store migration to an existing workflow."""
+    if workflow_id != SNAPSHOT_MIGRATION_WORKFLOW_ID:
+        raise OrchestratorError("This migration is limited to the explicitly named Ohpen workflow")
+    if (not isinstance(target, str) or not Path(target).is_absolute() or
+            not isinstance(expected_old_sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", expected_old_sha256) or
+            not isinstance(expected_current_sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", expected_current_sha256) or
+            not isinstance(authorization_reference, str) or not authorization_reference.strip()):
+        raise OrchestratorError("Migration requires an absolute target, exact fingerprints, and authorization provenance")
+    root = Path(canonical(target))
+    if root != Path(target):
+        raise OrchestratorError("Migration target must be the canonical repository root")
+    report = Preflight(str(root), str(HARNESS_ROOT), None, None).run()
+    if report.get("overall_result") != "READY":
+        raise OrchestratorError(f"Target preflight is {report.get('overall_result')}: {report.get('blockers', [])}")
+    store = WorkflowStore(root, workflow_id)
+    state = store.read_state()
+    if not isinstance(state, dict):
+        raise OrchestratorError("The explicitly named existing workflow state is missing")
+    if (state.get("workflow_id") != workflow_id or not isinstance(state.get("target"), dict) or
+            state["target"].get("git_root") != str(root) or
+            state["target"].get("resolved_input_path") != str(root)):
+        raise OrchestratorError("Workflow state identifies another target or workflow")
+    orchestration = state.get("orchestration")
+    if (not isinstance(orchestration, dict) or orchestration.get("current_stage") != "SELF_REVIEW" or
+            state.get("phase") != "IMPLEMENTATION" or state.get("status") != "BLOCKED"):
+        raise OrchestratorError("The migration applies only to the existing BLOCKED IMPLEMENTATION/SELF_REVIEW workflow")
+    existing_rows = _snapshot_migration_rows(state)
+    if existing_rows:
+        row = existing_rows[0]
+        if row["old_sha256"] != expected_old_sha256:
+            raise OrchestratorError("The existing migration record does not match the requested original fingerprint")
+        return {"status": "MIGRATED", "changed": False, "workflow_id": workflow_id,
+                "migration": copy.deepcopy(row)}
+
+    baseline_hashes = orchestration.get("preexisting_hashes")
+    baseline_rows = state.get("baseline", {}).get("preexisting_changes")
+    matches = [row for row in baseline_hashes if isinstance(row, dict) and row.get("path") == DS_STORE_BASENAME] \
+        if isinstance(baseline_hashes, list) else []
+    status_matches = [row for row in baseline_rows if isinstance(row, dict) and row.get("path") == DS_STORE_BASENAME] \
+        if isinstance(baseline_rows, list) else []
+    if (len(matches) != 1 or len(status_matches) != 1 or
+            matches[0].get("worktree_sha256") != expected_old_sha256 or
+            matches[0].get("index_sha256") is not None or
+            status_matches[0].get("working_tree_state") != "untracked"):
+        raise OrchestratorError("Original root .DS_Store baseline does not match the explicitly supplied fingerprint")
+    if orchestration.get("snapshot_policy") is not None:
+        raise OrchestratorError("Workflow already has a snapshot policy but no matching migration record")
+    raw_status = _status(root)
+    current_row = raw_status.get(DS_STORE_BASENAME)
+    file = root / DS_STORE_BASENAME
+    try:
+        file_info = file.lstat()
+    except OSError as exc:
+        raise OrchestratorError("Current root .DS_Store cannot be inspected") from exc
+    if (current_row is None or current_row.get("working_tree_state") != "untracked" or
+            current_row.get("index_sha256") is not None or not stat.S_ISREG(file_info.st_mode)):
+        raise OrchestratorError("Current root .DS_Store is no longer an untracked regular file")
+    current_hash = _sha(file.read_bytes())
+    if current_hash != expected_current_sha256:
+        raise OrchestratorError("Current root .DS_Store fingerprint differs from the explicitly supplied fingerprint")
+    if (not expected_old_sha256.startswith(SNAPSHOT_MIGRATION_OLD_HASH_PREFIX) or
+            not expected_current_sha256.startswith(SNAPSHOT_MIGRATION_CURRENT_HASH_PREFIX)):
+        raise OrchestratorError("Fingerprints do not match the documented Ohpen workflow migration")
+
+    authorizations = state.get("authorizations")
+    if not isinstance(authorizations, list):
+        raise OrchestratorError("Workflow authorization history is malformed")
+    if not isinstance(state["target"].get("target_id"), str) or not state["target"]["target_id"].strip():
+        raise OrchestratorError("Workflow target identity is malformed")
+    now = _now()
+    authorization_id = f"AUTH-SNAPSHOT-{workflow_id}"
+    if any(isinstance(row, dict) and row.get("authorization_id") == authorization_id for row in authorizations):
+        raise OrchestratorError("A conflicting authorization record already uses this migration authorization ID")
+    resource = store.state_path
+    authorization = {
+        "authorization_id": authorization_id,
+        "operation": "modify_workflow_state",
+        "resource": resource,
+        "scope": SNAPSHOT_MIGRATION_AUTHORIZATION_SCOPE,
+        "target_id": state["target"].get("target_id"),
+        "workflow_id": workflow_id,
+        "limits": copy.deepcopy(SNAPSHOT_MIGRATION_AUTHORIZATION_LIMITS),
+        "authorizer_identity": "Requesting user (declared in the explicit task instruction)",
+        "authorizer_kind": "human",
+        "authorizer_role": "Requesting user",
+        "authorizer_identity_assurance": "declared",
+        "authorizer_authentication_reference": None,
+        "authorizer_session_identity": None,
+        "authority_reference": authorization_reference.strip(),
+        "authorized_at": now,
+        "source_reference": authorization_reference.strip(),
+        "expires_or_revocation": "Single use; consumed by the snapshot migration record with the same authorization_id.",
+    }
+    migration = {
+        "migration_id": SNAPSHOT_MIGRATION_ID,
+        "policy_id": SNAPSHOT_POLICY_UNTRACKED_DS_STORE,
+        "path": DS_STORE_BASENAME,
+        "old_sha256": expected_old_sha256,
+        "current_sha256": current_hash,
+        "reason": ("The workflow captured a volatile, untracked macOS metadata file and its bytes changed after initialization. "
+                   "The original bytes could not be recovered from the investigation artifacts. "
+                   "The explicit untracked .DS_Store policy excludes this exact path; every other original path and fingerprint remains enforced."),
+        "recorded_at": now,
+        "original_bytes_recovered": False,
+        "original_bytes_note": "Original file bytes could not be recovered from the investigation artifacts; the old SHA-256 is retained as historical evidence.",
+        "authorization_id": authorization_id,
+    }
+    authorizations.append(authorization)
+    orchestration["snapshot_policy"] = SNAPSHOT_POLICY_UNTRACKED_DS_STORE
+    orchestration["snapshot_migrations"] = [migration]
+    state["updated_at"] = now
+    store.save(state)
+    return {"status": "MIGRATED", "changed": True, "workflow_id": workflow_id,
+            "migration": copy.deepcopy(migration), "authorization_id": authorization_id}
 
 
 def _interaction_store(target: str, workflow_id: str) -> tuple[WorkflowStore, dict[str, Any]]:
@@ -955,6 +1223,23 @@ def validate_config(value: Any) -> dict[str, Any]:
             "code_file_extensions": extensions}
 
 
+def _planning_config_sha256(config: dict[str, Any]) -> str:
+    """Fingerprint only settings that affect requirement planning and implementation scope."""
+    planning_config = copy.deepcopy(config)
+    planning_config.pop("claude_budget_usd", None)
+    planning_config.pop("review", None)
+    return _sha(_json_bytes(planning_config))
+
+
+def _legacy_plan_config_sha256(config: dict[str, Any]) -> str:
+    """Fingerprint the former full config format for plans predating this separation."""
+    legacy_config = copy.deepcopy(config)
+    review = legacy_config.get("review")
+    if isinstance(review, dict):
+        review.pop("authorization", None)
+    return _sha(_json_bytes(legacy_config))
+
+
 def _plan_valid(plan: Any, config: dict[str, Any], *, controller_artifact_paths: list[str] | None = None) -> dict[str, Any]:
     required = {"decision", "summary", "requirements", "acceptance_criteria", "risk_band",
                 "architecture_context", "documentation_context", "capabilities_used", "increments",
@@ -1180,7 +1465,8 @@ class Orchestrator:
     def __init__(self, target: str, task: str, config: dict[str, Any], workflow_id: str,
                  *, codex: str = "codex", aily: str | None = None,
                  process_runner: Callable[..., Any] = subprocess.run,
-                 update_requirements_reason: str | None = None) -> None:
+                 update_requirements_reason: str | None = None,
+                 self_review_recovery_authorization_reference: str | None = None) -> None:
         if not Path(target).is_absolute() or not task.strip() or not SAFE_ID.fullmatch(workflow_id):
             raise OrchestratorError("An absolute target, non-empty task, and safe workflow ID are required")
         self.target = canonical(target)
@@ -1189,6 +1475,7 @@ class Orchestrator:
         self.workflow_id, self.codex, self.aily = workflow_id, codex, aily
         self.process_runner = process_runner
         self.update_requirements_reason = update_requirements_reason
+        self.self_review_recovery_authorization_reference = self_review_recovery_authorization_reference
         self._codex_version: str | None = None
         self._codex_model: str | None = None
         self._codex_provider: str | None = None
@@ -1216,7 +1503,8 @@ class Orchestrator:
             raise OrchestratorError(f"Target preflight is {report['overall_result']}: {report.get('blockers', [])}")
         self.store.ensure_directory()
         existing = self.store.read_state()
-        current = _status(self.target)
+        current = (_status_for_workflow(self.target, existing) if existing is not None else
+                   _status(self.target, exclude_untracked_ds_store=True))
         if existing:
             status = existing.get("status")
             target_record = existing.get("target")
@@ -1261,12 +1549,16 @@ class Orchestrator:
                     not isinstance(orchestration.get("increments"), list) or
                     not isinstance(orchestration.get("validation_results"), list)):
                 raise OrchestratorError("Existing workflow state has malformed baseline, authorization, or history records")
+            migrated_snapshot_paths = {row["path"] for row in _snapshot_migration_rows(existing)}
             for item in preexisting_hashes:
                 if (not isinstance(item, dict) or not isinstance(item.get("path"), str) or
                         not isinstance(item.get("protected_path"), bool) or
                         item.get("worktree_sha256") is not None and not isinstance(item.get("worktree_sha256"), str) or
                         item.get("index_sha256") is not None and not isinstance(item.get("index_sha256"), str)):
                     raise OrchestratorError("Existing workflow state contains a malformed pre-existing path record")
+                if item["path"] in migrated_snapshot_paths and \
+                        _is_regular_untracked_ds_store(self.target, item["path"]):
+                    continue
                 latest = current.get(item["path"])
                 if (not latest or latest["index_sha256"] != item["index_sha256"] or
                         (not item.get("protected_path") and latest["worktree_sha256"] != item["worktree_sha256"])):
@@ -1343,7 +1635,8 @@ class Orchestrator:
                 "identity_assurance": "declared", "source_reference": f"task:{self.workflow_id}",
                 "authentication_reference": None, "authority_reference": None},
             "claude_review_cycles": [], "pending_decisions": [], "updated_at": _now(),
-            "orchestration": {"version": 1, "task_sha256": _sha(self.task.encode()),
+            "orchestration": {"version": 1, "snapshot_policy": SNAPSHOT_POLICY_UNTRACKED_DS_STORE,
+                "snapshot_migrations": [], "task_sha256": _sha(self.task.encode()),
                 "config_sha256": _sha(_json_bytes(self.config)),
                 "branch": branch, "current_stage": "PLANNING", "max_iterations": self.config["max_iterations"],
                 "git_tracking": git_tracking,
@@ -1353,7 +1646,7 @@ class Orchestrator:
                 "requirement_history": [{"version": 1, "task_sha256": _sha(self.task.encode()),
                     "task_reference": f"{self.store.directory}/requirements-v1.json", "reason": "initial requirement snapshot",
                     "created_at": _now(), "status": "current"}],
-                "invalidations": [], "self_reviews": [],
+                "invalidations": [], "self_reviews": [], "self_review_recovery_authorizations": [],
                 "config_snapshot": copy.deepcopy(self.config),
                 "claude_authorization": copy.deepcopy(self.config["review"].get("authorization")),
                 "claude_authorization_history": ([{"authorization_id": self.config["review"]["authorization"]["authorization_id"],
@@ -1713,6 +2006,107 @@ class Orchestrator:
             return None
         return previous_revision, current_revision
 
+    def _recovery_context(self, blocker_hash: str) -> dict[str, Any]:
+        """Fingerprint the inputs that determine whether a blocked stage can make progress."""
+        orchestration = self.state["orchestration"]
+        revision_id = None
+        plan_reference = orchestration.get("plan_reference")
+        increment_id = orchestration.get("current_increment_id")
+        if isinstance(plan_reference, str) and isinstance(increment_id, str):
+            plan_path = _relative(plan_reference, "plan_reference")
+            if not plan_path.startswith(self.store.directory + "/"):
+                raise OrchestratorError("Existing plan reference is outside the workflow artifact directory")
+            plan = self._read_plan(plan_path)
+            increment = next((row for row in plan["increments"] if row.get("increment_id") == increment_id), None)
+            if increment is not None:
+                revision_id, _manifest, _reference = self._revision_manifest(increment)
+        with tempfile.TemporaryDirectory(prefix="orchestrator-recovery-context-") as temp:
+            try:
+                runtime_files = _runtime_bundle_files(Path(temp).resolve())
+            except Exception as exc:
+                raise OrchestratorError(f"Could not fingerprint the current harness runtime: {exc}") from exc
+        return {"workflow_id": self.workflow_id, "stage": orchestration.get("current_stage"),
+            "blocker_sha256": blocker_hash,
+            "requirement_version": orchestration.get("current_requirement_version", 1),
+            "task_sha256": orchestration.get("task_sha256"),
+            "config_sha256": orchestration.get("config_sha256"),
+            "target_baseline_commit": self.state.get("baseline", {}).get("commit"),
+            "revision_id": revision_id,
+            "harness_orchestrator_sha256": _sha(Path(__file__).read_bytes()),
+            "runtime_bundle_sha256": _sha(_json_bytes(runtime_files)),
+            "codex": self._codex_runtime_metadata(self.codex)}
+
+    def _legacy_resume_context_changed(self, attempts: list[dict[str, Any]],
+                                       prior_resume: dict[str, Any],
+                                       current: dict[str, Any]) -> bool:
+        """Allow a legacy resume once when a recorded stage input demonstrably changed."""
+        try:
+            resume_index = max(index for index, row in enumerate(attempts) if row is prior_resume)
+        except ValueError:
+            return False
+        stage = current.get("stage")
+        later = [row for row in attempts[resume_index + 1:]
+                 if isinstance(row, dict) and row.get("stage") == stage and isinstance(row.get("trace"), dict)]
+        if not later:
+            return False
+        trace = later[-1]["trace"]
+        comparisons = (("harness_orchestrator_sha256", "harness_orchestrator_sha256"),
+            ("runtime_bundle_sha256", "runtime_bundle_sha256"),
+            ("requirement_sha256", "task_sha256"),
+            ("workflow_config_sha256", "config_sha256"),
+            ("reviewed_revision_id", "revision_id"),
+            ("model", "codex.model"), ("provider", "codex.provider"),
+            ("cli_version", "codex.cli_version"))
+        for recorded_key, current_key in comparisons:
+            recorded = trace.get(recorded_key)
+            if current_key.startswith("codex."):
+                observed = current.get("codex", {}).get(current_key.split(".", 1)[1])
+            else:
+                observed = current.get(current_key)
+            if isinstance(recorded, str) and isinstance(observed, str) and recorded != observed:
+                return True
+        return False
+
+    def _authorize_ohpen_self_review_recovery(self, blocker_hash: str) -> dict[str, Any] | None:
+        reference = self.self_review_recovery_authorization_reference
+        if reference is None:
+            return None
+        orchestration = self.state["orchestration"]
+        blocker = self.state.get("blocker", {})
+        attempts = orchestration.get("attempts", [])
+        if (not isinstance(reference, str) or not reference.strip() or len(reference) > 1000 or
+                self.workflow_id != OHPEN_RECOVERY_WORKFLOW_ID or self.state.get("status") != "BLOCKED" or
+                orchestration.get("current_stage") != "SELF_REVIEW" or
+                blocker_hash != OHPEN_RECOVERY_BLOCKER_SHA256 or
+                blocker.get("reason") != "Self-review findings remain after the bounded correction loop" or
+                len(attempts) != OHPEN_RECOVERY_EXPECTED_ATTEMPTS):
+            raise OrchestratorError("One-use recovery authorization does not match the recorded Ohpen workflow state")
+        rows = orchestration.setdefault("self_review_recovery_authorizations", [])
+        if rows:
+            raise OrchestratorError("The one-use Ohpen self-review recovery authorization was already recorded")
+        authorization = {"authorization_id": f"AUTH-SELF-REVIEW-{self.workflow_id}-{blocker_hash[:12]}",
+            "operation": "resume_blocked_self_review_once", "target_id": self.state["target"]["target_id"],
+            "workflow_id": self.workflow_id, "stage": "SELF_REVIEW", "blocker_sha256": blocker_hash,
+            "reason": "User authorized one recovery to exercise the controller-managed process-evidence lifecycle.",
+            "source_reference": reference.strip(), "authorizer_identity": "Requesting user",
+            "identity_assurance": "declared", "authorized_at": _now(), "status": "authorized",
+            "consumed_at": None, "resume_attempt_number": None}
+        rows.append(authorization)
+        self._save()
+        return authorization
+
+    def _available_ohpen_self_review_recovery(self, blocker_hash: str) -> dict[str, Any] | None:
+        rows = self.state["orchestration"].get("self_review_recovery_authorizations", [])
+        if not isinstance(rows, list):
+            raise OrchestratorError("Self-review recovery authorization history is malformed")
+        matches = [row for row in rows if isinstance(row, dict) and
+                   row.get("workflow_id") == self.workflow_id and row.get("blocker_sha256") == blocker_hash]
+        if len(matches) > 1:
+            raise OrchestratorError("Workflow contains duplicate one-use self-review recovery authorizations")
+        if matches and matches[0].get("status") == "authorized":
+            return matches[0]
+        return None
+
     def _codex_runtime_metadata(self, binary: str) -> dict[str, Any]:
         if self._codex_version is None:
             self._codex_version = "unavailable"
@@ -1746,9 +2140,11 @@ class Orchestrator:
         version = self.state["orchestration"].get("current_requirement_version", 1)
         if isinstance(saved, dict) and saved.get("artifact_schema_version") == 1:
             expected = {"artifact_schema_version": 1, "requirement_version": version,
-                "task_sha256": self.state["orchestration"].get("task_sha256"),
-                "config_sha256": self.state["orchestration"].get("config_sha256")}
-            if any(saved.get(key) != value for key, value in expected.items()):
+                "task_sha256": self.state["orchestration"].get("task_sha256")}
+            valid_config_hashes = {_planning_config_sha256(self.config),
+                                   _legacy_plan_config_sha256(self.config)}
+            if (any(saved.get(key) != value for key, value in expected.items()) or
+                    saved.get("config_sha256") not in valid_config_hashes):
                 raise OrchestratorError("Stored plan does not match the current requirement/configuration version")
             plan = saved.get("plan")
             if not isinstance(plan, dict):
@@ -1842,6 +2238,8 @@ class Orchestrator:
             "capabilities": self._source_trace(context), "skills": _skill_trace(stage, self.target, skill_context),
             "result_status": "not_returned",
             "result_summary": None, "diagnostic": None, "changed_paths": [], "changed_content_sha256": []}
+        if stage == "SELF_REVIEW" and isinstance(context.get("revision_before_review"), str):
+            trace["reviewed_revision_id"] = context["revision_before_review"]
         return trace
 
     def _run_codex(self, stage: str, context: dict[str, Any], runtime: Path,
@@ -1868,6 +2266,7 @@ class Orchestrator:
             "Read applicable target AGENTS.md instructions, README/build guidance, and only the repository skills relevant to this task. "
             "Return every instruction, skill, or tool contract actually used in capabilities_used, including its repository-relative source path, applicable phases, and rationale. "
             "Do not read environment files, credentials, private configuration, or unrelated paths. Do not install or download skills. "
+            f"{PROCESS_EVIDENCE_PATH} is controller-managed process evidence: do not edit it or return findings about it. "
             + ("Analyze and plan only. Do not write any file. If human input is required, include a complete decision_context: "
                "classify it as functional, external data transfer, restricted operation, security risk acceptance, "
                "High-risk approval, criterion waiver, or unclassified; include the exact question, proposed resolution, "
@@ -1877,7 +2276,7 @@ class Orchestrator:
                "or High-risk approvals. Otherwise set it false. When the plan is READY, decision_context must be null. "
                "Re-evaluate the current architecture classification and rationale from the target repository patterns, including DataView/non-DataView where applicable. Reassess applicable capabilities/skills, dependencies, write scopes, acceptance criteria, and validations from the current requirement version. Do not carry forward superseded decisions as approvals. Return only JSON matching the schema.\n"
                if stage == "PLANNING" else
-               "Perform a read-only self-review of the exact current increment against the current requirement, approved decisions, architecture context, selected skills and their repository patterns, acceptance criteria, and authorized scope. Report every concrete deviation. If findings exist, provide the minimal safe corrections as complete UTF-8 file contents in changes; do not claim unresolved findings are corrected. Do not write files directly. Return only JSON matching the self-review schema.\n"
+               "Perform a read-only self-review of the exact current implementation increment against the current requirement, approved decisions, architecture context, selected skills and their repository patterns, acceptance criteria, and authorized review scope. Report every concrete implementation deviation. Use only workflow records available at the evidence_cutoff in Stage context; assess no record created after that cutoff. The controller-managed process evidence file is excluded from review and must not be required to describe this or any future self-review execution. If implementation findings exist, provide the minimal safe corrections as complete UTF-8 file contents in changes; do not claim unresolved findings are corrected. Do not write files directly. Return only JSON matching the self-review schema.\n"
                if stage == "SELF_REVIEW" else
                "Implement only the current increment by returning complete UTF-8 text for changed/new files in the JSON changes array. "
                "You are read-only and must not write target files directly. Every changed path must be beneath exactly one supplied code_paths or artifact_paths entry. "
@@ -2012,15 +2411,34 @@ class Orchestrator:
                     return self._result()
                 blocker = self.state.get("blocker", {})
                 blocker_hash = _blocker_fingerprint(blocker)
-                prior = [row for row in self.state["orchestration"].get("attempts", [])
+                attempts = self.state["orchestration"].get("attempts", [])
+                prior = [row for row in attempts
                          if row.get("stage") == "RESUME" and row.get("blocker_sha256") == blocker_hash]
-                changed_validation_revision = self._changed_validation_revision(blocker)
-                if prior and changed_validation_revision is None:
+                authorization = self._authorize_ohpen_self_review_recovery(blocker_hash)
+                authorization = authorization or self._available_ohpen_self_review_recovery(blocker_hash)
+                recorded_recovery_auths = self.state["orchestration"].get("self_review_recovery_authorizations", [])
+                if any(isinstance(row, dict) and row.get("blocker_sha256") == blocker_hash and
+                       row.get("status") == "consumed" for row in recorded_recovery_auths):
                     return self._result()
+                changed_validation_revision = self._changed_validation_revision(blocker)
+                recovery_context = self._recovery_context(blocker_hash)
+                recovery_context_sha256 = _sha(_jcs(recovery_context))
+                changed_execution_context = False
+                if prior:
+                    previous_context = prior[-1].get("recovery_context_sha256")
+                    if isinstance(previous_context, str):
+                        changed_execution_context = previous_context != recovery_context_sha256
+                    else:
+                        changed_execution_context = self._legacy_resume_context_changed(
+                            attempts, prior[-1], recovery_context)
+                    if (changed_validation_revision is None and not changed_execution_context and
+                            authorization is None):
+                        return self._result()
                 resume_attempt = {
                     "stage": "RESUME", "schema": None, "started_at": _now(), "finished_at": _now(),
                     "exit_code": 0, "duration_ms": 0, "result_sha256": None,
-                    "blocker_sha256": blocker_hash,
+                    "blocker_sha256": blocker_hash, "recovery_context_sha256": recovery_context_sha256,
+                    "recovery_context": recovery_context,
                 }
                 if changed_validation_revision is not None:
                     resume_attempt.update({
@@ -2028,6 +2446,14 @@ class Orchestrator:
                         "previous_revision_id": changed_validation_revision[0],
                         "current_revision_id": changed_validation_revision[1],
                     })
+                if authorization is not None:
+                    authorization["status"] = "consumed"
+                    authorization["consumed_at"] = _now()
+                    authorization["resume_attempt_number"] = len(attempts) + 1
+                    resume_attempt["resume_basis"] = "authorized_self_review_recovery"
+                    resume_attempt["recovery_authorization_id"] = authorization["authorization_id"]
+                elif changed_execution_context:
+                    resume_attempt["resume_basis"] = "changed_execution_context"
                 self.state["orchestration"]["attempts"].append(resume_attempt)
                 self.state["status"] = "ACTIVE"
                 self.state.pop("blocker", None)
@@ -2064,6 +2490,20 @@ class Orchestrator:
                     "safe_recovery_path": "Resolve the recorded blocker and resume with the same target, task, and workflow ID.",
                 }
                 self._save()
+                plan_reference = orchestration.get("plan_reference")
+                increment_id = orchestration.get("current_increment_id")
+                if isinstance(plan_reference, str) and isinstance(increment_id, str):
+                    try:
+                        plan_path = _relative(plan_reference, "plan_reference")
+                        if plan_path.startswith(self.store.directory + "/"):
+                            saved_plan = self._read_plan(plan_path)
+                            increment = next((row for row in saved_plan["increments"]
+                                              if row.get("increment_id") == increment_id), None)
+                            if increment is not None:
+                                self._sync_process_evidence(increment)
+                    except (OSError, OrchestratorError, ValueError) as evidence_exc:
+                        self.state["blocker"]["process_evidence_update_error"] = _redact(str(evidence_exc))[:1000]
+                        self._save()
             raise
 
     def _planning(self, runtime: Path) -> dict[str, Any] | None:
@@ -2141,7 +2581,7 @@ class Orchestrator:
             item["artifact_paths"] = sorted(set(item["artifact_paths"] + [self.store.directory]))
         self.state["applied_capabilities"] = plan["capabilities_used"]
         self.store.write(plan_path, {"artifact_schema_version": 1, "requirement_version": version,
-            "task_sha256": orchestration["task_sha256"], "config_sha256": orchestration["config_sha256"],
+            "task_sha256": orchestration["task_sha256"], "config_sha256": _planning_config_sha256(self.config),
             "plan": plan})
         self._activate_plan(plan, plan_path, version)
         return plan
@@ -2173,6 +2613,8 @@ class Orchestrator:
             "acceptance_criteria": copy.deepcopy(plan["acceptance_criteria"]),
             "constraints": {"task": self.task, "code_paths": increment["code_paths"],
                 "artifact_paths": increment["artifact_paths"], "revision_paths": increment["revision_paths"],
+                "controller_managed_paths": [PROCESS_EVIDENCE_PATH],
+                "revision_exclusions": [PROCESS_EVIDENCE_PATH] if _process_evidence_is_in_scope(increment) else [],
                 "authorized_code_paths": self.config["authorized_code_paths"],
                 "authorized_artifact_paths": self.config["authorized_artifact_paths"]},
             "scope": copy.deepcopy(self.state["scope"]),
@@ -2204,6 +2646,8 @@ class Orchestrator:
             if not isinstance(finding["severity"], str) or finding["severity"] not in {"critical", "high", "medium", "low"}:
                 raise OrchestratorError("Self-review finding severity is invalid")
             path = _relative(finding["file"], "self-review finding file")
+            if path == PROCESS_EVIDENCE_PATH:
+                raise OrchestratorError("Self-review cannot report findings against controller-managed process evidence")
             if not _contained(path, increment["code_paths"] + increment["artifact_paths"]):
                 raise OrchestratorError("Self-review finding refers outside the increment allowlist")
             if any(not isinstance(finding[key], str) or not finding[key].strip()
@@ -2212,6 +2656,8 @@ class Orchestrator:
         for change in value["changes"]:
             if not isinstance(change, dict) or set(change) != {"path", "content"} or not isinstance(change["content"], str):
                 raise OrchestratorError("Self-review changes must contain only path and complete text content")
+            if _relative(change["path"], "self-review correction path") == PROCESS_EVIDENCE_PATH:
+                raise OrchestratorError("Self-review cannot change controller-managed process evidence")
         if value["decision"] == "PASS" and (value["findings"] or value["changes"]):
             raise OrchestratorError("PASS self-review cannot contain findings or changes")
         if value["decision"] == "CORRECTED" and (not value["findings"] or not value["changes"]):
@@ -2231,38 +2677,70 @@ class Orchestrator:
         if existing is not None:
             return
         self._set_stage("SELF_REVIEW", "IMPLEMENTATION")
-        context = self._implementation_context(plan, increment)
+        review_increment = copy.deepcopy(increment)
+        review_increment["revision_paths"] = [path for path in increment["revision_paths"]
+                                               if path != PROCESS_EVIDENCE_PATH]
+        context = self._implementation_context(plan, review_increment)
         context.update({"review_mode": "self-review; not independent review or approval",
             "revision_before_review": before_revision,
             "changed_paths": next((row.get("changed_paths", []) for row in orchestration["increments"]
                                     if row.get("increment_id") == increment["increment_id"]), []),
             "review_checklist": ["current requirement and version", "approved decisions", "architecture context",
-                "applicable skills and repository patterns", "acceptance criteria", "authorized paths"]})
+                "applicable skills and repository patterns", "acceptance criteria", "authorized implementation paths"],
+            "controller_managed_paths": [PROCESS_EVIDENCE_PATH],
+            "evidence_cutoff": {"observed_at": _now(), "attempt_count": len(orchestration["attempts"]),
+                "self_review_count": len(orchestration["self_reviews"]),
+                "validation_count": len(orchestration["validation_results"]),
+                "review_count": len(orchestration.get("review_results", []))}})
         findings: list[dict[str, Any]] = []
         correction_count = 0
         passed = False
         while correction_count <= self.config["max_iterations"]:
             review = self._self_review_valid(self._run_codex("SELF_REVIEW", context, runtime,
                 "orchestrator-self-review.schema.json", sandbox="read-only"), increment)
+            attempt = orchestration["attempts"][-1]
+            trace = attempt.setdefault("trace", {})
+            trace["self_review_result"] = {"decision": review["decision"],
+                "summary": _redact(review["summary"]), "correction_round": correction_count,
+                "evidence_cutoff": copy.deepcopy(context["evidence_cutoff"]),
+                "findings": [], "correction_paths": [item["path"] for item in review["changes"]],
+                "corrections_applied": False, "correction_limit_reached": False}
             for finding in review["findings"]:
                 safe_finding = copy.deepcopy(finding)
                 safe_finding["description"] = _redact(safe_finding["description"])
                 safe_finding["recommendation"] = _redact(safe_finding["recommendation"])
                 if safe_finding not in findings:
                     findings.append(safe_finding)
+                trace["self_review_result"]["findings"].append(safe_finding)
             if review["decision"] == "BLOCKED":
+                trace["self_review_result"]["outcome"] = "blocked"
+                self._save()
+                self._sync_process_evidence(increment)
                 raise OrchestratorError("Self-review is blocked: " + _redact(review["summary"]))
             if review["decision"] == "PASS":
+                trace["self_review_result"]["outcome"] = "passed"
                 passed = True
                 break
             if correction_count >= self.config["max_iterations"]:
+                trace["self_review_result"]["outcome"] = "correction_limit_reached"
+                trace["self_review_result"]["correction_limit_reached"] = True
+                self._save()
+                self._sync_process_evidence(increment)
                 break
-            self._apply_changes(review["changes"], increment)
+            self._apply_changes(review["changes"], review_increment)
             correction_count += 1
+            trace["self_review_result"]["outcome"] = "corrections_applied"
+            trace["self_review_result"]["corrections_applied"] = True
+            self._save()
+            self._sync_process_evidence(increment)
             context.update({"review_mode": "verify self-review and any prior corrections",
                 "prior_self_review_findings": findings,
                 "correction_paths": [item["path"] for item in review["changes"]],
-                "correction_pass": correction_count})
+                "correction_pass": correction_count,
+                "evidence_cutoff": {"observed_at": _now(), "attempt_count": len(orchestration["attempts"]),
+                    "self_review_count": len(orchestration["self_reviews"]),
+                    "validation_count": len(orchestration["validation_results"]),
+                    "review_count": len(orchestration.get("review_results", []))}})
         if not passed:
             raise OrchestratorError("Self-review findings remain after the bounded correction loop")
         after_revision, _, _ = self._revision_manifest(increment)
@@ -2272,6 +2750,110 @@ class Orchestrator:
             "correction_passes": correction_count, "completed_at": _now(),
             "classification": "self_review_not_independent"})
         self._save()
+        self._sync_process_evidence(increment)
+
+    @staticmethod
+    def _markdown_cell(value: Any) -> str:
+        if value is None:
+            return ""
+        return _redact(str(value)).replace("|", "\\|").replace("\n", " ").replace("\r", " ")
+
+    def _process_evidence_content(self, existing: str) -> str:
+        orchestration = self.state["orchestration"]
+        attempts = orchestration.get("attempts", [])
+        rows = [PROCESS_EVIDENCE_START,
+            "## Controller-managed workflow evidence",
+            "",
+            "This section is generated from the persisted workflow state. Self-review assesses implementation quality using records available at each recorded evidence cutoff; it does not require this section to contain its own or future review results.",
+            "",
+            f"- Workflow: `{self.workflow_id}`",
+            f"- Status/stage when generated: `{self.state.get('status')}` / `{orchestration.get('current_stage')}`",
+            f"- Requirement version: `{orchestration.get('current_requirement_version', 1)}`",
+            f"- Persisted execution attempts: {len(attempts)}",
+            f"- Persisted successful self-reviews: {len(orchestration.get('self_reviews', []))}",
+            f"- Persisted validation results: {len(orchestration.get('validation_results', []))}",
+            "",
+            "### Execution attempts",
+            "",
+            "| # | Stage | Started | Finished | Exit | Outcome | Summary |",
+            "|---:|---|---|---|---:|---|---|"]
+        for index, attempt in enumerate(attempts, 1):
+            trace = attempt.get("trace", {}) if isinstance(attempt, dict) else {}
+            rows.append("| " + " | ".join(self._markdown_cell(value) for value in (
+                index, attempt.get("stage"), attempt.get("started_at"), attempt.get("finished_at"),
+                attempt.get("exit_code"), trace.get("result_status"), trace.get("result_summary") or
+                (trace.get("self_review_result", {}).get("summary") if isinstance(trace.get("self_review_result"), dict) else "")
+            )) + " |")
+            review_result = trace.get("self_review_result") if isinstance(trace, dict) else None
+            if isinstance(review_result, dict):
+                cutoff = review_result.get("evidence_cutoff", {})
+                rows.extend(["", f"Self-review evidence cutoff: `{cutoff.get('observed_at')}`; "
+                    f"{cutoff.get('attempt_count')} attempts, {cutoff.get('self_review_count')} self-review results, "
+                    f"{cutoff.get('validation_count')} validations, and {cutoff.get('review_count')} review records were available at review start.",
+                    f"Correction round: {review_result.get('correction_round')}; outcome: `{review_result.get('outcome')}`."])
+                for finding in review_result.get("findings", []):
+                    rows.append(f"- Finding `{self._markdown_cell(finding.get('id'))}` "
+                        f"({self._markdown_cell(finding.get('severity'))}, `{self._markdown_cell(finding.get('file'))}`): "
+                        f"{self._markdown_cell(finding.get('description'))} Recommendation: "
+                        f"{self._markdown_cell(finding.get('recommendation'))}")
+                paths = review_result.get("correction_paths", [])
+                rows.append("- Proposed correction paths: " + (", ".join(f"`{self._markdown_cell(path)}`" for path in paths) or "none"))
+        rows.extend(["", "### Successful self-reviews", "",
+            "| Requirement | Increment | Completed | Result | Correction passes | Findings | Revision |",
+            "|---:|---|---|---|---:|---:|---|"])
+        for review in orchestration.get("self_reviews", []):
+            rows.append("| " + " | ".join(self._markdown_cell(value) for value in (
+                review.get("requirement_version"), review.get("increment_id"), review.get("completed_at"),
+                review.get("status"), review.get("correction_passes"), len(review.get("findings", [])),
+                review.get("revision_after"))) + " |")
+        rows.extend(["", "### Validation results", "",
+            "| ID | Command | Started | Finished | Exit | Observed result |",
+            "|---|---|---|---|---:|---|"])
+        for result in orchestration.get("validation_results", []):
+            rows.append("| " + " | ".join(self._markdown_cell(value) for value in (
+                result.get("evidence_id"), shlex.join(result.get("argv", [])), result.get("started_at"),
+                result.get("finished_at"), result.get("exit_code"), result.get("observed_result"))) + " |")
+        blocker = self.state.get("blocker")
+        rows.extend(["", "### Current disposition", "",
+            self._markdown_cell(blocker.get("reason")) if isinstance(blocker, dict) else
+            ("No blocker is recorded." if self.state.get("status") not in {"WAITING_FOR_HUMAN"} else
+             "The workflow is waiting for human input; see the workflow state for the exact decision."),
+            "", PROCESS_EVIDENCE_END])
+        generated = "\n".join(rows).rstrip() + "\n"
+        start = existing.find(PROCESS_EVIDENCE_START)
+        end = existing.find(PROCESS_EVIDENCE_END)
+        if (start == -1) != (end == -1) or (start != -1 and end < start):
+            raise OrchestratorError("Controller-managed process evidence markers are malformed")
+        if start >= 0:
+            return existing[:start] + generated + existing[end + len(PROCESS_EVIDENCE_END):].lstrip("\n")
+        return existing.rstrip() + "\n\n" + generated if existing.strip() else generated
+
+    def _sync_process_evidence(self, increment: dict[str, Any]) -> None:
+        if not _contained(PROCESS_EVIDENCE_PATH, increment.get("artifact_paths", [])):
+            return
+        path = self.target / PROCESS_EVIDENCE_PATH
+        if path.is_symlink():
+            raise OrchestratorError("Controller-managed process evidence path is a symlink")
+        if path.exists() and not path.is_file():
+            raise OrchestratorError("Controller-managed process evidence is not a regular file")
+        existing = path.read_text(encoding="utf-8") if path.exists() else ""
+        content = self._process_evidence_content(existing).encode("utf-8")
+        digest = _sha(content)
+        if not path.exists() or path.read_bytes() != content:
+            with tempfile.TemporaryDirectory(prefix="harness-process-evidence-") as temp:
+                cfg = self.store._config(Path(temp), self.target, PROCESS_EVIDENCE_PATH, classification="artifact")
+                if path.exists():
+                    replace_file(self.target, cfg, PROCESS_EVIDENCE_PATH, content, _sha(path.read_bytes()))
+                else:
+                    create_file(self.target, cfg, PROCESS_EVIDENCE_PATH, content)
+        orchestration = self.state["orchestration"]
+        metadata = {"path": PROCESS_EVIDENCE_PATH, "sha256": digest, "updated_at": _now(),
+            "attempt_count": len(orchestration.get("attempts", [])),
+            "self_review_count": len(orchestration.get("self_reviews", [])),
+            "validation_count": len(orchestration.get("validation_results", []))}
+        if orchestration.get("process_evidence") != metadata:
+            orchestration["process_evidence"] = metadata
+            self._save()
 
     def _increment(self, plan: dict[str, Any], increment: dict[str, Any], runtime: Path) -> None:
         orchestration = self.state["orchestration"]
@@ -2295,14 +2877,15 @@ class Orchestrator:
             raise OrchestratorError(f"Unsupported increment resume state: {record['status']}")
         self._assert_increment_changes(increment)
         record["status"] = "implemented"
-        current = _status(self.target)
+        current = _status_for_workflow(self.target, self.state)
         baseline = {row["path"] for row in self.state["baseline"]["preexisting_changes"]}
         record["changed_paths"] = sorted(path for path in set(current) - baseline
             if not (path == self.store.directory or path.startswith(self.store.directory + "/")))
         self._save()
         self._self_review(plan, increment, runtime)
+        self._sync_process_evidence(increment)
         self._assert_increment_changes(increment)
-        current = _status(self.target)
+        current = _status_for_workflow(self.target, self.state)
         baseline = {row["path"] for row in self.state["baseline"]["preexisting_changes"]}
         changed = sorted(path for path in set(current) - baseline
                          if not (path == self.store.directory or path.startswith(self.store.directory + "/")))
@@ -2319,7 +2902,7 @@ class Orchestrator:
         self._validate(plan, increment, revision_id)
 
     def _assert_increment_changes(self, increment: dict[str, Any]) -> None:
-        current = _status(self.target)
+        current = _status_for_workflow(self.target, self.state)
         baseline = {row["path"] for row in self.state["baseline"]["preexisting_changes"]}
         changed = sorted(path for path in set(current) - baseline
                          if not (path == self.store.directory or path.startswith(self.store.directory + "/")))
@@ -2327,8 +2910,12 @@ class Orchestrator:
         unexpected = [path for path in changed if not _contained(path, authorized)]
         if unexpected:
             raise OrchestratorError(f"Agent changed paths outside authorized increment scope: {unexpected}")
+        migrated_snapshot_paths = {row["path"] for row in _snapshot_migration_rows(self.state)}
         for path in baseline:
             saved = next(x for x in self.state["orchestration"]["preexisting_hashes"] if x["path"] == path)
+            if path in migrated_snapshot_paths and \
+                    _is_regular_untracked_ds_store(self.target, path):
+                continue
             now = current.get(path)
             if (not now or now["index_sha256"] != saved["index_sha256"] or
                     (not saved.get("protected_path") and now["worktree_sha256"] != saved["worktree_sha256"])):
@@ -2336,6 +2923,7 @@ class Orchestrator:
 
     def _revision_manifest(self, increment: dict[str, Any]) -> tuple[str, dict[str, Any], str]:
         files: dict[str, dict[str, Any]] = {}
+        managed_exclusions = [PROCESS_EVIDENCE_PATH] if _process_evidence_is_in_scope(increment) else []
         for relative in increment["revision_paths"]:
             path = self.target / relative
             if not path.exists() and not path.is_symlink():
@@ -2358,7 +2946,14 @@ class Orchestrator:
             for candidate in candidates:
                 name = candidate.relative_to(self.target).as_posix()
                 _relative(name, "revision manifest path")
+                if name in managed_exclusions:
+                    continue
                 item = candidate.lstat()
+                if (self.state.get("orchestration", {}).get("snapshot_policy") ==
+                        SNAPSHOT_POLICY_UNTRACKED_DS_STORE and
+                        PurePosixPath(name).name == DS_STORE_BASENAME and
+                        stat.S_ISREG(item.st_mode) and not _index_has_path(self.target, name)):
+                    continue
                 if stat.S_ISLNK(item.st_mode):
                     resolved = candidate.resolve(strict=True)
                     if resolved != self.target and self.target not in resolved.parents:
@@ -2377,6 +2972,8 @@ class Orchestrator:
             raise OrchestratorError("The final revision manifest contains no files")
         material = {"baseline_commit": self.state["baseline"]["commit"],
                     "revision_paths": sorted(increment["revision_paths"]), "manifest": manifest_rows}
+        if managed_exclusions:
+            material["excluded_paths"] = managed_exclusions
         revision_id = "content:" + _sha(_jcs(material))
         artifact_path = f"{self.store.directory}/revision-manifest-{increment['increment_id']}.json"
         return revision_id, {**material, "revision_id": revision_id}, artifact_path
@@ -2406,6 +3003,8 @@ class Orchestrator:
             if not isinstance(change, dict) or set(change) != {"path", "content"}:
                 raise OrchestratorError("Each Codex file change must contain only path and content")
             path = _relative(change["path"], "Codex changed path")
+            if path == PROCESS_EVIDENCE_PATH:
+                raise OrchestratorError(f"Codex cannot modify controller-managed process evidence: {path}")
             if path in seen or not _contained(path, allowed):
                 raise OrchestratorError(f"Codex file change is duplicate or outside its allowlist: {path}")
             classification = "code" if _contained(path, increment["code_paths"]) else "artifact"
@@ -2494,6 +3093,7 @@ class Orchestrator:
                 self.state["artifact_references"].append(evidence_path)
             self.state["orchestration"]["validation_results"].append(result)
             self._save()
+            self._sync_process_evidence(increment)
             if result["exit_code"] != 0:
                 raise OrchestratorError(f"Required validation {validation_id} failed (exit {result['exit_code']})")
         record = next(x for x in self.state["orchestration"]["increments"] if x["increment_id"] == increment["increment_id"])
@@ -3045,7 +3645,7 @@ class Orchestrator:
         upstream_moved = ((upstream_commit != initial_upstream)
                           if upstream_ref and not tracking.get("migration") else None)
         base_moved = (observed_base != tracking.get("base_commit")) if base_ref not in {"HEAD", "legacy:HEAD"} else False
-        cleanliness = not _status(self.target)
+        cleanliness = not _status_for_workflow(self.target, self.state)
         note = None
         if isinstance(behind, int) and behind > 0:
             note = ("The branch is behind the observed upstream; this does not change the pinned workflow baseline "
@@ -3094,6 +3694,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--update-requirements", action="store_true",
                         help="Append a new requirement version to an existing workflow and force replanning")
     parser.add_argument("--update-reason", help="Required auditable reason for --update-requirements")
+    parser.add_argument("--migrate-untracked-ds-store", action="store_true",
+                        help="Apply the explicit root .DS_Store migration to the named Ohpen workflow")
+    parser.add_argument("--expected-old-sha256", help="Recorded pre-migration .DS_Store fingerprint")
+    parser.add_argument("--expected-current-sha256", help="Current .DS_Store fingerprint required for migration")
+    parser.add_argument("--authorization-reference", help="Reference to the explicit user authorization for workflow-state migration")
+    parser.add_argument("--authorize-ohpen-self-review-recovery", action="store_true",
+                        help="Persist and consume the one-use authorization for the current Ohpen SELF_REVIEW blocker")
+    parser.add_argument("--recovery-authorization-reference",
+                        help="Source reference for the explicit one-use Ohpen self-review recovery authorization")
     interaction = parser.add_mutually_exclusive_group()
     interaction.add_argument("--list-pending-decisions", action="store_true")
     interaction.add_argument("--respond-decision")
@@ -3103,6 +3712,29 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if not args.target:
             parser.error("--target is required")
+        migration_options = (args.expected_old_sha256, args.expected_current_sha256, args.authorization_reference)
+        if args.migrate_untracked_ds_store:
+            if (not args.workflow_id or any(value is None for value in migration_options) or
+                    args.branch or args.task is not None or args.task_file or args.config or
+                    args.update_requirements or args.update_reason or args.list_pending_decisions or args.respond_decision or
+                    args.authorize_ohpen_self_review_recovery or args.recovery_authorization_reference):
+                parser.error("--migrate-untracked-ds-store requires only --target, --workflow-id, both fingerprints, and --authorization-reference")
+            outcome = migrate_untracked_ds_store(
+                args.target, args.workflow_id,
+                expected_old_sha256=args.expected_old_sha256,
+                expected_current_sha256=args.expected_current_sha256,
+                authorization_reference=args.authorization_reference,
+            )
+            print(json.dumps(outcome, ensure_ascii=False, sort_keys=True))
+            return 0
+        if any(value is not None for value in migration_options):
+            parser.error("Migration fingerprint and authorization arguments require --migrate-untracked-ds-store")
+        if args.authorize_ohpen_self_review_recovery:
+            if (not args.workflow_id or not args.recovery_authorization_reference or args.list_pending_decisions or
+                    args.respond_decision):
+                parser.error("--authorize-ohpen-self-review-recovery requires --workflow-id and --recovery-authorization-reference during workflow execution")
+        elif args.recovery_authorization_reference is not None:
+            parser.error("--recovery-authorization-reference requires --authorize-ohpen-self-review-recovery")
         if args.list_pending_decisions:
             if (not args.workflow_id or args.branch or args.task is not None or args.task_file or args.config or
                     args.update_requirements or args.update_reason):
@@ -3132,7 +3764,9 @@ def main(argv: list[str] | None = None) -> int:
         config["branch"] = args.branch
         identity = args.workflow_id or "flow-" + _sha((str(Path(args.target).resolve()) + "\0" + text).encode())[:24]
         outcome = Orchestrator(args.target, text, config, identity, codex=args.codex, aily=args.aily,
-            update_requirements_reason=args.update_reason if args.update_requirements else None).run()
+            update_requirements_reason=args.update_reason if args.update_requirements else None,
+            self_review_recovery_authorization_reference=(args.recovery_authorization_reference
+                if args.authorize_ohpen_self_review_recovery else None)).run()
     except (OSError, json.JSONDecodeError, OrchestratorError, PreflightError) as exc:
         print(json.dumps({"status": "BLOCKED", "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 2
