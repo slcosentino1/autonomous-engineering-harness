@@ -46,21 +46,6 @@ python3 /path/to/autonomous-engineering-harness/harness/orchestrator.py approve 
   --workflow-id WORKFLOW_ID
 ```
 
-New workflows also print required user decisions and show them in `status`. Approval stops until each decision is
-answered for the current proposal version. Choose the displayed proposed default or another listed choice:
-
-```sh
-python3 /path/to/autonomous-engineering-harness/harness/orchestrator.py approve \
-  --target /absolute/path/to/target-repository \
-  --workflow-id WORKFLOW_ID \
-  --decision DECISION_ID='displayed choice'
-```
-
-Repeat `--decision ID=ANSWER` for multiple decisions. A custom answer for a product decision can use
-`--decision DECISION_ID='other: explanation'`. Answers are recorded with the proposal version and must be supplied
-again if a later proposal version changes the decision context. Reversible assumptions and future-production items
-are recorded in Discovery but do not block approval.
-
 To ask for a proposal change, give concise feedback. The workflow uses a remaining Claude plan review when available, then returns to `awaiting_approval`:
 
 ```sh
@@ -89,28 +74,6 @@ python3 /path/to/autonomous-engineering-harness/harness/orchestrator.py resume \
 ```
 
 Workflow files are stored under `.engineering/workflows/WORKFLOW_ID/` in the target: `state.json`, `proposal.md`, and, on completion, `delivery.md`.
-New workflows also store versioned `discovery-vN.json` records linked to the proposal version they informed.
-
-## Plan finding evidence
-
-For an incorporated finding, the harness mechanically checks that the cited Markdown heading and quote exist in the
-revised proposal. The saved disposition marks this as `reference_verified`; quote matching does not establish that
-the proposal semantically resolves the finding, so `resolution_verified` remains false by default.
-
-Findings marked `must_fix` or `blocks_approval` require an explicit human decision during approval. Choose
-`verify_resolved` after checking the proposal against the finding, or choose `accept_risk` or `reject_finding` as
-appropriate. These choices are tied to the proposal version and must be revisited after a revision. Material findings
-remain pending across review iterations until a human decision is recorded. Their approval IDs include the review
-iteration, such as `REVIEW-review-2:F-001`, while status retains Claude's original finding ID for traceability. Minor
-findings remain governed by their ordinary dispositions and do not all block approval.
-
-## Workflow state compatibility
-
-Older workflows remain readable and their state is not migrated automatically. A workflow created before structured
-Discovery cannot be approved by the updated harness because the existing record cannot prove that material user
-decisions were identified. The command reports this limitation without rewriting the saved state; start a new
-workflow to use decision-aware approval. Previously authorized code reviews can continue under their original data
-scope, but old authorizations are never expanded to include Discovery.
 
 ## Workspace and review boundaries
 
@@ -119,7 +82,6 @@ scope, but old authorizations are never expanded to include Discovery.
 - Dependency installs are limited to dependencies declared by the repository and its package manager; arbitrary download URLs and custom registries are outside the workflow authorization.
 - The Codex planning stage is read-only. Implementation and correction use the Codex workspace-write sandbox.
 - Claude receives complete, secret-redacted review sections. The harness filters operating-system metadata and binary files before constructing a code-review diff, and lists each excluded changed path with its reason. It validates required sections and the final serialized payload before marking a call submitted. Required context is never truncated.
-- Plan finding quote checks validate proposal references only. When independent semantic verification is unavailable, a human must verify or explicitly resolve material findings during approval.
 - Code review keeps one call when the complete prompt fits. Otherwise, changed files are grouped using their actual paths and names, and each part is sized from its complete serialized prompt. A file that still does not fit is split only at conservative patch boundaries; when no safe split fits, the campaign stops and records the file as unreviewed. Every eligible patch segment is assigned once, with a hash and line range.
 - Every part receives the same hashed assignment, approved proposal, implementation summary, repository instructions, relevant skill application, inferred module map, and independent architecture/product/engineering review rubric. Multi-part campaigns review the individual reports together in a final integration call; the consolidated report is not complete until all assigned files and that integration review are complete.
 - Claude reviews as an independent senior architect, backend engineer, product engineer, and technical reviewer. It verifies requirements and challenges the approved design, assesses proportionality, and distinguishes Must fix, Should fix, and Optional improvements. Optional improvements do not trigger the correction stage by themselves.

@@ -23,11 +23,11 @@ import claude_reviewer
 
 
 MAX_PLAN_REVIEWS = 2
-DISCOVERY_SCHEMA_VERSION = 1
-PLAN_REVIEW_SCHEMA_VERSION = 1
 DEFAULT_CLAUDE_BUDGET_USD = 2.00
 DEFAULT_MAX_CODE_REVIEW_CALLS = 16
 MAX_AUTHORIZED_CODE_REVIEW_CALLS = 64
+MAX_PLANNING_FAILURE_OUTPUT_CHARS = 50_000
+MAX_PLANNING_FAILURE_RECORDS = 3
 CODEX_EXECUTABLE = "codex"
 WORKFLOW_ROOT = ".engineering/workflows"
 PLANNING_PRINCIPLES = """Engineering Judgment & Proportional Design
@@ -82,13 +82,6 @@ WORKSPACE_OPERATIONS = [
 ]
 CODEX_STAGES = ["planning", "implementation", "correction"]
 CLAUDE_DATA_SCOPE = [
-    "assignment",
-    "implementation_proposal",
-    "structured_discovery_record",
-    "implementation_and_validation_summary",
-    "relevant_redacted_code_changes",
-]
-LEGACY_CLAUDE_DATA_SCOPE = [
     "assignment",
     "implementation_proposal",
     "implementation_and_validation_summary",
@@ -194,507 +187,6 @@ def valid_workflow_id(value: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", value):
         raise WorkflowError("Workflow ID must contain only letters, numbers, dots, underscores, and hyphens.")
     return value
-
-
-def _normalized_text(value: str) -> str:
-    return " ".join(value.split()).casefold()
-
-
-def _finding_identity(review_iteration: object, finding_id: object) -> str:
-    """Return a review-qualified identity, preserving a safe namespace for legacy records."""
-    if not isinstance(finding_id, str) or not finding_id:
-        return "legacy:unknown"
-    if isinstance(review_iteration, int) and not isinstance(review_iteration, bool) and review_iteration > 0:
-        return f"review-{review_iteration}:{finding_id}"
-    return f"legacy:{finding_id}"
-
-
-def _stored_finding_identity(item: dict, review_iteration: object = None) -> str:
-    identity = item.get("finding_identity")
-    if isinstance(identity, str) and identity:
-        return identity
-    return _finding_identity(item.get("review_iteration", review_iteration), item.get("finding_id"))
-
-
-def _pending_finding_identity(item: dict, state: dict) -> str:
-    identity = item.get("finding_identity")
-    if isinstance(identity, str) and identity:
-        return identity
-    iteration = item.get("review_iteration")
-    if isinstance(iteration, int) and not isinstance(iteration, bool):
-        return _finding_identity(iteration, item.get("finding_id"))
-    matching_reviews = [
-        review.get("iteration")
-        for review in state.get("plan_reviews", [])
-        if any(finding.get("id") == item.get("finding_id")
-               and (finding.get("blocks_approval") or finding.get("severity") == "must_fix")
-               for finding in review.get("parsed_review", {}).get("findings", [])
-               if isinstance(finding, dict))
-    ]
-    described_candidates = {
-        review.get("iteration")
-        for review in state.get("plan_reviews", [])
-        if any(finding.get("id") == item.get("finding_id")
-               and finding.get("description") == item.get("description")
-               and (finding.get("blocks_approval") or finding.get("severity") == "must_fix")
-               for finding in review.get("parsed_review", {}).get("findings", [])
-               if isinstance(finding, dict))
-    }
-    candidates = described_candidates if described_candidates else set(matching_reviews)
-    if len(candidates) == 1:
-        return _finding_identity(next(iter(candidates)), item.get("finding_id"))
-    return _finding_identity(None, item.get("finding_id"))
-
-
-def _review_decision_id(finding_identity: str) -> str:
-    return f"REVIEW-{finding_identity}"
-
-
-def _proposal_reference_exists(proposal: str, section: str, quote: str) -> bool:
-    """Mechanically check that a heading and quote exist; this does not verify semantic resolution."""
-    if not isinstance(section, str) or not section.strip() or not isinstance(quote, str) or not quote.strip():
-        return False
-    headings = list(re.finditer(r"(?m)^#{1,6}\s+(.+?)\s*#*\s*$", proposal))
-    target = _normalized_text(section.lstrip("# "))
-    for index, heading in enumerate(headings):
-        if _normalized_text(heading.group(1)) != target:
-            continue
-        end = headings[index + 1].start() if index + 1 < len(headings) else len(proposal)
-        body = proposal[heading.end():end]
-        if _normalized_text(quote) in _normalized_text(body):
-            return True
-    return False
-
-
-def _extract_tagged_block(value: str, tag: str) -> str:
-    match = re.search(
-        rf"(?s)<{re.escape(tag)}>\s*(.*?)\s*</{re.escape(tag)}>", value,
-    )
-    if not match or not match.group(1).strip():
-        raise WorkflowError(f"Codex output is missing the {tag} block.")
-    return match.group(1).strip()
-
-
-def _parse_json_block(value: str, tag: str) -> dict:
-    try:
-        parsed = json.loads(_extract_tagged_block(value, tag))
-    except json.JSONDecodeError as exc:
-        raise WorkflowError(f"Codex output contains invalid JSON in {tag}: {exc.msg}.") from exc
-    if not isinstance(parsed, dict):
-        raise WorkflowError(f"Codex {tag} must contain a JSON object.")
-    return parsed
-
-
-def validate_discovery_record(record: dict, proposal: str, *, proposal_version: int) -> dict:
-    """Validate the small, versioned Discovery contract and its proposal traceability."""
-    if not isinstance(record, dict):
-        raise WorkflowError("Discovery must be a JSON object.")
-    if isinstance(proposal_version, bool) or not isinstance(proposal_version, int) or proposal_version < 1:
-        raise WorkflowError("Discovery must be associated with a positive proposal version.")
-    if record.get("schema_version") != DISCOVERY_SCHEMA_VERSION:
-        raise WorkflowError(
-            f"Unsupported Discovery schema version {record.get('schema_version')!r}; "
-            f"expected {DISCOVERY_SCHEMA_VERSION}."
-        )
-    requirements = record.get("requirements")
-    evidence = record.get("repository_evidence")
-    concerns = record.get("concerns")
-    decisions = record.get("decisions")
-    if not isinstance(requirements, list) or not requirements:
-        raise WorkflowError("Discovery must list every explicit assignment requirement.")
-    if not isinstance(evidence, list) or not isinstance(concerns, list) or not isinstance(decisions, list):
-        raise WorkflowError("Discovery repository_evidence, concerns, and decisions must be arrays.")
-
-    ids: set[str] = set()
-
-    def take_id(item: dict, label: str) -> str:
-        item_id = item.get("id")
-        if not isinstance(item_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,79}", item_id):
-            raise WorkflowError(f"Discovery {label} has an invalid stable id.")
-        if item_id in ids:
-            raise WorkflowError(f"Discovery contains duplicate id {item_id!r}.")
-        ids.add(item_id)
-        return item_id
-
-    for index, item in enumerate(requirements):
-        if not isinstance(item, dict):
-            raise WorkflowError(f"Discovery requirement {index + 1} must be an object.")
-        item_id = take_id(item, "requirement")
-        for key in ("description", "source", "interpretation", "design_decision", "proposal_reference",
-                    "proposal_evidence", "expected_verification"):
-            if not isinstance(item.get(key), str) or not item[key].strip():
-                raise WorkflowError(f"Discovery requirement {item_id} needs non-empty {key}.")
-        if not _proposal_reference_exists(proposal, item["proposal_reference"], item["design_decision"]):
-            raise WorkflowError(
-                f"Discovery requirement {item_id} design decision is not present in its referenced proposal section."
-            )
-        if not _proposal_reference_exists(proposal, item["proposal_reference"], item["proposal_evidence"]):
-            raise WorkflowError(
-                f"Discovery requirement {item_id} does not point to verifiable design evidence in its proposal section."
-            )
-
-    for index, item in enumerate(evidence):
-        if not isinstance(item, dict):
-            raise WorkflowError(f"Discovery repository evidence {index + 1} must be an object.")
-        item_id = take_id(item, "repository evidence")
-        for key in ("source", "observation", "relevance"):
-            if not isinstance(item.get(key), str) or not item[key].strip():
-                raise WorkflowError(f"Discovery evidence {item_id} needs non-empty {key}.")
-
-    requirement_ids = {item["id"] for item in requirements}
-    for index, item in enumerate(concerns):
-        if not isinstance(item, dict):
-            raise WorkflowError(f"Discovery concern {index + 1} must be an object.")
-        item_id = take_id(item, "concern")
-        for key in ("category", "description", "source", "interpretation_impact", "applicability",
-                    "disposition", "expected_verification"):
-            if not isinstance(item.get(key), str) or not item[key].strip():
-                raise WorkflowError(f"Discovery concern {item_id} needs non-empty {key}.")
-        if item["applicability"] not in {"applicable", "not_applicable", "unknown"}:
-            raise WorkflowError(f"Discovery concern {item_id} has invalid applicability.")
-        if item["applicability"] == "not_applicable" and not (
-                isinstance(item.get("not_applicable_reason"), str) and item["not_applicable_reason"].strip()):
-            raise WorkflowError(f"Discovery concern {item_id} is not applicable but has no reason.")
-        if not isinstance(item.get("material"), bool):
-            raise WorkflowError(f"Discovery concern {item_id} must identify whether it is material.")
-        if item["disposition"] not in {
-                "addressed", "documented_assumption", "requires_user_decision", "accepted_risk",
-                "deferred", "rejected", "future_production", "out_of_scope", "unknown", "not_applicable"}:
-            raise WorkflowError(f"Discovery concern {item_id} has invalid disposition.")
-        if item["applicability"] == "not_applicable" and item["disposition"] != "not_applicable":
-            raise WorkflowError(f"Discovery concern {item_id} must use not_applicable disposition.")
-        related = item.get("related_requirement_ids")
-        if not isinstance(related, list) or any(ref not in requirement_ids for ref in related):
-            raise WorkflowError(f"Discovery concern {item_id} has an unknown related requirement id.")
-        if item.get("material") is True and item["disposition"] in {"unknown"}:
-            raise WorkflowError(f"Material Discovery concern {item_id} has no valid disposition.")
-        if item["disposition"] in {"addressed", "documented_assumption", "requires_user_decision"}:
-            if not _proposal_reference_exists(
-                    proposal, item.get("proposal_reference", ""), item.get("proposal_evidence", "")):
-                raise WorkflowError(
-                    f"Discovery concern {item_id} is marked {item['disposition']} without proposal evidence."
-                )
-
-    concern_ids = {item["id"] for item in concerns}
-    evidence_ids = {item["id"] for item in evidence}
-    for index, item in enumerate(decisions):
-        if not isinstance(item, dict):
-            raise WorkflowError(f"Discovery decision {index + 1} must be an object.")
-        item_id = take_id(item, "decision")
-        for key in ("classification", "description", "reason", "proposal_reference", "proposal_evidence"):
-            if not isinstance(item.get(key), str) or not item[key].strip():
-                raise WorkflowError(f"Discovery decision {item_id} needs non-empty {key}.")
-        classification = item["classification"]
-        if classification not in {
-                "required_user_decision", "necessary_engineering_decision", "reversible_assumption",
-                "future_production"}:
-            raise WorkflowError(f"Discovery decision {item_id} has invalid classification.")
-        sources = item.get("source_ids")
-        if not isinstance(sources, list) or not sources or any(
-                source not in (requirement_ids | concern_ids | evidence_ids) for source in sources):
-            raise WorkflowError(f"Discovery decision {item_id} has an unknown source id.")
-        if not _proposal_reference_exists(
-                proposal, item["proposal_reference"], item["proposal_evidence"]):
-            raise WorkflowError(f"Discovery decision {item_id} is not visible in its referenced proposal section.")
-        if classification == "required_user_decision":
-            choices = item.get("choices")
-            if not isinstance(choices, list) or len(choices) < 2 or any(
-                    not isinstance(choice, str) or not choice.strip() for choice in choices):
-                raise WorkflowError(f"Required decision {item_id} must list at least two choices.")
-            if len({_normalized_text(choice) for choice in choices}) != len(choices):
-                raise WorkflowError(f"Required decision {item_id} has duplicate choices.")
-            default = item.get("proposed_default")
-            if not isinstance(default, str) or not any(_normalized_text(default) == _normalized_text(c) for c in choices):
-                raise WorkflowError(f"Required decision {item_id} must name a proposed default from its choices.")
-    record["proposal_version"] = proposal_version
-    return record
-
-
-def _discovery_digest(record: dict) -> str:
-    encoded = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _parse_discovery_and_proposal(value: str, *, proposal_version: int) -> tuple[dict, str]:
-    record = _parse_json_block(value, "DISCOVERY_RECORD_JSON")
-    proposal = clean_markdown(_extract_tagged_block(value, "PROPOSAL_MARKDOWN"))
-    return validate_discovery_record(record, proposal, proposal_version=proposal_version), proposal
-
-
-def _validate_plan_review(value: str, discovery: dict, proposal: str) -> dict:
-    report = _parse_json_block(value, "PLAN_REVIEW_JSON")
-    if report.get("schema_version") != PLAN_REVIEW_SCHEMA_VERSION:
-        raise WorkflowError("Claude plan review used an unsupported structured-review schema version.")
-    if report.get("decision") not in {"ready_for_approval", "changes_requested", "human_review_required"}:
-        raise WorkflowError("Claude plan review has an invalid decision.")
-    for field in ("assessment", "requirement_coverage", "discovery_coverage", "findings"):
-        if field == "assessment":
-            if not isinstance(report.get(field), str) or not report[field].strip():
-                raise WorkflowError("Claude plan review needs a concise assessment.")
-        elif not isinstance(report.get(field), list):
-            raise WorkflowError(f"Claude plan review {field} must be an array.")
-
-    def validate_coverage(rows: list, expected: list[dict], *, id_key: str,
-                          statuses: set[str], evidence_status: str,
-                          resolved_statuses: set[str] | None = None) -> set[str]:
-        expected_by_id = {item["id"]: item for item in expected}
-        seen: set[str] = set()
-        unresolved: set[str] = set()
-        for row in rows:
-            if not isinstance(row, dict):
-                raise WorkflowError("Claude plan review coverage entries must be objects.")
-            item_id = row.get(id_key)
-            if item_id not in expected_by_id:
-                raise WorkflowError(f"Claude plan review references unknown {id_key} {item_id!r}.")
-            if item_id in seen:
-                raise WorkflowError(f"Claude plan review duplicates coverage for {item_id}.")
-            seen.add(item_id)
-            status = row.get("status")
-            if status not in statuses:
-                raise WorkflowError(f"Claude plan review has invalid coverage status for {item_id}.")
-            reason = row.get("reason")
-            if status != evidence_status and (not isinstance(reason, str) or not reason.strip()):
-                raise WorkflowError(f"Claude plan review needs a reason for {status} coverage of {item_id}.")
-            if status == evidence_status:
-                section = row.get("proposal_reference")
-                quote = row.get("proposal_evidence")
-                if not _proposal_reference_exists(proposal, section, quote):
-                    raise WorkflowError(
-                        f"Claude plan review claims {item_id} is covered without verifiable proposal evidence."
-                    )
-            elif status not in (resolved_statuses or {evidence_status}):
-                unresolved.add(item_id)
-        missing = set(expected_by_id) - seen
-        if missing:
-            raise WorkflowError("Claude plan review omits coverage for: " + ", ".join(sorted(missing)) + ".")
-        return unresolved
-
-    requirement_gaps = validate_coverage(
-        report["requirement_coverage"], discovery["requirements"], id_key="requirement_id",
-        statuses={"covered", "gap", "unclear"}, evidence_status="covered",
-    )
-
-    concern_by_id = {item["id"]: item for item in discovery["concerns"]}
-    concern_rows = report["discovery_coverage"]
-    concern_gaps = validate_coverage(
-        concern_rows, discovery["concerns"], id_key="concern_id",
-        statuses={"reflected", "not_reflected", "unknown", "not_applicable"}, evidence_status="reflected",
-        resolved_statuses={"reflected", "not_applicable"},
-    )
-    for row in concern_rows:
-        if row["status"] == "not_applicable":
-            item = concern_by_id[row["concern_id"]]
-            if item.get("applicability") != "not_applicable":
-                raise WorkflowError(
-                    f"Claude cannot mark applicable concern {row['concern_id']} as not_applicable."
-                )
-
-    findings = report["findings"]
-    finding_ids: set[str] = set()
-    for finding in findings:
-        if not isinstance(finding, dict):
-            raise WorkflowError("Claude plan review findings must be objects.")
-        finding_id = finding.get("id")
-        if not isinstance(finding_id, str) or not re.fullmatch(r"F-[A-Za-z0-9._:-]{1,76}", finding_id):
-            raise WorkflowError("Claude plan review finding has an invalid stable id.")
-        if finding_id in finding_ids:
-            raise WorkflowError(f"Claude plan review duplicates finding id {finding_id}.")
-        finding_ids.add(finding_id)
-        for field in ("category", "severity", "description", "evidence", "engineering_impact",
-                      "recommended_action"):
-            if not isinstance(finding.get(field), str) or not finding[field].strip():
-                raise WorkflowError(f"Claude finding {finding_id} needs non-empty {field}.")
-        if finding["severity"] not in {"must_fix", "should_fix", "optional"}:
-            raise WorkflowError(f"Claude finding {finding_id} has invalid severity.")
-        if not isinstance(finding.get("blocks_approval"), bool):
-            raise WorkflowError(f"Claude finding {finding_id} must say whether it blocks approval.")
-        related = finding.get("related_ids")
-        if not isinstance(related, list) or any(
-                item_id not in ({item["id"] for item in discovery["requirements"]} | set(concern_by_id))
-                for item_id in related):
-            raise WorkflowError(f"Claude finding {finding_id} has unknown related Discovery ids.")
-
-    unresolved = requirement_gaps | concern_gaps
-    findings_for_unresolved = {
-        related_id for finding in findings for related_id in finding.get("related_ids", [])
-    }
-    unreported = unresolved - findings_for_unresolved
-    if unreported:
-        raise WorkflowError(
-            "Claude plan review reports coverage gaps without findings for: " + ", ".join(sorted(unreported)) + "."
-        )
-    if report["decision"] == "ready_for_approval" and (
-            unresolved or any(finding["blocks_approval"] for finding in findings)):
-        raise WorkflowError("Claude marked the proposal ready despite unresolved coverage or blocking findings.")
-    if report["decision"] == "changes_requested" and not findings:
-        raise WorkflowError("Claude requested changes without supplying a trackable finding.")
-    report["unresolved_coverage_ids"] = sorted(unresolved)
-    report["findings"] = findings
-    return report
-
-
-def _validate_finding_dispositions(
-    raw: dict, findings: list[dict], proposal: str, *, review_iteration: int | None = None,
-) -> tuple[list[dict], list[dict]]:
-    """Validate disposition IDs and proposal references, never semantic finding resolution."""
-    if raw.get("schema_version") != PLAN_REVIEW_SCHEMA_VERSION:
-        raise WorkflowError("Codex dispositions use an unsupported schema version.")
-    items = raw.get("dispositions")
-    if not isinstance(items, list):
-        raise WorkflowError("Codex finding dispositions must be an array.")
-    expected = {finding["id"]: finding for finding in findings}
-    seen: set[str] = set()
-    normalized: list[dict] = []
-    unresolved_blockers: list[dict] = []
-    allowed = {"incorporated", "accepted_risk", "deferred", "rejected"}
-    for item in items:
-        if not isinstance(item, dict):
-            raise WorkflowError("Each finding disposition must be an object.")
-        finding_id = item.get("finding_id")
-        if finding_id not in expected:
-            raise WorkflowError(f"Codex disposition references unknown finding id {finding_id!r}.")
-        if finding_id in seen:
-            raise WorkflowError(f"Codex duplicates the disposition for {finding_id}.")
-        seen.add(finding_id)
-        disposition = item.get("disposition")
-        if disposition not in allowed:
-            raise WorkflowError(f"Codex disposition for {finding_id} has an invalid value.")
-        reason = item.get("reason")
-        if not isinstance(reason, str) or not reason.strip():
-            raise WorkflowError(f"Codex disposition for {finding_id} needs a reason.")
-        record = {
-            "finding_id": finding_id,
-            "disposition": disposition,
-            "reason": reason.strip(),
-            "reference_verified": False,
-            "resolution_verified": False,
-        }
-        if review_iteration is not None:
-            record.update({
-                "review_iteration": review_iteration,
-                "finding_identity": _finding_identity(review_iteration, finding_id),
-            })
-        if disposition == "incorporated":
-            section = item.get("proposal_reference")
-            quote = item.get("proposal_evidence")
-            if not _proposal_reference_exists(proposal, section, quote):
-                raise WorkflowError(
-                    f"Incorporated finding {finding_id} has no verifiable proposal reference."
-                )
-            record.update({
-                "proposal_reference": section,
-                "proposal_evidence": quote,
-                "reference_verified": True,
-            })
-        elif item.get("proposal_reference") or item.get("proposal_evidence"):
-            section = item.get("proposal_reference")
-            quote = item.get("proposal_evidence")
-            if not _proposal_reference_exists(proposal, section, quote):
-                raise WorkflowError(f"Disposition for {finding_id} cites a proposal reference that does not exist.")
-            record.update({
-                "proposal_reference": section,
-                "proposal_evidence": quote,
-                "reference_verified": True,
-            })
-        finding = expected[finding_id]
-        if finding["blocks_approval"] and disposition != "incorporated":
-            unresolved_blockers.append({"finding": finding, "disposition": record})
-        normalized.append(record)
-    missing = set(expected) - seen
-    if missing:
-        raise WorkflowError("Codex omitted dispositions for findings: " + ", ".join(sorted(missing)) + ".")
-    return normalized, unresolved_blockers
-
-
-def _material_findings_for_review(state: dict, review: dict, proposal_version: int) -> list[dict]:
-    """Return material review findings, deriving them for structured states saved before this field existed."""
-    stored = review.get("material_findings_for_human_review")
-    if isinstance(stored, list):
-        findings = [dict(item) for item in stored if isinstance(item, dict)]
-        proposal = state.get("proposal", "")
-        for item in findings:
-            item.setdefault("review_iteration", review.get("iteration"))
-            item.setdefault("finding_identity", _finding_identity(item.get("review_iteration"), item.get("finding_id")))
-            if item.get("proposal_version") != proposal_version:
-                item["reference_verified"] = _proposal_reference_exists(
-                    proposal, item.get("proposal_reference", ""), item.get("proposal_evidence", ""),
-                )
-                item["resolution_verified"] = False
-                item.pop("human_resolution", None)
-                item["proposal_version"] = proposal_version
-        return findings
-    decision_version = review.get("reconciled_proposal_version", proposal_version)
-    prior = next((row for row in reversed(state.get("plan_review_decisions", []))
-                  if row.get("iteration") == review.get("iteration")
-                  and row.get("proposal_version") == decision_version), {})
-    dispositions = {
-        row.get("finding_id"): row for row in prior.get("parsed_dispositions", []) if isinstance(row, dict)
-    }
-    proposal = state.get("proposal", "")
-    material = []
-    for finding in review.get("parsed_review", {}).get("findings", []):
-        if not (finding.get("blocks_approval") or finding.get("severity") == "must_fix"):
-            continue
-        disposition = dispositions.get(finding.get("id"), {})
-        quote_exists = _proposal_reference_exists(
-            proposal,
-            disposition.get("proposal_reference", ""),
-            disposition.get("proposal_evidence", ""),
-        )
-        material.append({
-            "finding_id": finding.get("id"),
-            "review_iteration": review.get("iteration"),
-            "finding_identity": _finding_identity(review.get("iteration"), finding.get("id")),
-            "description": finding.get("description", "Material Claude finding"),
-            "severity": finding.get("severity"),
-            "blocks_approval": finding.get("blocks_approval"),
-            "disposition": disposition.get("disposition"),
-            "reference_verified": disposition.get("reference_verified", quote_exists),
-            "resolution_verified": disposition.get("resolution_verified") is True,
-            "human_resolution": disposition.get("human_resolution"),
-            "proposal_version": proposal_version,
-        })
-    return material
-
-
-def _material_findings_pending_for_state(state: dict, proposal_version: int) -> list[dict]:
-    """Get outstanding material findings, preserving them across proposal and review iterations."""
-    latest: dict[str, dict] = {}
-    stored = state.get("material_findings_pending")
-    if isinstance(stored, list):
-        findings = [dict(item) for item in stored if isinstance(item, dict)]
-        proposal = state.get("proposal", "")
-        review_ids = {
-            finding.get("id")
-            for review in state.get("plan_reviews", [])
-            for finding in review.get("parsed_review", {}).get("findings", [])
-            if isinstance(finding, dict)
-        }
-        for item in findings:
-            # Older state keyed these rows only by Claude's per-review ID. The review
-            # records below are authoritative and can recover iteration-qualified rows.
-            if not item.get("finding_identity") and not item.get("review_iteration"):
-                if item.get("finding_id") in review_ids:
-                    continue
-            item.setdefault("finding_identity", _stored_finding_identity(item))
-            if item.get("proposal_version") != proposal_version:
-                item["reference_verified"] = _proposal_reference_exists(
-                    proposal, item.get("proposal_reference", ""), item.get("proposal_evidence", ""),
-                )
-                item["resolution_verified"] = False
-                item.pop("human_resolution", None)
-                item["proposal_version"] = proposal_version
-            latest[item["finding_identity"]] = item
-    # Rebuild from retained review records as well. This recovers distinct findings from older
-    # states whose pending list was keyed only by Claude's per-review ID.
-    for review in state.get("plan_reviews", []):
-        reviewed_version = review.get("reconciled_proposal_version")
-        if not review.get("reconciled") or not isinstance(reviewed_version, int) or reviewed_version > proposal_version:
-            continue
-        for item in _material_findings_for_review(state, review, proposal_version):
-            if item.get("finding_id"):
-                latest[_stored_finding_identity(item, review.get("iteration"))] = item
-    return list(latest.values())
 
 
 def _git_env() -> dict[str, str]:
@@ -1319,7 +811,7 @@ def validate_workflow_authorization(state: dict, target: Path, workflow_id: str)
         and 1 <= code_review_limit <= MAX_AUTHORIZED_CODE_REVIEW_CALLS
     )
     if (external.get("provider") != "Claude through Aily"
-            or external.get("permitted_data") not in (CLAUDE_DATA_SCOPE, LEGACY_CLAUDE_DATA_SCOPE)
+            or external.get("permitted_data") != CLAUDE_DATA_SCOPE
             or external.get("max_plan_reviews") != MAX_PLAN_REVIEWS
             or not (legacy_single_review or configured_review_policy)):
         raise WorkflowError("Saved Claude/Aily scope or review limit is missing or changed.")
@@ -1376,7 +868,6 @@ class Orchestrator:
         self.workflow_dir = _check_plain_directories(self.target, f"{WORKFLOW_ROOT}/{self.workflow_id}")
         self.state_path = self.workflow_dir / "state.json"
         self.proposal_path = self.workflow_dir / "proposal.md"
-        self.discovery_path = self.workflow_dir / "discovery.json"
         self.delivery_path = self.workflow_dir / "delivery.md"
 
     @staticmethod
@@ -1389,6 +880,30 @@ class Orchestrator:
         if isinstance(authorization, dict):
             authorization["scope_sha256"] = authorization_scope_digest(authorization)
         _atomic_text(self.state_path, json.dumps(self.state, indent=2, ensure_ascii=False) + "\n")
+
+    def _record_unvalidated_planning_output(
+        self, output: str, error: WorkflowError, *, stage: str, proposal_version: int,
+    ) -> None:
+        """Keep bounded, redacted diagnostics without making output approval eligible."""
+        safe_output = redact(output)
+        records = self.state.setdefault("planning_validation_failures", [])
+        records.append({
+            "validation_status": "failed_unvalidated",
+            "approval_eligible": False,
+            "stage": stage,
+            "proposal_version": proposal_version,
+            "attempted_at": now(),
+            "validation_error": redact(str(error)),
+            "generated_output": safe_output[:MAX_PLANNING_FAILURE_OUTPUT_CHARS],
+            "generated_output_characters": len(safe_output),
+            "generated_output_sha256": hashlib.sha256(safe_output.encode("utf-8")).hexdigest(),
+            "generated_output_truncated": len(safe_output) > MAX_PLANNING_FAILURE_OUTPUT_CHARS,
+            "secrets_redacted": safe_output != output,
+        })
+        if len(records) > MAX_PLANNING_FAILURE_RECORDS:
+            del records[:-MAX_PLANNING_FAILURE_RECORDS]
+            self.state["planning_validation_failure_history_truncated"] = True
+        self._save()
 
     def _load(self) -> None:
         _safe_artifact(self.state_path)
@@ -1423,319 +938,6 @@ class Orchestrator:
             raise WorkflowError("Saved proposal is empty.")
         return clean_markdown(proposal)
 
-    def _persist_planning_version(self, discovery: dict, proposal: str, version: int) -> None:
-        previous = self.state.get("discovery")
-        if previous:
-            previous_ids = {
-                item.get("id")
-                for collection in ("requirements", "repository_evidence", "concerns", "decisions")
-                for item in previous.get(collection, [])
-            }
-            current_ids = {
-                item.get("id")
-                for collection in ("requirements", "repository_evidence", "concerns", "decisions")
-                for item in discovery.get(collection, [])
-            }
-            missing_ids = previous_ids - current_ids
-            if missing_ids:
-                raise WorkflowError(
-                    "A refined Discovery record cannot silently drop prior evidence or decisions: "
-                    + ", ".join(sorted(missing_ids))
-                )
-        discovery["proposal_version"] = version
-        discovery = validate_discovery_record(discovery, proposal, proposal_version=version)
-        digest = _discovery_digest(discovery)
-        artifact = self.workflow_dir / f"discovery-v{version}.json"
-        serialized = json.dumps(discovery, indent=2, ensure_ascii=False) + "\n"
-        versions = self.state.setdefault("proposal_versions", [])
-        existing = next((item for item in versions if item.get("version") == version), None)
-        if existing:
-            expected_artifact = existing.get("discovery_artifact")
-            if existing.get("discovery_sha256") != digest or expected_artifact != artifact.name:
-                raise WorkflowError(f"Proposal version {version} already has different Discovery evidence.")
-        if artifact.exists():
-            _safe_artifact(artifact)
-            if existing and artifact.read_text(encoding="utf-8") != serialized:
-                raise WorkflowError(f"Discovery artifact for proposal version {version} already exists and differs.")
-        if not artifact.exists() or not existing:
-            # A crash can leave an artifact before its proposal-version state is saved.
-            # It is safe to replace only when state has no association for this version.
-            _atomic_text(artifact, serialized)
-        proposal_hash = hashlib.sha256(proposal.encode("utf-8")).hexdigest()
-        version_record = {
-            "version": version,
-            "proposal_sha256": proposal_hash,
-            "discovery_sha256": digest,
-            "discovery_schema_version": DISCOVERY_SCHEMA_VERSION,
-            "discovery_artifact": artifact.name,
-        }
-        if existing:
-            for key, value in version_record.items():
-                if existing.get(key) != value:
-                    raise WorkflowError(f"Proposal version {version} already has different planning evidence.")
-        else:
-            versions.append(version_record)
-        self.state["discovery"] = discovery
-        self.state["discovery_schema_version"] = DISCOVERY_SCHEMA_VERSION
-        self.state["discovery_sha256"] = digest
-        self.state["discovery_artifact"] = artifact.name
-        self.state["proposal"] = proposal
-        self.state["proposal_version"] = version
-        for finding in self.state.get("material_findings_pending", []):
-            if not isinstance(finding, dict) or finding.get("proposal_version") == version:
-                continue
-            finding["reference_verified"] = _proposal_reference_exists(
-                proposal, finding.get("proposal_reference", ""), finding.get("proposal_evidence", ""),
-            )
-            finding["resolution_verified"] = False
-            finding.pop("human_resolution", None)
-            finding["proposal_version"] = version
-        self.proposal_path = self.workflow_dir / "proposal.md"
-        _atomic_text(self.proposal_path, proposal)
-
-    def _require_current_discovery(self) -> dict:
-        discovery = self.state.get("discovery")
-        if not isinstance(discovery, dict) or not isinstance(self.state.get("discovery_sha256"), str):
-            raise WorkflowError(
-                "This workflow predates structured Discovery and decision-aware approval. "
-                "It cannot be approved safely; start a new workflow with the current harness."
-            )
-        if discovery.get("schema_version") != DISCOVERY_SCHEMA_VERSION:
-            raise WorkflowError("This workflow uses an unsupported Discovery schema; start a new workflow.")
-        if discovery.get("proposal_version") != self.state.get("proposal_version"):
-            raise WorkflowError("Saved Discovery does not match the current proposal version; revise the workflow.")
-        if _discovery_digest(discovery) != self.state.get("discovery_sha256"):
-            raise WorkflowError("Saved Discovery changed after review; start a new workflow to restore traceability.")
-        artifact_name = self.state.get("discovery_artifact")
-        if not isinstance(artifact_name, str) or Path(artifact_name).name != artifact_name:
-            raise WorkflowError("Saved Discovery artifact reference is invalid.")
-        artifact = self.workflow_dir / artifact_name
-        _safe_artifact(artifact)
-        try:
-            stored = json.loads(artifact.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise WorkflowError("Saved Discovery artifact is missing or invalid.") from exc
-        if not isinstance(stored, dict) or _discovery_digest(stored) != self.state["discovery_sha256"]:
-            raise WorkflowError("Saved Discovery artifact does not match workflow state.")
-        version = next((item for item in self.state.get("proposal_versions", [])
-                        if item.get("version") == self.state.get("proposal_version")), None)
-        proposal_hash = hashlib.sha256(self.state.get("proposal", "").encode("utf-8")).hexdigest()
-        if (not isinstance(version, dict) or version.get("proposal_sha256") != proposal_hash
-                or version.get("discovery_sha256") != self.state["discovery_sha256"]):
-            raise WorkflowError("Current proposal and Discovery version association is missing or invalid.")
-        return discovery
-
-    def _required_approval_items(self) -> list[dict]:
-        discovery = self._require_current_discovery()
-        items = [
-            {
-                "id": decision["id"],
-                "kind": "discovery_decision",
-                "description": decision["description"],
-                "choices": decision["choices"],
-                "proposed_default": decision["proposed_default"],
-                "proposal_version": self.state["proposal_version"],
-            }
-            for decision in discovery.get("decisions", [])
-            if decision.get("classification") == "required_user_decision"
-        ]
-        readiness = self.state.get("proposal_readiness", {})
-        if (readiness.get("status") == "human_review_required"
-                and readiness.get("proposal_version") == self.state.get("proposal_version")
-                and readiness.get("reason")):
-            items.append({
-                "id": "PLAN-REVIEW-ACK",
-                "kind": "proposal_review_acknowledgement",
-                "description": readiness["reason"],
-                "choices": [readiness.get("ack_choice", "approve_unreviewed_revision")],
-                "proposed_default": None,
-                "proposal_version": self.state["proposal_version"],
-            })
-        existing_ids = {item["id"] for item in items}
-        current_version = self.state.get("proposal_version")
-        for review in self.state.get("plan_reviews", []):
-            reviewed_version = review.get("reconciled_proposal_version")
-            if not review.get("reconciled") or not isinstance(reviewed_version, int) or reviewed_version > current_version:
-                continue
-            for blocker in review.get("unresolved_blocking_findings", []):
-                identity = _stored_finding_identity(blocker, review.get("iteration"))
-                decision_id = _review_decision_id(identity)
-                if decision_id in existing_ids:
-                    continue
-                items.append({
-                    "id": decision_id,
-                    "kind": "blocking_review_finding",
-                    "finding_id": blocker.get("finding_id"),
-                    "finding_identity": identity,
-                    "review_iteration": blocker.get("review_iteration", review.get("iteration")),
-                    "description": blocker.get("description", "Unresolved blocking Claude finding"),
-                    "choices": ["accept_risk", "reject_finding"],
-                    "proposed_default": None,
-                    "proposal_version": current_version,
-                    "reference_verified": blocker.get("reference_verified") is True,
-                })
-                existing_ids.add(decision_id)
-        for finding in _material_findings_pending_for_state(self.state, current_version):
-            identity = _stored_finding_identity(finding)
-            decision_id = _review_decision_id(identity)
-            if decision_id in existing_ids:
-                continue
-            disposition = finding.get("disposition")
-            choices = ["verify_resolved", "accept_risk", "reject_finding"]
-            if disposition not in {None, "incorporated"}:
-                choices = ["accept_risk", "reject_finding"]
-            items.append({
-                "id": decision_id,
-                "kind": "material_finding_resolution",
-                "finding_id": finding.get("finding_id"),
-                "finding_identity": identity,
-                "review_iteration": finding.get("review_iteration"),
-                "description": (
-                    f"Human review required for {finding.get('severity', 'material')} finding: "
-                    f"{finding.get('description', 'Review the finding resolution.')} "
-                    "The proposal reference is mechanically checked; confirm semantic resolution or choose "
-                    "to accept the risk or reject the finding."
-                ),
-                "choices": choices,
-                "proposed_default": None,
-                "proposal_version": current_version,
-                "reference_verified": finding.get("reference_verified") is True,
-                "severity": finding.get("severity"),
-            })
-            existing_ids.add(decision_id)
-        return items
-
-    @staticmethod
-    def _parse_decision_arguments(values: list[str] | None) -> dict[str, str]:
-        parsed: dict[str, str] = {}
-        for value in values or []:
-            decision_id, separator, answer = value.partition("=")
-            if not separator or not decision_id.strip() or not answer.strip():
-                raise WorkflowError("Each --decision must use DECISION_ID=ANSWER with a non-empty answer.")
-            decision_id, answer = decision_id.strip(), answer.strip()
-            if decision_id in parsed:
-                raise WorkflowError(f"Decision {decision_id} was supplied more than once.")
-            parsed[decision_id] = answer
-        return parsed
-
-    def _resolve_approval_items(self, values: list[str] | None) -> list[dict]:
-        items = self._required_approval_items()
-        answers = self._parse_decision_arguments(values)
-        by_id = {item["id"]: item for item in items}
-        unknown = set(answers) - set(by_id)
-        if unknown:
-            raise WorkflowError("Unknown approval decision id(s): " + ", ".join(sorted(unknown)) + ".")
-        recorded = self.state.setdefault("decision_resolutions", [])
-        original_id_counts: dict[str, int] = {}
-        for item in items:
-            if item.get("kind") in {"material_finding_resolution", "blocking_review_finding"}:
-                original = item.get("finding_id")
-                if isinstance(original, str):
-                    original_id_counts[original] = original_id_counts.get(original, 0) + 1
-        resolved: list[dict] = []
-        pending: list[str] = []
-        for item in items:
-            answer = answers.get(item["id"])
-            if answer is None:
-                previous = next((row for row in reversed(recorded)
-                                 if row.get("decision_id") == item["id"]
-                                 and row.get("proposal_version") == self.state["proposal_version"]
-                                 and row.get("discovery_sha256") == self.state.get("discovery_sha256")), None)
-                if previous is None and item.get("kind") in {"material_finding_resolution", "blocking_review_finding"}:
-                    original_id = item.get("finding_id")
-                    if original_id_counts.get(original_id) == 1:
-                        legacy_id = f"REVIEW-{original_id}"
-                        previous = next((row for row in reversed(recorded)
-                                         if row.get("decision_id") == legacy_id
-                                         and row.get("proposal_version") == self.state["proposal_version"]
-                                         and row.get("discovery_sha256") == self.state.get("discovery_sha256")), None)
-                answer = previous.get("answer") if previous else None
-            valid_values = {_normalized_text(choice) for choice in item["choices"]}
-            if answer is not None and _normalized_text(answer) not in valid_values:
-                if not (item["kind"] == "discovery_decision" and answer.casefold().startswith("other:")
-                        and answer[6:].strip()):
-                    raise WorkflowError(
-                        f"Decision {item['id']} must be one of: {', '.join(item['choices'])}"
-                        + (" or other:<your decision>." if item["kind"] == "discovery_decision" else ".")
-                    )
-            if answer is not None and _normalized_text(answer) in valid_values:
-                answer = next(choice for choice in item["choices"] if _normalized_text(choice) == _normalized_text(answer))
-            if answer is None:
-                pending.append(
-                    f"{item['id']}: {item['description']} Choices: {', '.join(item['choices'])}. "
-                    + (f"Proposed default: {item['proposed_default']}." if item.get("proposed_default") else "")
-                )
-                continue
-            resolved.append({
-                "decision_id": item["id"],
-                "answer": answer,
-                "kind": item["kind"],
-                "description": item["description"],
-                "finding_id": item.get("finding_id"),
-                "finding_identity": item.get("finding_identity"),
-                "review_iteration": item.get("review_iteration"),
-                "choices": list(item["choices"]),
-                "proposed_default": item.get("proposed_default"),
-                "proposal_version": self.state["proposal_version"],
-                "discovery_sha256": self.state.get("discovery_sha256"),
-                "reference_verified": item.get("reference_verified") is True,
-                "resolution_verified": (
-                    item["kind"] == "material_finding_resolution" and answer == "verify_resolved"
-                ),
-                "time": now(),
-            })
-        for row in resolved:
-            key = (row["decision_id"], row["proposal_version"])
-            existing_row = next((saved for saved in reversed(recorded)
-                                 if (saved.get("decision_id"), saved.get("proposal_version")) == key), None)
-            if existing_row is None:
-                recorded.append(row)
-            elif row["decision_id"] in answers and existing_row.get("answer") != row["answer"]:
-                recorded.append(row)
-        for row in resolved:
-            if row["kind"] not in {"material_finding_resolution", "blocking_review_finding"}:
-                continue
-            finding_identity = row.get("finding_identity")
-            if not isinstance(finding_identity, str):
-                finding_identity = row["decision_id"].removeprefix("REVIEW-")
-            for review in self.state.get("plan_reviews", []):
-                if review.get("reconciled_proposal_version") != self.state["proposal_version"]:
-                    continue
-                for finding in review.get("material_findings_for_human_review", []):
-                    if _stored_finding_identity(finding, review.get("iteration")) == finding_identity:
-                        finding["human_resolution"] = row["answer"]
-                        finding["resolution_verified"] = row["resolution_verified"]
-                for finding in review.get("unresolved_blocking_findings", []):
-                    if _stored_finding_identity(finding, review.get("iteration")) == finding_identity:
-                        finding["human_resolution"] = row["answer"]
-                        finding["resolution_verified"] = row["resolution_verified"]
-            for finding in self.state.get("material_findings_pending", []):
-                if (_stored_finding_identity(finding) == finding_identity
-                        and finding.get("proposal_version") == self.state["proposal_version"]):
-                    finding["human_resolution"] = row["answer"]
-                    finding["resolution_verified"] = row["resolution_verified"]
-            for review_decision in self.state.get("plan_review_decisions", []):
-                if review_decision.get("proposal_version") != self.state["proposal_version"]:
-                    continue
-                for disposition in review_decision.get("parsed_dispositions", []):
-                    if _stored_finding_identity(disposition, review_decision.get("iteration")) == finding_identity:
-                        disposition["human_resolution"] = row["answer"]
-                        disposition["resolution_verified"] = row["resolution_verified"]
-        if pending:
-            self._save()
-            raise WorkflowError(
-                "Approval requires explicit answers to these material decisions:\n- "
-                + "\n- ".join(pending)
-                + "\nPass each as --decision DECISION_ID=ANSWER; answers apply only to this proposal version."
-            )
-        latest: dict[str, dict] = {}
-        for row in recorded:
-            if (row.get("proposal_version") == self.state["proposal_version"]
-                    and row.get("discovery_sha256") == self.state.get("discovery_sha256")
-                    and row.get("decision_id") in by_id):
-                latest[row["decision_id"]] = row
-        return [latest[item["id"]] for item in items]
-
     def start(self) -> dict:
         if not self.task or not self.task.strip():
             raise WorkflowError("A non-empty task is required to start a workflow.")
@@ -1756,7 +958,6 @@ class Orchestrator:
         self.workflow_dir.mkdir()
         self.state_path = self.workflow_dir / "state.json"
         self.proposal_path = self.workflow_dir / "proposal.md"
-        self.discovery_path = self.workflow_dir / "discovery.json"
         self.delivery_path = self.workflow_dir / "delivery.md"
         self.state = {
             "version": 1,
@@ -1772,15 +973,8 @@ class Orchestrator:
             "preexisting_paths": _protected_paths(self.target, baseline),
             "project_guidance": _project_guidance(self.target, self.task.strip()),
             "proposal_version": 0,
-            "proposal_versions": [],
-            "human_proposal_input": None,
-            "material_findings_pending": [],
-            "discovery": None,
-            "discovery_schema_version": None,
-            "discovery_sha256": None,
-            "discovery_artifact": None,
-            "decision_resolutions": [],
-            "proposal_readiness": {"status": "planning"},
+            "planning_validation_failures": [],
+            "planning_validation_failure_history_truncated": False,
             "authorization": new_workflow_authorization(
                 self.target, self.workflow_id, float(budget), self.max_code_review_calls,
             ),
@@ -1800,33 +994,14 @@ class Orchestrator:
         self._save()
         return self.run_pending()
 
-    def approve(self, decisions: list[str] | None = None) -> dict:
+    def approve(self) -> dict:
         self._load()
         if self.state.get("status") != "awaiting_approval":
             raise WorkflowError("This workflow is not waiting for implementation approval.")
-        self._require_current_discovery()
-        readiness = self.state.get("proposal_readiness", {})
-        if (readiness.get("proposal_version") != self.state.get("proposal_version")
-                or readiness.get("status") not in {"ready_for_approval", "human_review_required"}):
-            raise WorkflowError(
-                "The current proposal has not completed review reconciliation; implementation cannot be approved."
-            )
         current_proposal = self._read_proposal()
         if current_proposal != clean_markdown(self.state.get("proposal", "")):
             raise WorkflowError("The proposal file changed after review; use revise to review the change before approval.")
-        resolutions = self._resolve_approval_items(decisions)
-        if readiness.get("status") == "human_review_required":
-            self.state["proposal_readiness"]["status"] = "ready_for_approval"
-            self.state["proposal_readiness"]["human_review_resolved_at"] = now()
-            for review in self.state.get("plan_reviews", []):
-                if review.get("reconciled_proposal_version") == self.state.get("proposal_version"):
-                    review["proposal_ready_for_approval"] = True
         self.state["implementation_approved_at"] = {"time": now(), "method": "explicit approve command"}
-        self.state["approved_proposal_version"] = self.state["proposal_version"]
-        self.state["approved_discovery_sha256"] = self.state["discovery_sha256"]
-        self.state["approved_decision_resolutions"] = [
-            row.copy() for row in resolutions if row.get("proposal_version") == self.state["proposal_version"]
-        ]
         self.state["status"] = "running"
         self.state["stage"] = "implementation"
         self.state["error"] = None
@@ -1839,9 +1014,8 @@ class Orchestrator:
             raise WorkflowError("This workflow is not waiting for proposal feedback.")
         if not feedback.strip():
             raise WorkflowError("Proposal feedback must not be empty.")
-        self._require_current_discovery()
         self._invalidate_unverified_plan_reviews()
-        self.state["human_proposal_input"] = self._read_proposal()
+        self.state["proposal"] = self._read_proposal()
         self.state["proposal_version"] = max(1, int(self.state.get("proposal_version", 1)))
         self.state["project_guidance"] = _project_guidance(self.target, self.state["task"])
         self.state["human_feedback"] = feedback.strip()
@@ -1958,19 +1132,9 @@ class Orchestrator:
         if external["budget_unknown"]:
             raise WorkflowError("Claude review stopped because a previous call has no recorded cost.")
         if external["permitted_data"] != CLAUDE_DATA_SCOPE:
-            if not (stage == "code_review" and external["permitted_data"] == LEGACY_CLAUDE_DATA_SCOPE):
-                raise WorkflowError(
-                    "This Claude/Aily request is outside the workflow's persisted data authorization; "
-                    "new plan reviews require authorization for the structured Discovery record."
-                )
-        if stage.startswith("plan_review_"):
-            plan_review_calls = sum(
-                context.get("stage", "").startswith("plan_review_")
-                and context.get("call_state") != "validation_failed"
-                for context in self.state.get("claude_contexts", [])
-            )
-            if plan_review_calls >= external["max_plan_reviews"]:
-                raise WorkflowError("The authorized Claude plan-review call limit is exhausted.")
+            raise WorkflowError("This Claude/Aily request is outside the workflow's persisted data authorization.")
+        if stage.startswith("plan_review_") and len(self._valid_plan_reviews()) >= external["max_plan_reviews"]:
+            raise WorkflowError("The authorized Claude plan-review limit is exhausted.")
         code_review_call_number = None
         if stage == "code_review":
             code_review_calls = [
@@ -2000,7 +1164,7 @@ class Orchestrator:
             "plan_review": {
                 "Review metadata", "Assignment", "Current proposal", "Repository context",
                 "Workflow constraints", "Engineering Judgment & Proportional Design", "Relevant skills",
-                "Structured Discovery record", "Review duties", "Review history and Codex decisions",
+                "Review duties", "Review history and Codex decisions",
             },
         }["plan_review"] if stage != "code_review" else code_required
         safe_header = redact(header)
@@ -2086,7 +1250,6 @@ class Orchestrator:
             }
             for key in (
                 "campaign_id", "review_kind", "part_id", "shared_context_sha256", "part_patch_sha256",
-                "discovery_sha256",
             ):
                 if (metadata or {}).get(key) is not None:
                     manifest[key] = (metadata or {})[key]
@@ -2993,82 +2156,33 @@ class Orchestrator:
                         "Understand the assignment and this repository. Use the applicable instruction and skill "
                         "content supplied below; inspect relevant target files. Do not merely list skills: apply "
                         "relevant guidance and record each selected skill and its use. If none apply, say so. "
-                        "First produce a structured Discovery record, then the implementation proposal. The Discovery "
-                        "record must use schema_version 1 and these top-level arrays: requirements, repository_evidence, "
-                        "concerns, decisions. Each requirement needs id, description, source, interpretation, "
-                        "design_decision, proposal_reference, proposal_evidence, expected_verification. Each evidence "
-                        "entry needs id, source, observation, relevance. Each concern needs id, category, description, "
-                        "source, interpretation_impact, applicability (applicable, not_applicable, or unknown), "
-                        "not_applicable_reason (null unless not_applicable), related_requirement_ids, disposition, "
-                        "expected_verification, and material (boolean). For addressed, documented_assumption, or "
-                        "requires_user_decision concerns, also include proposal_reference and proposal_evidence. "
-                        "Use contextual concerns such as constraints, material non-functional and operational needs, "
-                        "external dependencies, unknowns, failure scenarios, and risks; do not force irrelevant concerns. "
-                        "Each decision needs id, classification (required_user_decision, "
-                        "necessary_engineering_decision, reversible_assumption, or future_production), description, "
-                        "reason, source_ids, proposal_reference, proposal_evidence. "
-                        "Required user decisions also need at least two choices and a proposed_default matching one choice. "
-                        "Reference exact proposal headings and short text that appears there. Every explicit requirement "
-                        "must map to a design decision and verification. Give non-applicable concerns a reason. "
-                        "Then return the proposal with scope, approach, risks, requirements mapping, and distinct "
-                        "sections or clear labels for explicit requirements, necessary engineering decisions, "
-                        "reversible assumptions, decisions requiring user input, and future production considerations. "
-                        "skills used, and concrete validation commands. Compare important alternatives and do not invent "
-                        "product behavior. Return exactly these two tagged blocks, with no surrounding commentary:\n"
-                        "<DISCOVERY_RECORD_JSON>{valid JSON object}</DISCOVERY_RECORD_JSON>\n"
-                        "<PROPOSAL_MARKDOWN>{complete Markdown proposal}</PROPOSAL_MARKDOWN>\n"
-                        "Do not modify files or run tests.\n\n"
+                        "Make reasonable technical decisions, identify requirements, edge cases, and verification. "
+                        "Apply Engineering Judgment & Proportional Design. Separate must implement, should implement, "
+                        "future production considerations, and out of scope. Compare alternatives for important "
+                        "architectural choices and do not invent product behavior. "
+                        "Return a concise, readable Markdown implementation proposal with scope, approach, risks, "
+                        "a requirements-to-design mapping, relevant skills and how they were applied, and concrete "
+                        "validation commands. Do not modify files or run tests.\n\n"
                         f"{_guidance_for_codex(guidance)}\n\n"
                         f"{PLANNING_PRINCIPLES}\n\nTarget: {self.target}\n\nAssignment:\n{self.state['task']}"
                     )
-                    output = self._run_codex(prompt, sandbox="read-only")
-                    discovery, proposal = _parse_discovery_and_proposal(output, proposal_version=1)
-                    self._persist_planning_version(discovery, proposal, 1)
-                    self.state["proposal_readiness"] = {"status": "under_review", "proposal_version": 1}
+                    proposal = clean_markdown(self._run_codex(prompt, sandbox="read-only"))
+                    self.state["proposal"] = proposal
+                    self.state["proposal_version"] = 1
+                    _atomic_text(self.proposal_path, proposal)
                     self.state["stage"] = "plan_review_1"
                     self._save()
                 elif stage in {"plan_review_1", "plan_review_2"}:
                     iteration = int(stage[-1])
                     header, sections, metadata = self._plan_review_prompt(iteration)
                     report, manifest = self._call_claude(header, stage, sections, metadata=metadata)
-                    try:
-                        parsed_review = _validate_plan_review(
-                            report, self._require_current_discovery(), self.state["proposal"],
-                        )
-                    except WorkflowError as exc:
-                        self.state["plan_reviews"].append({
-                            "attempt": len(self.state.get("plan_reviews", [])) + 1,
-                            "iteration": iteration,
-                            "proposal_version": metadata["proposal_version"],
-                            "report": report,
-                            "time": now(),
-                            "valid": False,
-                            "call_succeeded": True,
-                            "context_valid": manifest.get("complete") is True,
-                            "findings_parsed": False,
-                            "reconciled": False,
-                            "error": str(exc),
-                            "context_manifest": manifest,
-                        })
-                        self.state["proposal_readiness"] = {
-                            "status": "review_parse_failed", "proposal_version": metadata["proposal_version"],
-                            "reason": str(exc),
-                        }
-                        self._save()
-                        raise
                     self.state["plan_reviews"].append({
                         "attempt": len(self.state.get("plan_reviews", [])) + 1,
                         "iteration": iteration,
                         "proposal_version": metadata["proposal_version"],
                         "report": report,
-                        "parsed_review": parsed_review,
                         "time": now(),
                         "valid": True,
-                        "call_succeeded": True,
-                        "context_valid": manifest.get("complete") is True,
-                        "findings_parsed": True,
-                        "reconciled": False,
-                        "proposal_ready_for_approval": False,
                         "context_manifest": manifest,
                     })
                     self.state["stage"] = f"plan_refine_{iteration}"
@@ -3082,130 +2196,39 @@ class Orchestrator:
                     report = review["report"]
                     guidance = self._guidance()
                     prompt = (
-                        "Reconcile every structured finding from this Claude report by its exact stable id. Return one "
-                        "disposition per finding, with disposition incorporated, accepted_risk, deferred, or rejected, "
-                        "and a reason. An incorporated disposition must include proposal_reference (an exact Markdown "
-                        "heading) and proposal_evidence (a short exact quote in that section). The harness checks only "
-                        "that this reference exists; it does not prove the quote resolves the finding. Do not describe "
-                        "reference validation as semantic verification. Material findings without independent semantic "
-                        "verification will require an explicit human decision during approval. Explain all other "
-                        "dispositions. Preserve every "
-                        "prior Discovery requirement, repository evidence item, concern, and decision id. Update or add "
-                        "records only when justified by the review. A revised Discovery record must use schema_version 1 "
-                        "and the existing contract. Return exactly four tagged blocks and no surrounding commentary: "
-                        "<DISCOVERY_RECORD_JSON>{complete JSON object}</DISCOVERY_RECORD_JSON>, "
-                        "<FINDING_DISPOSITIONS_JSON>{schema_version: 1, dispositions: [...]}</FINDING_DISPOSITIONS_JSON>, "
-                        "<PROPOSAL_MARKDOWN>{complete Markdown proposal}</PROPOSAL_MARKDOWN>, and "
-                        "<SECOND_PLAN_REVIEW_NEEDED>yes or no</SECOND_PLAN_REVIEW_NEEDED>. Use yes only when a material "
-                        "plan change needs a second independent review. Do not ask for an additional review round.\n\n"
+                        "Evaluate every distinct finding in this valid Claude plan-review report. For each, explicitly "
+                        "mark incorporated, rejected, or deferred and give a reason. Incorporate valid in-scope "
+                        "recommendations; do not turn optional production advice into assignment requirements. "
+                        "Return the complete refined proposal as readable Markdown, retaining requirements mapping, "
+                        "scope distinctions, and the relevant skills and their application. Put a section titled "
+                        "`## Claude finding dispositions` at the end of the proposal. Use one bullet for every finding "
+                        "in this format: `- Finding: ... | Decision: incorporated/rejected/deferred | Reason: ...`. "
+                        "If there are none, write `- No actionable findings.` Apply Engineering Judgment & "
+                        "Proportional Design. Add one final "
+                        "line exactly in this form: `Second plan review needed: yes` or `...: no`. Use yes only when "
+                        "a material plan change needs a second independent plan review.\n\n"
                         f"{PLANNING_PRINCIPLES}\n\n{_guidance_for_codex(guidance)}\n\n"
                         f"Assignment:\n{self.state['task']}\n\nCurrent proposal (version "
                         f"{self.state.get('proposal_version', 1)}):\n{self.state['proposal']}\n\n"
-                        f"Structured Discovery record:\n{json.dumps(self._require_current_discovery(), indent=2, ensure_ascii=False)}\n\n"
                         f"Claude review (iteration {iteration}, proposal version {review.get('proposal_version')}):\n{report}"
                     )
                     refined = self._run_codex(prompt, sandbox="read-only")
-                    new_version = int(self.state.get("proposal_version", 1)) + 1
-                    new_discovery, proposal = _parse_discovery_and_proposal(
-                        refined, proposal_version=new_version,
-                    )
-                    raw_dispositions = _parse_json_block(refined, "FINDING_DISPOSITIONS_JSON")
-                    dispositions, unresolved_blockers = _validate_finding_dispositions(
-                        raw_dispositions, review.get("parsed_review", {}).get("findings", []), proposal,
-                        review_iteration=iteration,
-                    )
-                    disposition_by_id = {item["finding_id"]: item for item in dispositions}
-                    material_findings = []
-                    for finding in review.get("parsed_review", {}).get("findings", []):
-                        if finding.get("blocks_approval") or finding.get("severity") == "must_fix":
-                            disposition = disposition_by_id[finding["id"]]
-                            material_findings.append({
-                                "finding_id": finding["id"],
-                                "review_iteration": iteration,
-                                "finding_identity": _finding_identity(iteration, finding["id"]),
-                                "description": finding["description"],
-                                "severity": finding["severity"],
-                                "blocks_approval": finding["blocks_approval"],
-                                "disposition": disposition["disposition"],
-                                "reason": disposition["reason"],
-                                "proposal_reference": disposition.get("proposal_reference"),
-                                "proposal_evidence": disposition.get("proposal_evidence"),
-                                "reference_verified": disposition["reference_verified"],
-                                "resolution_verified": False,
-                                "proposal_version": new_version,
-                            })
-                    review_again_text = _extract_tagged_block(refined, "SECOND_PLAN_REVIEW_NEEDED").casefold()
-                    if review_again_text not in {"yes", "no"}:
-                        raise WorkflowError("Codex must set SECOND_PLAN_REVIEW_NEEDED to yes or no.")
-                    review_again = review_again_text == "yes"
-                    self._persist_planning_version(new_discovery, proposal, new_version)
-                    pending_by_id = {
-                        _pending_finding_identity(item, self.state): item
-                        for item in self.state.get("material_findings_pending", [])
-                        if isinstance(item, dict) and item.get("finding_id")
-                    }
-                    pending_by_id.update({item["finding_identity"]: item for item in material_findings})
-                    self.state["material_findings_pending"] = list(pending_by_id.values())
-                    pending_material = _material_findings_pending_for_state(self.state, new_version)
-                    review["reconciled"] = True
-                    review["findings_reconciled"] = True
-                    review["reconciled_proposal_version"] = new_version
-                    review["unresolved_blocking_findings"] = [
-                        {
-                            "finding_id": blocker["finding"]["id"],
-                            "review_iteration": iteration,
-                            "finding_identity": _finding_identity(iteration, blocker["finding"]["id"]),
-                            "description": blocker["finding"]["description"],
-                            "severity": blocker["finding"]["severity"],
-                            "disposition": blocker["disposition"]["disposition"],
-                            "reason": blocker["disposition"]["reason"],
-                            "reference_verified": blocker["disposition"]["reference_verified"],
-                            "resolution_verified": False,
-                        }
-                        for blocker in unresolved_blockers
-                    ]
-                    review["material_findings_for_human_review"] = material_findings
-                    needs_human_ack = (
-                        review.get("parsed_review", {}).get("decision") == "human_review_required"
-                        and not unresolved_blockers
-                    )
-                    review["proposal_ready_for_approval"] = (
-                        not unresolved_blockers and not needs_human_ack and not pending_material
-                    )
+                    next_proposal_version = int(self.state.get("proposal_version", 1)) + 1
+                    try:
+                        proposal, review_again, dispositions = self._refined_proposal(refined)
+                    except WorkflowError as exc:
+                        self._record_unvalidated_planning_output(
+                            refined, exc, stage=stage, proposal_version=next_proposal_version,
+                        )
+                        raise
+                    self.state["proposal"] = proposal
+                    self.state["proposal_version"] = next_proposal_version
                     self.state.setdefault("plan_review_decisions", []).append({
                         "iteration": iteration,
-                        "proposal_version": new_version,
-                        "dispositions": "\n".join(
-                            f"- {item['finding_id']}: {item['disposition']} — {item['reason']} "
-                            f"[reference_verified={item['reference_verified']}; "
-                            f"resolution_verified={item['resolution_verified']}]"
-                            + (f" ({item.get('proposal_reference')}: {item.get('proposal_evidence')})"
-                               if item.get("proposal_evidence") else "")
-                            for item in dispositions
-                        ) or "No Claude findings required disposition.",
-                        "parsed_dispositions": dispositions,
+                        "proposal_version": self.state["proposal_version"],
+                        "dispositions": dispositions,
                     })
-                    readiness = {
-                        "status": "human_review_required"
-                        if (unresolved_blockers or needs_human_ack or pending_material)
-                        else "ready_for_approval",
-                        "proposal_version": new_version,
-                        "unresolved_blocking_finding_ids": [
-                            item["finding"]["id"] for item in unresolved_blockers
-                        ],
-                        "material_findings_for_human_review": [
-                            item["finding_id"] for item in pending_material
-                        ],
-                    }
-                    if needs_human_ack:
-                        readiness.update({
-                            "reason": (
-                                "Claude marked the plan for human review. Review the structured findings and "
-                                "explicitly acknowledge this before approval."
-                            ),
-                            "ack_choice": "approve_after_review",
-                        })
-                    self.state["proposal_readiness"] = readiness
+                    _atomic_text(self.proposal_path, proposal)
                     if iteration == 1 and review_again:
                         self.state["stage"] = "plan_review_2"
                     else:
@@ -3218,38 +2241,23 @@ class Orchestrator:
                         "Revise the saved proposal to address the user's explicit feedback. Keep the original "
                         "assignment and unrelated decisions intact. Apply Engineering Judgment & Proportional Design. "
                         "Apply relevant skill instructions below, and record the skill name and how it informed the "
-                        "proposal; if there are no applicable skills, state that. Preserve all Discovery ids and update "
-                        "proposal references and evidence to match the revised proposal. Return exactly these two blocks "
-                        "with no surrounding commentary: <DISCOVERY_RECORD_JSON>{complete JSON object}</DISCOVERY_RECORD_JSON> "
-                        "and <PROPOSAL_MARKDOWN>{complete Markdown proposal}</PROPOSAL_MARKDOWN>. Do not implement code.\n\n"
+                        "proposal; if there are no applicable skills, state that. Distinguish must implement, should "
+                        "implement, future production considerations, and out of scope. Return the complete proposal "
+                        "in readable Markdown; do not implement code.\n\n"
                         f"{PLANNING_PRINCIPLES}\n\n{_guidance_for_codex(guidance)}\n\n"
                         f"Assignment:\n{self.state['task']}\n\nCurrent proposal (version "
-                        f"{self.state.get('proposal_version', 1)}):\n"
-                        f"{self.state.get('human_proposal_input') or self.state['proposal']}\n\n"
-                        f"Structured Discovery record:\n{json.dumps(self._require_current_discovery(), indent=2, ensure_ascii=False)}\n\n"
+                        f"{self.state.get('proposal_version', 1)}):\n{self.state['proposal']}\n\n"
                         f"Prior review attempts:\n{self._review_history_for_prompt()}\n\n"
                         f"User feedback:\n{self.state['human_feedback']}"
                     )
-                    new_version = int(self.state.get("proposal_version", 1)) + 1
-                    output = self._run_codex(prompt, sandbox="read-only")
-                    discovery, proposal = _parse_discovery_and_proposal(output, proposal_version=new_version)
-                    self._persist_planning_version(discovery, proposal, new_version)
-                    self.state["human_proposal_input"] = None
+                    self.state["proposal"] = clean_markdown(self._run_codex(prompt, sandbox="read-only"))
+                    self.state["proposal_version"] = int(self.state.get("proposal_version", 1)) + 1
+                    _atomic_text(self.proposal_path, self.state["proposal"])
                     authorized_plan_limit = self.state["authorization"]["claude_aily"]["max_plan_reviews"]
                     valid_reviews = self._valid_plan_reviews()
                     if len(valid_reviews) < authorized_plan_limit:
-                        self.state["proposal_readiness"] = {"status": "under_review", "proposal_version": new_version}
                         self.state["stage"] = f"plan_review_{len(valid_reviews) + 1}"
                     else:
-                        self.state["proposal_readiness"] = {
-                            "status": "human_review_required",
-                            "proposal_version": new_version,
-                            "ack_choice": "approve_unreviewed_revision",
-                            "reason": (
-                                "This proposal was revised after the authorized Claude plan-review iterations "
-                                "were exhausted. Review the changes and explicitly acknowledge this before approval."
-                            ),
-                        }
                         self.state["status"] = "awaiting_approval"
                         self.state["stage"] = "implementation"
                     self._save()
@@ -3427,32 +2435,13 @@ class Orchestrator:
                 "publication, shared-infrastructure changes, or access to unrelated repositories. Preserve the "
                 "existing assignment and workflow budget."
             ),
-            "Structured Discovery record": json.dumps(
-                self._require_current_discovery(), indent=2, ensure_ascii=False,
-            ),
             "Engineering Judgment & Proportional Design": PLANNING_PRINCIPLES,
             "Relevant skills": _guidance_for_claude(guidance),
             "Review duties": (
-                "Review requirement coverage, architecture and boundaries, data/persistence when relevant, lifecycle "
-                "when relevant, failure/recovery, dependencies/contracts, security/configuration when relevant, "
-                "deployment/execution when relevant, verification, assumptions, and unresolved decisions. These are "
-                "contextual review dimensions, not automatic implementation requirements. Compare the structured "
-                "Discovery record with the proposal and identify evidence or risks that are missing or misrepresented. "
-                "Use exact requirement_id coverage for every requirement and exact concern_id coverage for every "
-                "Discovery concern. Covered/reflected rows must cite proposal_reference (an exact heading) and "
-                "proposal_evidence (a short exact quote in that section). This is mechanical reference validation, "
-                "not proof that the proposal resolves a finding. Gaps, unknowns, and not_applicable rows need "
-                "a reason. Every gap or non-reflected/unknown concern must be linked to a finding. "
-                "Return exactly one <PLAN_REVIEW_JSON> block and no surrounding commentary. JSON schema: "
-                "{schema_version: 1, decision: ready_for_approval|changes_requested|human_review_required, "
-                "assessment: string, requirement_coverage: [{requirement_id, status: covered|gap|unclear, "
-                "proposal_reference, proposal_evidence, reason}], discovery_coverage: [{concern_id, "
-                "status: reflected|not_reflected|unknown|not_applicable, proposal_reference, proposal_evidence, reason}], "
-                "findings: [{id: stable F-* id, category, severity: must_fix|should_fix|optional, description, evidence, "
-                "engineering_impact, recommended_action, blocks_approval: boolean, related_ids: [requirement/concern ids]}]}. "
-                "Every finding needs evidence and an assignment-specific impact. Use ready_for_approval only when all "
-                "requirements and applicable concerns are reflected and no finding blocks approval. Distinguish model "
-                "review success from proposal readiness."
+                "Answer both questions explicitly: (1) Does the proposal satisfy every explicit assignment requirement? "
+                "(2) Is each architectural component and abstraction justified by those requirements? Prefer the "
+                "simplest adequate solution. Distinguish genuine omissions from should-implement items, future "
+                "production considerations, and out-of-scope ideas. Do not reward complexity by itself."
             ),
             "Review history and Codex decisions": self._review_history_for_prompt(),
         }
@@ -3460,9 +2449,34 @@ class Orchestrator:
             "iteration": iteration,
             "proposal_version": version,
             "header_id": "plan-review-v2",
-            "discovery_sha256": self.state.get("discovery_sha256"),
         }
         return header, sections, metadata
+
+    @staticmethod
+    def _refined_proposal(value: str) -> tuple[str, bool, str]:
+        match = re.search(r"(?im)^\s*Second plan review needed:\s*(yes|no)\s*$", value)
+        if not match:
+            raise WorkflowError("Codex refinement must state whether a second plan review is needed.")
+        review_again = match.group(1).lower() == "yes"
+        proposal = value[:match.start()].strip()
+        if not proposal:
+            raise WorkflowError("Codex returned an empty refined proposal.")
+        disposition_heading = re.search(r"(?im)^##\s+Claude finding dispositions\s*$", proposal)
+        if not disposition_heading:
+            raise WorkflowError("Codex refinement is missing the required Claude finding dispositions section.")
+        dispositions = proposal[disposition_heading.end():].strip()
+        if not dispositions:
+            raise WorkflowError("Codex refinement has an empty Claude finding dispositions section.")
+        no_findings = re.search(r"(?im)^-\s*No actionable findings\.?\s*$", dispositions)
+        finding_decisions = re.findall(
+            r"(?im)^-\s*Finding:.*\|\s*Decision:\s*(?:incorporated|rejected|deferred)\s*\|\s*Reason:\s*.+$",
+            dispositions,
+        )
+        if not no_findings and not finding_decisions:
+            raise WorkflowError(
+                "Codex dispositions must list each finding with a decision and reason, or state that there were none."
+            )
+        return clean_markdown(proposal), review_again, dispositions
 
     def _delivery_report(self) -> str:
         reviews = self.state.get("plan_reviews", [])
@@ -3498,18 +2512,6 @@ class Orchestrator:
                 f"### Codex dispositions after iteration {decision['iteration']}", "",
                 decision["dispositions"], "",
             ])
-        approval_resolutions = self.state.get("approved_decision_resolutions", [])
-        if approval_resolutions:
-            sections.extend(["## Human approval decisions", ""])
-            for item in approval_resolutions:
-                line = f"- `{item.get('decision_id')}`: {item.get('answer')}"
-                if item.get("kind") in {"material_finding_resolution", "blocking_review_finding"}:
-                    line += (
-                        f"; reference_verified={item.get('reference_verified', False)}; "
-                        f"resolution_verified={item.get('resolution_verified', False)}"
-                    )
-                sections.append(line + ".")
-            sections.append("")
         sections.extend([
             "## Claude context audit",
             "",
@@ -3619,107 +2621,6 @@ def _code_review_calls_arg(value: str) -> int:
     return calls
 
 
-def _approval_decisions_for_display(state: dict) -> list[dict]:
-    discovery = state.get("discovery")
-    version = state.get("proposal_version")
-    if not isinstance(discovery, dict) or not isinstance(version, int):
-        return [{
-            "status": "unavailable",
-            "message": "This workflow predates structured Discovery; approval requires a new workflow.",
-        }]
-    latest_answers: dict[str, dict] = {}
-    for row in state.get("decision_resolutions", []):
-        if (row.get("proposal_version") == version
-                and row.get("discovery_sha256") == state.get("discovery_sha256")):
-            latest_answers[row.get("decision_id")] = row
-
-    def answer_for(item: dict, original_id_counts: dict[str, int] | None = None):
-        answer = latest_answers.get(item["id"])
-        original = item.get("finding_id")
-        if (answer is None and isinstance(original, str) and original_id_counts
-                and original_id_counts.get(original) == 1):
-            answer = latest_answers.get(f"REVIEW-{original}")
-        return answer
-    items = []
-    for decision in discovery.get("decisions", []):
-        if decision.get("classification") != "required_user_decision":
-            continue
-        answer = latest_answers.get(decision.get("id"))
-        items.append({
-            "id": decision.get("id"),
-            "kind": "discovery_decision",
-            "description": decision.get("description"),
-            "choices": decision.get("choices", []),
-            "proposed_default": decision.get("proposed_default"),
-            "answer": answer.get("answer") if answer else None,
-            "status": "resolved" if answer else "unresolved",
-        })
-    readiness = state.get("proposal_readiness", {})
-    if readiness.get("proposal_version") == version:
-        acknowledgement = latest_answers.get("PLAN-REVIEW-ACK")
-        if readiness.get("reason") or acknowledgement:
-            items.append({
-                "id": "PLAN-REVIEW-ACK",
-                "kind": "proposal_review_acknowledgement",
-                "description": readiness.get("reason", "Human review acknowledgement recorded."),
-                "choices": [readiness.get("ack_choice", "approve_unreviewed_revision")],
-                "answer": acknowledgement.get("answer") if acknowledgement else None,
-                "status": "resolved" if acknowledgement else "unresolved",
-            })
-    seen = {item["id"] for item in items}
-    for review in state.get("plan_reviews", []):
-        if review.get("reconciled_proposal_version") != version or not review.get("reconciled"):
-            continue
-        for finding in review.get("unresolved_blocking_findings", []):
-            identity = _stored_finding_identity(finding, review.get("iteration"))
-            decision_id = _review_decision_id(identity)
-            answer = latest_answers.get(decision_id)
-            items.append({
-                "id": decision_id,
-                "kind": "blocking_review_finding",
-                "finding_id": finding.get("finding_id"),
-                "finding_identity": identity,
-                "review_iteration": finding.get("review_iteration", review.get("iteration")),
-                "description": finding.get("description"),
-                "choices": ["accept_risk", "reject_finding"],
-                "answer": answer.get("answer") if answer else None,
-                "status": "resolved" if answer else "unresolved",
-                "reference_verified": finding.get("reference_verified") is True,
-                "resolution_verified": answer.get("resolution_verified", False) if answer else False,
-            })
-            seen.add(decision_id)
-    pending_material = _material_findings_pending_for_state(state, version)
-    identity_counts: dict[str, int] = {}
-    for finding in pending_material:
-        original = finding.get("finding_id")
-        if isinstance(original, str):
-            identity_counts[original] = identity_counts.get(original, 0) + 1
-    for finding in pending_material:
-        identity = _stored_finding_identity(finding)
-        decision_id = _review_decision_id(identity)
-        if decision_id in seen:
-            continue
-        answer = answer_for({"id": decision_id, "finding_id": finding.get("finding_id")}, identity_counts)
-        choices = ["verify_resolved", "accept_risk", "reject_finding"]
-        if finding.get("disposition") not in {None, "incorporated"}:
-            choices = ["accept_risk", "reject_finding"]
-        items.append({
-            "id": decision_id,
-            "kind": "material_finding_resolution",
-            "finding_id": finding.get("finding_id"),
-            "finding_identity": identity,
-            "review_iteration": finding.get("review_iteration"),
-            "description": finding.get("description"),
-            "choices": choices,
-            "answer": answer.get("answer") if answer else None,
-            "status": "resolved" if answer else "unresolved",
-            "reference_verified": finding.get("reference_verified") is True,
-            "resolution_verified": answer.get("resolution_verified", False) if answer else False,
-        })
-        seen.add(decision_id)
-    return items
-
-
 def _print_summary(state: dict) -> None:
     external_authorization = state.get("authorization", {}).get("claude_aily", {})
     reviews = state.get("plan_reviews", [])
@@ -3734,14 +2635,6 @@ def _print_summary(state: dict) -> None:
         "authorization_id": state.get("authorization", {}).get("authorization_id"),
         "codex_model": state.get("codex_model"),
         "proposal_version": state.get("proposal_version"),
-        "discovery": {
-            "schema_version": state.get("discovery_schema_version"),
-            "proposal_version": (state.get("discovery") or {}).get("proposal_version"),
-            "sha256": state.get("discovery_sha256"),
-            "artifact": state.get("discovery_artifact"),
-        },
-        "proposal_readiness": state.get("proposal_readiness"),
-        "approval_decisions": _approval_decisions_for_display(state),
         "valid_plan_reviews": len(valid_reviews),
         "invalidated_plan_reviews": len(reviews) - len(valid_reviews),
         "claude_contexts": [
@@ -3804,11 +2697,6 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--workflow-id", required=True)
         command.add_argument("--codex", default=CODEX_EXECUTABLE)
         command.add_argument("--aily", default=claude_reviewer.AILY_EXECUTABLE)
-    commands.choices["approve"].add_argument(
-        "--decision", action="append", default=[], metavar="ID=ANSWER",
-        help=("Resolve a required proposal decision explicitly; repeat for multiple decisions. "
-              "Use the displayed proposed default or another listed choice."),
-    )
 
     revise = commands.add_parser("revise", help="Request a proposal change before implementation")
     revise.add_argument("--target", required=True)
@@ -3838,7 +2726,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             runner = Orchestrator(args.target, workflow_id=args.workflow_id, codex=args.codex, aily=args.aily)
             if args.command == "approve":
-                state = runner.approve(args.decision)
+                state = runner.approve()
             elif args.command == "resume":
                 state = runner.resume()
             elif args.command == "revise":
