@@ -14,6 +14,8 @@ from typing import Callable
 
 
 AILY_EXECUTABLE = "aily"
+DEFAULT_MAX_REVIEW_PAYLOAD_CHARS = 100_000
+MAX_REVIEW_PAYLOAD_ENV = "HARNESS_CLAUDE_MAX_PAYLOAD_CHARS"
 SECRET_PATTERNS = (
     re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{12,}"),
     re.compile(r"\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{20,}|AKIA[A-Z0-9]{16})\b"),
@@ -38,7 +40,32 @@ class ReviewResult:
 def redact(text: str) -> str:
     for pattern in SECRET_PATTERNS:
         text = pattern.sub("[REDACTED]", text)
-    return text[:1200]
+    return text
+
+
+def max_review_payload_chars() -> int:
+    raw = os.environ.get(MAX_REVIEW_PAYLOAD_ENV)
+    if raw is None:
+        return DEFAULT_MAX_REVIEW_PAYLOAD_CHARS
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ReviewError(f"{MAX_REVIEW_PAYLOAD_ENV} must be a positive integer.") from exc
+    if value < 1:
+        raise ReviewError(f"{MAX_REVIEW_PAYLOAD_ENV} must be a positive integer.")
+    return value
+
+
+def validate_review_payload(prompt: str) -> int:
+    if not prompt.strip():
+        raise ReviewError("Claude review context is empty; no paid call was made.")
+    limit = max_review_payload_chars()
+    if len(prompt) > limit:
+        raise ReviewError(
+            f"Claude review context is {len(prompt)} characters, above the configured {limit}-character "
+            f"limit ({MAX_REVIEW_PAYLOAD_ENV}); no paid call was made."
+        )
+    return limit
 
 
 def _decode(stdout: str) -> tuple[str, float | None]:
@@ -77,6 +104,7 @@ def review(
         raise ReviewError("A positive USD budget is required for Claude review.")
     if not math.isfinite(float(budget_usd)) or budget_usd <= 0:
         raise ReviewError("A positive USD budget is required for Claude review.")
+    validate_review_payload(prompt)
 
     command = [
         executable, "claude", "-p", prompt,

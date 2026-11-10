@@ -22,16 +22,19 @@ The harness has no Python package dependencies.
 
 Each stage is recorded in one small JSON state file. `resume` retries only the failed stage. It does not replan completed work or cross the approval gate.
 
+Starting the workflow writes one persistent authorization into that state. It binds normal development operations to the exact target and workflow ID, authorizes the configured Claude/Aily reviews within the declared budget, and is reused on every stage and resume. The saved scope is checked before resuming; approval and resume commands do not request or replace the authorization.
+
 ## Start a workflow
 
-Provide an absolute target path, assignment, and one total budget for Claude/Aily calls:
+Provide an absolute target path and assignment. Claude/Aily calls default to a total budget of USD 2.00; override it with `--budget-usd`. The workflow prints and stores the effective budget. A Codex model is optional; without `--model`, the CLI's configured default is used.
 
 ```sh
 python3 /path/to/autonomous-engineering-harness/harness/orchestrator.py start \
   --target /absolute/path/to/target-repository \
-  --task-file /absolute/path/to/assignment.md \
-  --budget-usd 2.00
+  --task-file /absolute/path/to/assignment.md
 ```
+
+For example, `--budget-usd 0.75` overrides the budget, and `--model MODEL_NAME` selects a Codex model explicitly. The selected model is saved with the workflow and reused on approval/resume. If omitted, no `--model` argument is passed to Codex.
 
 The workflow prints its ID and proposal path. Review the proposal, then explicitly approve it:
 
@@ -73,12 +76,17 @@ Workflow files are stored under `.engineering/workflows/WORKFLOW_ID/` in the tar
 ## Workspace and review boundaries
 
 - The target must be an absolute Git repository root. Codex runs with the target as its workspace and does not need per-file approvals for ordinary engineering work.
+- The Codex CLI approval policy is supplied as a top-level option before `exec` (`codex --ask-for-approval never exec ...`); ordinary commands run under the selected sandbox without repeated human approval.
+- Dependency installs are limited to dependencies declared by the repository and its package manager; arbitrary download URLs and custom registries are outside the workflow authorization.
 - The Codex planning stage is read-only. Implementation and correction use the Codex workspace-write sandbox.
-- Claude receives the assignment, proposal, summaries, and a redacted patch. It runs in a restricted temporary directory with read-only tools and no target files mounted.
+- Claude receives complete, secret-redacted review sections. The harness validates required sections, enforces `HARNESS_CLAUDE_MAX_PAYLOAD_CHARS` (default: 100,000), and refuses oversized or incomplete context before making a paid call. It never truncates required context.
+- Each Claude call records the prompt SHA-256, character count, proposal version, review iteration, and per-section hashes in `state.json`; review records refer to that manifest.
+- Planning includes the Engineering Judgment & Proportional Design rule. Codex receives applicable `AGENTS.md` files and skills from target `.agents/skills` and `.codex/skills`; relevant installed skills under `CODEX_HOME` are supplied inline when the CLI invocation disables plugins.
 - Existing dirty and untracked paths are excluded from the Claude patch. Credential and environment paths are also excluded; common credential patterns are redacted.
-- New files over 500 KB are omitted from the review patch, and the patch is capped at 200 KB. The reviewer sees a note when either limit applies.
+- Code reviews receive the complete eligible patch. If a new file or full review context exceeds `HARNESS_CLAUDE_MAX_PAYLOAD_CHARS`, the review stops with an explicit error before a paid Claude call.
 - The one `--budget-usd` limit applies across Claude calls. Aily receives the remaining amount as a hard call cap. Actual reported costs are accumulated. If a call's cost is unknown or an invocation is interrupted, further Claude calls stop.
-- The workflow does not commit, push, merge, deploy, publish, or change shared infrastructure. Codex is instructed to preserve unrelated files and changes.
+- The workflow authorization allows at most two plan reviews and one independent code review, and only the assignment, proposal, implementation/validation summary, and relevant redacted code changes are in the Aily data scope.
+- The workflow authorization does not include commits, pushes, merges, deployments, publication, or shared-infrastructure changes. Those require separate explicit authorization. Codex is instructed to preserve unrelated files and changes.
 
 These are workflow guardrails. They do not override OS, provider, or organization permissions, and they are not an OS-level process sandbox.
 
