@@ -13,7 +13,8 @@ from dataclasses import dataclass
 from typing import Callable
 
 
-AILY_EXECUTABLE = "aily"
+DEFAULT_AILY_EXECUTABLE = "/Users/slcosentino/.local/bin/aily"
+AILY_EXECUTABLE = os.environ.get("AILY_EXECUTABLE", DEFAULT_AILY_EXECUTABLE)
 DEFAULT_MAX_REVIEW_PAYLOAD_CHARS = 100_000
 MAX_REVIEW_PAYLOAD_ENV = "HARNESS_CLAUDE_MAX_PAYLOAD_CHARS"
 SECRET_PATTERNS = (
@@ -119,7 +120,7 @@ def review(
     prompt: str,
     *,
     budget_usd: float,
-    executable: str = AILY_EXECUTABLE,
+    executable: str | None = None,
     timeout_seconds: int = 900,
     process_runner: Callable = subprocess.run,
 ) -> ReviewResult:
@@ -128,6 +129,8 @@ def review(
         raise ReviewError("A positive USD budget is required for Claude review.")
     if not math.isfinite(float(budget_usd)) or budget_usd <= 0:
         raise ReviewError("A positive USD budget is required for Claude review.")
+    if executable is None:
+        executable = os.environ.get("AILY_EXECUTABLE", AILY_EXECUTABLE)
     validate_review_invocation(prompt, executable)
 
     command = [

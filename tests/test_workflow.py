@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -43,12 +44,72 @@ def prompt_section(prompt: str, name: str) -> str:
     return match.group(1).strip() if match else ""
 
 
+def prompt_discovery(prompt: str) -> dict:
+    section = prompt_section(prompt, "Structured Discovery record")
+    if not section:
+        match = re.search(
+            r"(?s)Structured Discovery record:\s*(\{.*?\})\s*\n\n(?:Claude review|Prior review attempts)", prompt,
+        )
+        section = match.group(1) if match else ""
+    return json.loads(section)
+
+
+def first_proposal_reference(proposal: str) -> tuple[str, str]:
+    headings = list(re.finditer(r"(?m)^(#{1,6})\s+(.+?)\s*#*\s*$", proposal))
+    sections = [heading for heading in headings if len(heading.group(1)) > 1] or headings
+    for index, heading in enumerate(sections):
+        end = next((candidate.start() for candidate in headings if candidate.start() > heading.start()
+                    and len(candidate.group(1)) <= len(heading.group(1))), len(proposal))
+        body_lines = [
+            line.strip() for line in proposal[heading.end():end].splitlines()
+            if line.strip() and not re.match(r"^#{1,6}\s+", line.strip())
+        ]
+        if body_lines:
+            return heading.group(2).strip(), body_lines[0]
+    raise AssertionError("test proposal needs a Markdown heading with body text")
+
+
+def fake_discovery(proposal: str) -> dict:
+    heading, evidence = first_proposal_reference(proposal)
+    return {
+        "schema_version": 1,
+        "requirements": [{
+            "id": "REQ-001",
+            "description": "Implement the requested assignment behavior.",
+            "source": "assignment",
+            "interpretation": "The task text is the acceptance baseline.",
+            "design_decision": evidence,
+            "proposal_reference": heading,
+            "proposal_evidence": evidence,
+            "expected_verification": "Run the focused workflow tests.",
+        }],
+        "repository_evidence": [],
+        "concerns": [],
+        "decisions": [],
+    }
+
+
+def update_discovery_evidence(discovery: dict, proposal: str) -> dict:
+    heading, evidence = first_proposal_reference(proposal)
+    discovery = json.loads(json.dumps(discovery))
+    for item in discovery.get("requirements", []):
+        item.update({"proposal_reference": heading, "proposal_evidence": evidence, "design_decision": evidence})
+    for item in discovery.get("concerns", []):
+        if item.get("disposition") in {"addressed", "documented_assumption", "requires_user_decision"}:
+            item.update({"proposal_reference": heading, "proposal_evidence": evidence})
+    for item in discovery.get("decisions", []):
+        item.update({"proposal_reference": heading, "proposal_evidence": evidence})
+    return discovery
+
+
 class FakeCodex:
     def __init__(self, *responses: str):
         self.responses = list(responses)
         self.commands: list[list[str]] = []
         self.prompts: list[str] = []
         self.on_call = None
+        self.discovery_record: dict | None = None
+        self.disposition_overrides: dict[str, str] = {}
 
     def __call__(self, command, **kwargs):
         self.commands.append(command)
@@ -59,8 +120,68 @@ class FakeCodex:
         response = self.responses.pop(0)
         if self.on_call is not None:
             self.on_call(len(self.commands) - 1, command, kwargs)
+        prompt = kwargs["input"].decode("utf-8")
+        if "<FINDING_DISPOSITIONS_JSON>" in prompt:
+            response = self._refinement_output(response, prompt)
+        elif "<DISCOVERY_RECORD_JSON>" in prompt and "User feedback:" in prompt:
+            proposal = response
+            current = prompt_discovery(prompt)
+            discovery = update_discovery_evidence(current, proposal)
+            response = self._discovery_output(discovery, proposal)
+        elif "<DISCOVERY_RECORD_JSON>" in prompt:
+            response = self._discovery_output(self.discovery_record or fake_discovery(response), response)
         output_path.write_text(response, encoding="utf-8")
         return subprocess.CompletedProcess(command, 0, b"", b"")
+
+    @staticmethod
+    def _discovery_output(discovery: dict, proposal: str) -> str:
+        return (
+            "<DISCOVERY_RECORD_JSON>\n" + json.dumps(discovery, ensure_ascii=False) + "\n"
+            "</DISCOVERY_RECORD_JSON>\n<PROPOSAL_MARKDOWN>\n" + proposal.strip()
+            + "\n</PROPOSAL_MARKDOWN>"
+        )
+
+    def _refinement_output(self, raw_proposal: str, prompt: str) -> str:
+        review = orchestrator._parse_json_block(prompt, "PLAN_REVIEW_JSON")
+        proposal = raw_proposal
+        second = re.search(r"(?im)^\s*Second plan review needed:\s*(yes|no)\s*$", proposal)
+        if second:
+            second_needed = second.group(1).lower()
+            proposal = proposal[:second.start()].rstrip()
+        else:
+            second_needed = "no"
+        findings = review.get("findings", [])
+        incorporated_lines = [
+            f"{finding['id']}: {finding['recommended_action']}"
+            for finding in findings
+            if self.disposition_overrides.get(finding["id"], "incorporated") == "incorporated"
+        ]
+        if incorporated_lines:
+            proposal += "\n\n## Review disposition references\n" + "\n".join(incorporated_lines) + "\n"
+        old_discovery = prompt_discovery(prompt)
+        discovery = update_discovery_evidence(old_discovery, proposal)
+        dispositions = []
+        for finding in findings:
+            disposition = self.disposition_overrides.get(finding["id"], "incorporated")
+            item = {
+                "finding_id": finding["id"],
+                "disposition": disposition,
+                "reason": "The proposal was revised to address this finding.",
+            }
+            if disposition == "incorporated":
+                item.update({
+                    "proposal_reference": "Review disposition references",
+                    "proposal_evidence": f"{finding['id']}: {finding['recommended_action']}",
+                })
+            dispositions.append(item)
+        return (
+            "<DISCOVERY_RECORD_JSON>\n" + json.dumps(discovery, ensure_ascii=False) + "\n"
+            "</DISCOVERY_RECORD_JSON>\n<FINDING_DISPOSITIONS_JSON>\n"
+            + json.dumps({"schema_version": 1, "dispositions": dispositions}, ensure_ascii=False)
+            + "\n</FINDING_DISPOSITIONS_JSON>\n<PROPOSAL_MARKDOWN>\n" + proposal
+            + "\n</PROPOSAL_MARKDOWN>\n<SECOND_PLAN_REVIEW_NEEDED>" + second_needed
+            + "</SECOND_PLAN_REVIEW_NEEDED>"
+        )
 
 
 class FakeClaude:
@@ -70,6 +191,8 @@ class FakeClaude:
         self.prompts: list[str] = []
         self.budgets: list[float] = []
         self.auto_structure = True
+        self.finding_blocks_approval = False
+        self.finding_severity = None
 
     def __call__(self, prompt, *, budget_usd, executable):
         self.prompts.append(prompt)
@@ -90,6 +213,57 @@ class FakeClaude:
                 f"## Overall assessment\n{result.text}"
             )
             return claude_reviewer.ReviewResult(report, result.cost_usd)
+        if self.auto_structure and "<PLAN_REVIEW_JSON>" in prompt:
+            discovery = json.loads(prompt_section(prompt, "Structured Discovery record"))
+            proposal = prompt_section(prompt, "Current proposal")
+            needs_finding = bool(re.search(
+                r"(?i)please clarify|clarify |check the edge cases|missing|changes_requested", result.text,
+            ))
+            requirements = []
+            for index, requirement in enumerate(discovery["requirements"]):
+                row = {
+                    "requirement_id": requirement["id"],
+                    "status": "unclear" if needs_finding and index == 0 else "covered",
+                    "proposal_reference": requirement["proposal_reference"],
+                    "proposal_evidence": requirement["proposal_evidence"],
+                    "reason": "The assignment edge case needs clarification." if needs_finding and index == 0 else "",
+                }
+                requirements.append(row)
+            concerns = []
+            for concern in discovery["concerns"]:
+                status = "not_applicable" if concern["applicability"] == "not_applicable" else "reflected"
+                concerns.append({
+                    "concern_id": concern["id"],
+                    "status": status,
+                    "proposal_reference": concern.get("proposal_reference", ""),
+                    "proposal_evidence": concern.get("proposal_evidence", ""),
+                    "reason": concern.get("not_applicable_reason") if status == "not_applicable" else "",
+                })
+            findings = []
+            if needs_finding:
+                findings.append({
+                    "id": "F-001",
+                    "category": "requirements",
+                    "severity": "must_fix" if self.finding_blocks_approval else (self.finding_severity or "should_fix"),
+                    "description": result.text.strip(),
+                    "evidence": "The proposal does not yet make this point clear.",
+                    "engineering_impact": "The client-visible behavior could be ambiguous.",
+                    "recommended_action": "Clarify the behavior in the proposal.",
+                    "blocks_approval": self.finding_blocks_approval,
+                    "related_ids": [discovery["requirements"][0]["id"]],
+                })
+            structured = {
+                "schema_version": 1,
+                "decision": "changes_requested" if needs_finding else "ready_for_approval",
+                "assessment": result.text.strip(),
+                "requirement_coverage": requirements,
+                "discovery_coverage": concerns,
+                "findings": findings,
+            }
+            return claude_reviewer.ReviewResult(
+                "<PLAN_REVIEW_JSON>\n" + json.dumps(structured, ensure_ascii=False)
+                + "\n</PLAN_REVIEW_JSON>", result.cost_usd,
+            )
         part_match = re.search(r"(?m)^Part ID: (part-\d+)$", prompt)
         if part_match and self.auto_structure:
             part_id = part_match.group(1)
@@ -140,8 +314,57 @@ class WorkflowTests(unittest.TestCase):
     ) -> str:
         return (
             "# Refined proposal\n\n## Scope\nAdd the requested behavior.\n\n"
-            f"## Claude finding dispositions\n{dispositions}\n\nSecond plan review needed: {second_review}\n"
+            f"Second plan review needed: {second_review}\n"
         )
+
+    def waiting_workflow(self, workflow_id: str, decisions: list[dict] | None = None,
+                         *, blocking_review_finding: bool = False,
+                         blocking_disposition: str = "incorporated", material_finding: bool = False,
+                         finding_severity: str | None = None):
+        proposal = (
+            "# Migration proposal\n\n## Scope\n"
+            "Empty jobs are accepted by default. Processing continues after item failure. "
+            "The API returns item-level results.\n"
+        )
+        discovery = fake_discovery(proposal)
+        discovery["decisions"] = decisions or []
+        for decision in discovery["decisions"]:
+            decision.setdefault("proposal_reference", "Scope")
+            decision.setdefault("proposal_evidence", "Empty jobs are accepted by default.")
+        codex = FakeCodex(proposal, self.refined())
+        codex.discovery_record = discovery
+        if blocking_review_finding or material_finding:
+            codex.disposition_overrides["F-001"] = blocking_disposition
+        has_finding = blocking_review_finding or material_finding or finding_severity is not None
+        claude_text = "Please clarify the data edge case." if has_finding else "Plan looks good."
+        claude = FakeClaude(claude_reviewer.ReviewResult(claude_text, 0.1))
+        claude.finding_blocks_approval = blocking_review_finding
+        claude.finding_severity = "must_fix" if material_finding else finding_severity
+        runner = orchestrator.Orchestrator(
+            self.target, task="Implement a jobs API", budget_usd=1.0, workflow_id=workflow_id,
+            process_runner=codex, claude_runner=claude,
+        )
+        state = runner.start()
+        self.assertEqual(state["status"], "awaiting_approval")
+        return runner, codex, claude
+
+    @staticmethod
+    def required_decision(decision_id: str = "DEC-EMPTY") -> dict:
+        return {
+            "id": decision_id,
+            "classification": "required_user_decision",
+            "description": "Should an empty job be accepted?",
+            "reason": "This changes externally visible behavior.",
+            "source_ids": ["REQ-001"],
+            "proposal_reference": "Scope",
+            "proposal_evidence": "Empty jobs are accepted by default.",
+            "choices": ["accept empty jobs", "reject empty jobs"],
+            "proposed_default": "accept empty jobs",
+        }
+
+    def approve_without_running(self, runner, decisions: list[str]):
+        with patch.object(runner, "run_pending", side_effect=lambda: runner.state):
+            return runner.approve(decisions)
 
     def implement_files(self, codex: FakeCodex, changed: dict[str, str]) -> None:
         def implementation(index, _command, _kwargs):
@@ -304,7 +527,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(claude.prompts), 2)
         self.assertEqual(len(codex.commands), 3)
         self.assertIn("Please clarify the data edge case.", claude.prompts[1])
-        self.assertIn("Decision: incorporated", claude.prompts[1])
+        self.assertIn("F-001: incorporated", claude.prompts[1])
         self.assertIn("Plan review iteration 2", claude.prompts[1])
         self.assertIn("proposal version 2", claude.prompts[1])
         self.assertEqual(state["claude_contexts"][1]["proposal_version"], 2)
@@ -315,8 +538,7 @@ class WorkflowTests(unittest.TestCase):
             self.refined(dispositions="- Finding: clarify empty input | Decision: incorporated | "
                                       "Reason: define zero-item behavior."),
             "# Revised proposal\nAdd explicit empty-input behavior.\n",
-            "# Final proposal\nHandle the empty-input case.\n\n"
-            "## Claude finding dispositions\n- No actionable findings.\n\nSecond plan review needed: no\n",
+            "# Final proposal\n\n## Scope\nHandle the empty-input case.\n",
         )
         claude = FakeClaude(
             claude_reviewer.ReviewResult("Clarify empty input.", 0.1),
@@ -432,6 +654,14 @@ class WorkflowTests(unittest.TestCase):
         ])
         self.assertEqual(state["review_exclusions"], [
             {"path": ".DS_Store", "reason": "operating-system metadata"},
+            {
+                "path": ".engineering/workflows/file-coverage-review/discovery-v1.json",
+                "reason": "workflow state is not part of the implementation diff",
+            },
+            {
+                "path": ".engineering/workflows/file-coverage-review/discovery-v2.json",
+                "reason": "workflow state is not part of the implementation diff",
+            },
             {
                 "path": ".engineering/workflows/file-coverage-review/proposal.md",
                 "reason": "workflow state is not part of the implementation diff",
@@ -1463,8 +1693,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len([r for r in revised["plan_reviews"] if r.get("valid")]), 1)
         self.assertEqual(revised["authorization"]["claude_aily"]["spent_usd"], 0.3)
         self.assertIn("Invalidated attempt", claude.prompts[1])
-        self.assertIn("Does the proposal satisfy every explicit assignment requirement?", claude.prompts[1])
-        self.assertIn("Is each architectural component and abstraction justified", claude.prompts[1])
+        self.assertIn("Review requirement coverage, architecture and boundaries", claude.prompts[1])
+        self.assertIn("Compare the structured Discovery record with the proposal", claude.prompts[1])
         self.assertIn("Mark the prior review invalid", codex.prompts[2])
 
     def test_codex_receives_target_instructions_and_applicable_skill_contents(self):
@@ -1512,13 +1742,452 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("Applicable skills: none found", codex.prompts[0])
         self.assertIn("Relevant skills: none found", claude.prompts[0])
 
-    def test_refinement_requires_explicit_disposition_for_findings(self):
-        incomplete = (
-            "# Proposal\n\n## Claude finding dispositions\n"
-            "- Finding: missing empty-input behavior.\n\nSecond plan review needed: no\n"
+    def test_structured_discovery_validation_and_contextual_unknowns(self):
+        proposal = "# Proposal\n\n## Scope\nImplement the requested behavior.\n"
+        valid = fake_discovery(proposal)
+        concern = {
+            "id": "RISK-001", "category": "external_dependency", "description": "Processor contract unknown.",
+            "source": "assignment", "interpretation_impact": "Error and timeout behavior is not specified.",
+            "applicability": "unknown", "disposition": "deferred", "expected_verification": "Use a local stub.",
+            "material": True, "related_requirement_ids": ["REQ-001"],
+        }
+        valid["concerns"].append(concern)
+        checked = orchestrator.validate_discovery_record(valid, proposal, proposal_version=7)
+        self.assertEqual(checked["proposal_version"], 7)
+        self.assertEqual(checked["concerns"][0]["applicability"], "unknown")
+
+        missing_mapping = json.loads(json.dumps(fake_discovery(proposal)))
+        missing_mapping["requirements"][0]["design_decision"] = "A decision absent from the plan."
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "design decision"):
+            orchestrator.validate_discovery_record(missing_mapping, proposal, proposal_version=1)
+
+        missing_reason = json.loads(json.dumps(fake_discovery(proposal)))
+        not_applicable = dict(concern, applicability="not_applicable", disposition="not_applicable")
+        missing_reason["concerns"].append(not_applicable)
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "has no reason"):
+            orchestrator.validate_discovery_record(missing_reason, proposal, proposal_version=1)
+
+        missing_disposition = json.loads(json.dumps(fake_discovery(proposal)))
+        invalid_risk = dict(concern)
+        del invalid_risk["disposition"]
+        missing_disposition["concerns"].append(invalid_risk)
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "needs non-empty disposition"):
+            orchestrator.validate_discovery_record(missing_disposition, proposal, proposal_version=1)
+
+    def test_discovery_persistence_is_versioned_and_linked_to_the_proposal(self):
+        runner, _codex, _claude = self.waiting_workflow("discovery-persist")
+        state = runner.state
+        artifact = runner.workflow_dir / state["discovery_artifact"]
+        stored = json.loads(artifact.read_text(encoding="utf-8"))
+        self.assertEqual(stored["schema_version"], orchestrator.DISCOVERY_SCHEMA_VERSION)
+        self.assertEqual(stored["proposal_version"], state["proposal_version"])
+        self.assertEqual(stored, state["discovery"])
+        current_version = next(
+            item for item in state["proposal_versions"] if item["version"] == state["proposal_version"]
         )
-        with self.assertRaisesRegex(orchestrator.WorkflowError, "decision and reason"):
-            orchestrator.Orchestrator._refined_proposal(incomplete)
+        self.assertEqual(current_version["discovery_artifact"], artifact.name)
+        self.assertEqual(current_version["discovery_sha256"], state["discovery_sha256"])
+
+        # Simulate a crash after writing a new artifact but before saving its state association.
+        next_proposal = "# Updated proposal\n\n## Scope\nImplement the requested behavior with a retry.\n"
+        next_discovery = update_discovery_evidence(state["discovery"], next_proposal)
+        next_version = state["proposal_version"] + 1
+        orphan = runner.workflow_dir / f"discovery-v{next_version}.json"
+        orphan.write_text("orphaned pre-save artifact\n", encoding="utf-8")
+        runner._persist_planning_version(next_discovery, next_proposal, next_version)
+        self.assertEqual(json.loads(orphan.read_text(encoding="utf-8")), runner.state["discovery"])
+        self.assertEqual(runner.state["proposal_versions"][-1]["version"], next_version)
+
+    @staticmethod
+    def _review_fixture(proposal: str):
+        discovery = fake_discovery(proposal)
+        heading, evidence = first_proposal_reference(proposal)
+        finding = {
+            "id": "F-001", "category": "requirements", "severity": "must_fix",
+            "description": "Document the response to an empty request.",
+            "evidence": "The response status is part of the client contract.",
+            "engineering_impact": "Clients need the status to handle empty submissions consistently.",
+            "recommended_action": "State that empty requests return HTTP 400 and create no job.",
+            "blocks_approval": False,
+            "related_ids": ["REQ-001"],
+        }
+        report = {
+            "schema_version": 1, "decision": "ready_for_approval", "assessment": "The plan is complete.",
+            "requirement_coverage": [{
+                "requirement_id": "REQ-001", "status": "covered", "proposal_reference": heading,
+                "proposal_evidence": evidence, "reason": "",
+            }],
+            "discovery_coverage": [], "findings": [finding],
+        }
+        return discovery, report, finding
+
+    def test_structured_review_and_disposition_are_reconciled_by_stable_id(self):
+        proposal = (
+            "# Proposal\n\n## Scope\nEmpty requests return HTTP 400 and create no job.\n"
+            "Implement the requested behavior.\n"
+        )
+        discovery, report, finding = self._review_fixture(proposal)
+        parsed = orchestrator._validate_plan_review(
+            "<PLAN_REVIEW_JSON>" + json.dumps(report) + "</PLAN_REVIEW_JSON>", discovery, proposal,
+        )
+        self.assertEqual(parsed["findings"][0]["id"], finding["id"])
+        valid = {
+            "schema_version": 1, "dispositions": [{
+                "finding_id": "F-001", "disposition": "incorporated", "reason": "Added the client behavior.",
+                "proposal_reference": "Scope",
+                "proposal_evidence": "Empty requests return HTTP 400 and create no job.",
+            }],
+        }
+        dispositions, unresolved = orchestrator._validate_finding_dispositions(valid, [finding], proposal)
+        self.assertEqual(dispositions[0]["disposition"], "incorporated")
+        self.assertTrue(dispositions[0]["reference_verified"])
+        self.assertFalse(dispositions[0]["resolution_verified"])
+        self.assertEqual(unresolved, [])
+
+    def test_unrelated_exact_quote_is_only_a_verified_reference(self):
+        proposal = (
+            "# Proposal\n\n## Scope\nEmpty requests return HTTP 400 and create no job.\n"
+            "Implement the requested behavior.\n"
+        )
+        _discovery, _report, finding = self._review_fixture(proposal)
+        dispositions, _unresolved = orchestrator._validate_finding_dispositions({
+            "schema_version": 1,
+            "dispositions": [{
+                "finding_id": "F-001", "disposition": "incorporated",
+                "reason": "The quote exists in the proposal.", "proposal_reference": "Scope",
+                "proposal_evidence": "Implement the requested behavior.",
+            }],
+        }, [finding], proposal)
+        self.assertTrue(dispositions[0]["reference_verified"])
+        self.assertFalse(dispositions[0]["resolution_verified"])
+        self.assertEqual(dispositions[0]["proposal_evidence"], "Implement the requested behavior.")
+
+    def test_plan_review_rejects_duplicate_finding_ids_and_unverifiable_coverage(self):
+        proposal = "# Proposal\n\n## Scope\nImplement the requested behavior.\n"
+        discovery, report, _finding = self._review_fixture(proposal)
+        duplicate = json.loads(json.dumps(report))
+        duplicate["findings"].append(dict(duplicate["findings"][0]))
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "duplicates finding id"):
+            orchestrator._validate_plan_review(
+                "<PLAN_REVIEW_JSON>" + json.dumps(duplicate) + "</PLAN_REVIEW_JSON>", discovery, proposal,
+            )
+        bad_coverage = json.loads(json.dumps(report))
+        bad_coverage["requirement_coverage"][0]["proposal_evidence"] = "Not in the proposal."
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "without verifiable proposal evidence"):
+            orchestrator._validate_plan_review(
+                "<PLAN_REVIEW_JSON>" + json.dumps(bad_coverage) + "</PLAN_REVIEW_JSON>", discovery, proposal,
+            )
+
+    def test_dispositions_reject_missing_duplicate_unknown_invalid_and_unverified_entries(self):
+        proposal = "# Proposal\n\n## Scope\nImplement the requested behavior.\n"
+        finding = {"id": "F-001", "blocks_approval": False, "description": "Clarify the outcome."}
+        valid_item = {
+            "finding_id": "F-001", "disposition": "accepted_risk", "reason": "Low impact for this assignment.",
+        }
+        cases = [
+            ({"schema_version": 1, "dispositions": []}, "omitted dispositions"),
+            ({"schema_version": 1, "dispositions": [valid_item, valid_item]}, "duplicates the disposition"),
+            ({"schema_version": 1, "dispositions": [dict(valid_item, finding_id="F-999")]}, "unknown finding id"),
+            ({"schema_version": 1, "dispositions": [dict(valid_item, disposition="ignored")]}, "invalid value"),
+            ({"schema_version": 1, "dispositions": [{
+                "finding_id": "F-001", "disposition": "incorporated", "reason": "Done.",
+                "proposal_reference": "Scope", "proposal_evidence": "Absent quote.",
+            }]}, "no verifiable proposal reference"),
+        ]
+        for raw, message in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(orchestrator.WorkflowError, message):
+                orchestrator._validate_finding_dispositions(raw, [finding], proposal)
+
+    def test_blocking_finding_requires_an_explicit_approval_resolution(self):
+        proposal = "# Proposal\n\n## Scope\nImplement the requested behavior.\n"
+        finding = {"id": "F-001", "blocks_approval": True, "description": "Resolve this risk."}
+        raw = {"schema_version": 1, "dispositions": [{
+            "finding_id": "F-001", "disposition": "accepted_risk", "reason": "Retained for this scope.",
+        }]}
+        _dispositions, unresolved = orchestrator._validate_finding_dispositions(raw, [finding], proposal)
+        self.assertEqual(unresolved[0]["finding"]["id"], "F-001")
+
+    def test_blocking_finding_must_be_resolved_by_the_user_before_approval(self):
+        runner, _codex, _claude = self.waiting_workflow(
+            "approval-blocking-finding", blocking_review_finding=True, blocking_disposition="accepted_risk",
+        )
+        self.assertEqual(runner.state["proposal_readiness"]["status"], "human_review_required")
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "REVIEW-review-1:F-001"):
+            runner.approve()
+        approved = self.approve_without_running(runner, ["REVIEW-review-1:F-001=accept_risk"])
+        self.assertEqual(approved["approved_decision_resolutions"][0]["answer"], "accept_risk")
+
+    def test_material_must_fix_finding_requires_human_semantic_verification(self):
+        runner, _codex, _claude = self.waiting_workflow(
+            "approval-material-finding", material_finding=True,
+        )
+        finding = runner.state["plan_reviews"][0]["material_findings_for_human_review"][0]
+        self.assertTrue(finding["reference_verified"])
+        self.assertFalse(finding["resolution_verified"])
+        self.assertEqual(runner.state["proposal_readiness"]["status"], "human_review_required")
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "verify_resolved"):
+            runner.approve()
+
+        approved = self.approve_without_running(runner, ["REVIEW-review-1:F-001=verify_resolved"])
+        resolution = approved["approved_decision_resolutions"][0]
+        self.assertTrue(resolution["reference_verified"])
+        self.assertTrue(resolution["resolution_verified"])
+        self.assertTrue(approved["plan_reviews"][0]["material_findings_for_human_review"][0]["resolution_verified"])
+
+    def test_should_fix_finding_does_not_automatically_block_approval(self):
+        runner, _codex, _claude = self.waiting_workflow(
+            "approval-minor-finding", finding_severity="should_fix",
+        )
+        self.assertEqual(runner.state["proposal_readiness"]["status"], "ready_for_approval")
+        self.assertEqual(runner.state["proposal_readiness"]["material_findings_for_human_review"], [])
+        self.assertFalse(any(
+            item["id"] == "REVIEW-review-1:F-001" for item in orchestrator._approval_decisions_for_display(runner.state)
+        ))
+
+    def test_older_structured_state_derives_material_review_without_migration(self):
+        runner, _codex, _claude = self.waiting_workflow(
+            "approval-material-legacy-shape", material_finding=True,
+        )
+        runner.state["plan_reviews"][0].pop("material_findings_for_human_review")
+        disposition = runner.state["plan_review_decisions"][0]["parsed_dispositions"][0]
+        disposition.pop("reference_verified", None)
+        disposition.pop("resolution_verified", None)
+        runner._save()
+        decisions = orchestrator._approval_decisions_for_display(runner.state)
+        material = next(item for item in decisions if item["id"] == "REVIEW-review-1:F-001")
+        self.assertTrue(material["reference_verified"])
+        self.assertFalse(material["resolution_verified"])
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "verify_resolved"):
+            runner.approve()
+
+    def test_unambiguous_legacy_finding_decision_remains_readable(self):
+        runner, _codex, _claude = self.waiting_workflow(
+            "legacy-finding-decision", material_finding=True,
+        )
+        runner.state["decision_resolutions"].append({
+            "decision_id": "REVIEW-F-001",
+            "answer": "verify_resolved",
+            "proposal_version": runner.state["proposal_version"],
+            "discovery_sha256": runner.state["discovery_sha256"],
+        })
+        resolved = runner._resolve_approval_items([])
+        self.assertEqual(resolved[0]["decision_id"], "REVIEW-review-1:F-001")
+        self.assertTrue(resolved[0]["resolution_verified"])
+        self.assertTrue(any(
+            row.get("decision_id") == "REVIEW-F-001" for row in runner.state["decision_resolutions"]
+        ))
+
+    def test_material_finding_survives_a_later_review_iteration(self):
+        proposal = "# Proposal\n\n## Scope\nImplement the requested behavior.\n"
+        codex = FakeCodex(proposal, self.refined("yes"), self.refined())
+        codex.discovery_record = fake_discovery(proposal)
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Please clarify the data edge case.", 0.1),
+            claude_reviewer.ReviewResult("Plan looks good.", 0.1),
+        )
+        claude.finding_severity = "must_fix"
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add a feature", budget_usd=1.0, workflow_id="material-across-reviews",
+            process_runner=codex, claude_runner=claude,
+        )
+        state = runner.start()
+        self.assertEqual(state["status"], "awaiting_approval")
+        self.assertEqual(len(state["plan_reviews"]), 2)
+        pending = state["material_findings_pending"][0]
+        self.assertEqual(pending["finding_id"], "F-001")
+        self.assertEqual(pending["finding_identity"], "review-1:F-001")
+        self.assertEqual(pending["proposal_version"], state["proposal_version"])
+        self.assertFalse(pending["reference_verified"])
+        self.assertEqual(
+            {item["finding_identity"] for item in state["material_findings_pending"]},
+            {"review-1:F-001"},
+        )
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "REVIEW-review-1:F-001"):
+            runner.approve()
+
+    def test_duplicate_finding_ids_across_reviews_get_independent_decisions(self):
+        runner, _codex, _claude = self.waiting_workflow(
+            "duplicate-finding-identities", material_finding=True,
+        )
+        state = runner.state
+        first = dict(state["material_findings_pending"][0])
+        second = dict(first)
+        second.update({
+            "review_iteration": 2,
+            "finding_identity": "review-2:F-001",
+            "description": "Restart recovery is unclear.",
+            "human_resolution": None,
+            "resolution_verified": False,
+        })
+        second_review = json.loads(json.dumps(state["plan_reviews"][0]))
+        second_review.update({"iteration": 2, "attempt": 2})
+        second_review["material_findings_for_human_review"] = [second]
+        state["plan_reviews"].append(second_review)
+        state["material_findings_pending"].append(second)
+        state["decision_resolutions"].append({
+            "decision_id": "REVIEW-F-001",
+            "answer": "verify_resolved",
+            "proposal_version": state["proposal_version"],
+            "discovery_sha256": state["discovery_sha256"],
+        })
+        runner._save()
+
+        item_ids = {item["id"] for item in runner._required_approval_items()
+                    if item["kind"] == "material_finding_resolution"}
+        self.assertEqual(item_ids, {"REVIEW-review-1:F-001", "REVIEW-review-2:F-001"})
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "REVIEW-review-2:F-001"):
+            runner._resolve_approval_items(["REVIEW-review-1:F-001=verify_resolved"])
+        pending = {item["finding_identity"]: item for item in runner.state["material_findings_pending"]}
+        self.assertTrue(pending["review-1:F-001"]["resolution_verified"])
+        self.assertIsNone(pending["review-2:F-001"].get("human_resolution"))
+
+        runner._resolve_approval_items(["REVIEW-review-2:F-001=accept_risk"])
+        pending = {item["finding_identity"]: item for item in runner.state["material_findings_pending"]}
+        self.assertTrue(pending["review-1:F-001"]["resolution_verified"])
+        self.assertEqual(pending["review-2:F-001"]["human_resolution"], "accept_risk")
+        self.assertFalse(pending["review-2:F-001"]["resolution_verified"])
+
+        old_version = runner.state["proposal_version"]
+        revised_proposal = runner.state["proposal"] + "\n## More\nRecovery is specified.\n"
+        revised_discovery = update_discovery_evidence(runner.state["discovery"], revised_proposal)
+        runner._persist_planning_version(revised_discovery, revised_proposal, old_version + 1)
+        refreshed = {item["finding_identity"]: item for item in
+                     orchestrator._material_findings_pending_for_state(runner.state, old_version + 1)}
+        self.assertEqual(set(refreshed), {"review-1:F-001", "review-2:F-001"})
+        self.assertFalse(any(item.get("resolution_verified") for item in refreshed.values()))
+        self.assertTrue(all("human_resolution" not in item for item in refreshed.values()))
+        required_ids = {item["id"] for item in runner._required_approval_items()}
+        self.assertTrue({"REVIEW-review-1:F-001", "REVIEW-review-2:F-001"} <= required_ids)
+
+    def test_material_resolution_is_invalidated_after_a_proposal_revision(self):
+        runner, _codex, _claude = self.waiting_workflow(
+            "material-decision-stale", material_finding=True,
+        )
+        runner._resolve_approval_items(["REVIEW-review-1:F-001=verify_resolved"])
+        runner._save()
+        previous_version = runner.state["proposal_version"]
+        revised_proposal = runner.state["proposal"] + "\n## Additional behavior\nA new case is documented.\n"
+        revised_discovery = update_discovery_evidence(runner.state["discovery"], revised_proposal)
+        runner._persist_planning_version(revised_discovery, revised_proposal, previous_version + 1)
+        runner.state["status"] = "awaiting_approval"
+        runner.state["proposal_readiness"] = {
+            "status": "human_review_required", "proposal_version": previous_version + 1,
+        }
+        runner._save()
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "REVIEW-review-1:F-001"):
+            runner._resolve_approval_items([])
+        pending = runner.state["material_findings_pending"][0]
+        self.assertFalse(pending.get("resolution_verified", False))
+        self.assertNotIn("human_resolution", pending)
+
+    def test_successful_review_call_with_invalid_json_is_not_a_valid_review(self):
+        codex = FakeCodex("# Proposal\n\n## Scope\nImplement the request.\n")
+        claude = FakeClaude(claude_reviewer.ReviewResult("not structured JSON", 0.17))
+        claude.auto_structure = False
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add a feature", budget_usd=1.0, workflow_id="invalid-review-output",
+            process_runner=codex, claude_runner=claude,
+        )
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "missing the PLAN_REVIEW_JSON block"):
+            runner.start()
+        review = runner.state["plan_reviews"][0]
+        self.assertTrue(review["call_succeeded"])
+        self.assertTrue(review["context_valid"])
+        self.assertFalse(review["findings_parsed"])
+        self.assertFalse(review["reconciled"])
+        self.assertFalse(review["valid"])
+        self.assertEqual(runner.state["proposal_readiness"]["status"], "review_parse_failed")
+        self.assertEqual(runner.state["authorization"]["claude_aily"]["spent_usd"], 0.17)
+        self.assertEqual(len(claude.prompts), 1)
+
+    def test_required_approval_decisions_show_default_and_block_until_explicit(self):
+        runner, _codex, _claude = self.waiting_workflow(
+            "approval-required", [self.required_decision()],
+        )
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "Proposed default: accept empty jobs"):
+            runner.approve()
+        self.assertIsNone(runner.state["implementation_approved_at"])
+        self.assertEqual(runner.state["decision_resolutions"], [])
+
+    def test_proposed_default_and_alternative_decisions_are_explicitly_saved(self):
+        runner, _codex, _claude = self.waiting_workflow(
+            "approval-default", [self.required_decision()],
+        )
+        approved = self.approve_without_running(runner, ["DEC-EMPTY=accept empty jobs"])
+        self.assertEqual(approved["status"], "running")
+        self.assertEqual(approved["approved_proposal_version"], 2)
+        saved = approved["approved_decision_resolutions"][0]
+        self.assertEqual(saved["answer"], "accept empty jobs")
+        self.assertEqual(saved["proposal_version"], approved["proposal_version"])
+
+        alternative, _codex, _claude = self.waiting_workflow(
+            "approval-alternative", [self.required_decision()],
+        )
+        approved_alternative = self.approve_without_running(
+            alternative, ["DEC-EMPTY=reject empty jobs"],
+        )
+        self.assertEqual(approved_alternative["approved_decision_resolutions"][0]["answer"], "reject empty jobs")
+
+    def test_partial_decision_answers_persist_and_stale_answers_do_not_carry_forward(self):
+        first = self.required_decision("DEC-EMPTY")
+        second = self.required_decision("DEC-FAILURE")
+        second["description"] = "Should an item failure stop processing?"
+        second["choices"] = ["stop on failure", "continue after failure"]
+        second["proposed_default"] = "stop on failure"
+        second["proposal_evidence"] = "Processing continues after item failure."
+        runner, _codex, _claude = self.waiting_workflow("approval-partial", [first, second])
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "DEC-FAILURE"):
+            runner.approve(["DEC-EMPTY=accept empty jobs"])
+        saved = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["decision_resolutions"][0]["answer"], "accept empty jobs")
+
+        self.approve_without_running(runner, ["DEC-FAILURE=stop on failure"])
+        revised_proposal = "# Updated proposal\n\n## Scope\nEmpty jobs are rejected by default. The API returns item-level results.\n"
+        revised_discovery = update_discovery_evidence(runner.state["discovery"], revised_proposal)
+        runner._persist_planning_version(revised_discovery, revised_proposal, 3)
+        runner.state["status"] = "awaiting_approval"
+        runner.state["proposal_readiness"] = {"status": "ready_for_approval", "proposal_version": 3}
+        runner._save()
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "DEC-EMPTY.*Proposed default"):
+            runner._resolve_approval_items([])
+        self.assertEqual(runner.state["decision_resolutions"][0]["proposal_version"], 2)
+
+    def test_reversible_assumptions_and_future_work_do_not_block_approval(self):
+        assumption = self.required_decision("DEC-MODULE")
+        assumption["classification"] = "reversible_assumption"
+        assumption.pop("choices")
+        assumption.pop("proposed_default")
+        future = self.required_decision("DEC-HA")
+        future["classification"] = "future_production"
+        future.pop("choices")
+        future.pop("proposed_default")
+        runner, _codex, _claude = self.waiting_workflow("approval-nonblocking", [assumption, future])
+        approved = self.approve_without_running(runner, [])
+        self.assertEqual(approved["status"], "running")
+        self.assertEqual(approved["approved_decision_resolutions"], [])
+
+    def test_legacy_approval_fails_without_rewriting_workflow_state(self):
+        runner, _codex, _claude = self.waiting_workflow("legacy-approval")
+        legacy = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        for key in (
+            "discovery", "discovery_schema_version", "discovery_sha256", "discovery_artifact",
+            "proposal_versions", "decision_resolutions",
+        ):
+            legacy.pop(key, None)
+        runner.state_path.write_text(json.dumps(legacy, indent=2) + "\n", encoding="utf-8")
+        before = hashlib.sha256(runner.state_path.read_bytes()).hexdigest()
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "predates structured Discovery"):
+            orchestrator.Orchestrator(self.target, workflow_id="legacy-approval").approve()
+        after = hashlib.sha256(runner.state_path.read_bytes()).hexdigest()
+        self.assertEqual(after, before)
+
+    def test_refinement_requires_explicit_disposition_for_each_finding(self):
+        finding = {"id": "F-001", "blocks_approval": False, "description": "Clarify the behavior."}
+        proposal = "# Proposal\n\n## Scope\nClarify the behavior.\n"
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "omitted dispositions"):
+            orchestrator._validate_finding_dispositions(
+                {"schema_version": 1, "dispositions": []}, [finding], proposal,
+            )
 
     def test_complete_diff_is_not_truncated_and_oversize_fails_explicitly(self):
         content = "# complete diff marker\n" + ("line of relevant code\n" * 120)
@@ -1562,7 +2231,19 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(called)
 
     def test_aily_adapter_uses_budget_cap_and_isolated_review_directory(self):
+        configured_dir = self.root / "configured-aily"
+        configured_dir.mkdir()
+        configured_executable = configured_dir / "aily-wrapper"
+        configured_executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        configured_executable.chmod(0o755)
+        path_dir = self.root / "path-bin"
+        path_dir.mkdir()
+        incompatible_aily = path_dir / "aily"
+        incompatible_aily.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        incompatible_aily.chmod(0o755)
+
         observed = {}
+        prompt = "review this sanitized patch"
 
         def process_runner(command, **kwargs):
             observed["command"] = command
@@ -1571,15 +2252,73 @@ class WorkflowTests(unittest.TestCase):
                         "result": "Decision: APPROVED", "total_cost_usd": 0.25}
             return subprocess.CompletedProcess(command, 0, json.dumps(envelope).encode(), b"")
 
-        result = claude_reviewer.review("review this sanitized patch", budget_usd=0.5,
-                                       process_runner=process_runner)
+        with patch.dict(os.environ, {
+            "AILY_EXECUTABLE": str(configured_executable),
+            "PATH": str(path_dir),
+        }):
+            self.assertEqual(shutil.which("aily"), str(incompatible_aily))
+            result = claude_reviewer.review(prompt, budget_usd=0.5, process_runner=process_runner)
+
         self.assertEqual(result.text, "Decision: APPROVED")
         self.assertEqual(result.cost_usd, 0.25)
-        self.assertIn("--max-budget-usd", observed["command"])
-        self.assertEqual(observed["command"][observed["command"].index("--max-budget-usd") + 1], "0.50")
-        self.assertIn("--restricted", observed["command"])
-        self.assertIn("--strict-mcp-config", observed["command"])
+        command = observed["command"]
+        self.assertEqual(command[:4], [str(configured_executable), "claude", "-p", prompt])
+        self.assertEqual(command[command.index("--output-format") + 1], "json")
+        self.assertIn("--no-session-persistence", command)
+        self.assertEqual(command[command.index("--permission-mode") + 1], "plan")
+        self.assertEqual(command[command.index("--permission-prompts") + 1], "none")
+        self.assertIn("--restricted", command)
+        self.assertEqual(command[command.index("--tools") + 1], "Read,Glob,Grep")
+        self.assertIn("--strict-mcp-config", command)
+        self.assertIn("--disable-slash-commands", command)
+        self.assertEqual(command[command.index("--max-budget-usd") + 1], "0.50")
         self.assertNotEqual(Path(observed["cwd"]), self.target)
+
+        missing_executable = self.root / "missing-aily" / "daily"
+        with patch.dict(os.environ, {
+            "AILY_EXECUTABLE": str(missing_executable),
+            "PATH": str(path_dir),
+        }):
+            with self.assertRaisesRegex(claude_reviewer.ReviewError, "Aily executable is unavailable") as missing:
+                claude_reviewer.review(prompt, budget_usd=0.5)
+        self.assertIsNone(missing.exception.cost_usd)
+
+        failed_calls = 0
+
+        def unsupported_command_runner(command, **kwargs):
+            nonlocal failed_calls
+            failed_calls += 1
+            return subprocess.CompletedProcess(
+                command, 128, b"", b'Error: unknown command "claude" for "aily"',
+            )
+
+        def failing_claude(prompt_text, *, budget_usd, executable):
+            return claude_reviewer.review(
+                prompt_text, budget_usd=budget_usd, executable=executable,
+                process_runner=unsupported_command_runner,
+            )
+
+        codex = FakeCodex("# Proposal\nUse the requested behavior.\n")
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add a feature", budget_usd=1.0, workflow_id="unsupported-aily-command",
+            aily=str(configured_executable), process_runner=codex, claude_runner=failing_claude,
+        )
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "unknown command \\\"claude\\\""):
+            runner.start()
+        failed = runner.state
+        self.assertEqual(failed["status"], "failed")
+        authorization = failed["authorization"]["claude_aily"]
+        self.assertTrue(authorization["budget_unknown"])
+        self.assertEqual(authorization["spent_usd"], 0)
+        self.assertEqual(failed_calls, 1)
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "Aily exited with status 128"):
+            orchestrator.Orchestrator(
+                self.target, workflow_id="unsupported-aily-command", aily=str(configured_executable),
+                process_runner=codex, claude_runner=failing_claude,
+            ).resume()
+        self.assertEqual(failed_calls, 1)
+        persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertTrue(persisted["authorization"]["claude_aily"]["budget_unknown"])
 
 
 if __name__ == "__main__":
