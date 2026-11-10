@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -118,11 +119,149 @@ class FakeClaude:
             report = (
                 f"Decision: {decision}\n\nPart ID: {part_id}\n\nFiles reviewed:\n"
                 + "".join(f"- `{path}`\n" for path in paths)
-                + f"\nFindings:\n{severity}{findings}\n\nCross-component concerns:\n- None\n\n"
+                + f"\nFindings:\n{findings}\n\nCross-component concerns:\n- None\n\n"
                 f"Overall assessment:\n{result.text}"
             )
             return claude_reviewer.ReviewResult(report, result.cost_usd)
         return result
+
+
+class PartReviewParserTests(unittest.TestCase):
+    def setUp(self):
+        self.segment = orchestrator.ReviewSegment("src/first.py", "patch", 1, 1, 1, "hash")
+
+    def report(self, *, part_id="part-000001", decision="APPROVED", findings=None,
+               prefix_part="Part ID:", final="Sound implementation.", extra=""):
+        if findings is None:
+            findings = "None"
+        return (
+            f"Decision: {decision}\n{prefix_part} {part_id}\n\n## Files reviewed\n"
+            "- `src/first.py` — complete patch\n\n## Findings\n"
+            f"{findings}\n\n## Cross-component concerns\nNone\n\n"
+            f"## Overall assessment\n{final}{extra}"
+        )
+
+    @staticmethod
+    def finding(identifier, severity="Should fix", missing=None):
+        fields = {
+            "Severity": severity,
+            "Category": "Reliability",
+            "File/location": "`src/first.py:12`",
+            "Description": "The worker can stop after a transient store error.",
+            "Impact and reasoning": "Accepted jobs would remain queued.",
+            "Recommended correction": "Catch and log the iteration error, then continue.",
+        }
+        fields.pop(missing, None)
+        return f"### Finding {identifier}\n" + "\n".join(
+            f"- **{name}:** {value}" for name, value in fields.items()
+        )
+
+    def test_accepts_plain_and_markdown_part_id(self):
+        for prefix in ("Part ID:", "## Part ID:"):
+            parsed = orchestrator.parse_part_review_report(
+                self.report(prefix_part=prefix), "part-000001", [self.segment],
+            )
+            self.assertTrue(parsed["valid"], parsed["errors"])
+
+    def test_accepts_markdown_decision_and_section_labels(self):
+        report = self.report().replace("Decision: APPROVED", "**Decision:** APPROVED")
+        report = report.replace("## Overall assessment", "## **Overall assessment:**")
+        parsed = orchestrator.parse_part_review_report(report, "part-000001", [self.segment])
+        self.assertTrue(parsed["valid"], parsed["errors"])
+
+    def test_missing_or_wrong_part_id_is_rejected(self):
+        report = self.report().replace("Part ID: part-000001\n", "")
+        parsed = orchestrator.parse_part_review_report(report, "part-000001", [self.segment])
+        self.assertTrue(any("Part ID" in error for error in parsed["errors"]))
+        parsed = orchestrator.parse_part_review_report(
+            self.report(part_id="part-000002"), "part-000001", [self.segment],
+        )
+        self.assertTrue(any("expected 'part-000001'" in error for error in parsed["errors"]))
+
+    def test_missing_and_invalid_decisions_are_rejected(self):
+        missing = self.report().replace("Decision: APPROVED\n", "")
+        invalid = self.report(decision="MAYBE")
+        self.assertFalse(orchestrator.parse_part_review_report(
+            missing, "part-000001", [self.segment],
+        )["valid"])
+        parsed = orchestrator.parse_part_review_report(invalid, "part-000001", [self.segment])
+        self.assertTrue(any("Decision must be" in error for error in parsed["errors"]))
+
+    def test_missing_final_assessment_is_rejected(self):
+        report = self.report().replace("## Overall assessment\nSound implementation.", "")
+        parsed = orchestrator.parse_part_review_report(report, "part-000001", [self.segment])
+        self.assertTrue(any("Overall assessment" in error for error in parsed["errors"]))
+
+    def test_validates_multiple_findings_individually(self):
+        findings = "\n\n".join([
+            self.finding("F1"), self.finding("F2", "Optional improvement"),
+        ])
+        parsed = orchestrator.parse_part_review_report(
+            self.report(findings=findings), "part-000001", [self.segment],
+        )
+        self.assertTrue(parsed["valid"], parsed["errors"])
+        self.assertEqual(len(parsed["findings"]), 2)
+
+    def test_rejects_a_finding_missing_a_required_field(self):
+        report = self.report(findings=self.finding("F1", missing="Impact and reasoning"))
+        parsed = orchestrator.parse_part_review_report(report, "part-000001", [self.segment])
+        self.assertTrue(any("missing required field 'Impact and reasoning'" in error
+                            for error in parsed["errors"]))
+
+    def test_accepts_explicit_empty_findings(self):
+        for marker in ("None", "No findings.", "N/A"):
+            parsed = orchestrator.parse_part_review_report(
+                self.report(findings=marker), "part-000001", [self.segment],
+            )
+            self.assertTrue(parsed["valid"], parsed["errors"])
+            self.assertEqual(parsed["findings"], [])
+        parsed = orchestrator.parse_part_review_report(
+            self.report(findings=""), "part-000001", [self.segment],
+        )
+        self.assertTrue(any("explicitly say None" in error for error in parsed["errors"]))
+
+    def test_rejects_ambiguous_duplicate_fields_parts_and_decisions(self):
+        finding = self.finding("F1") + "\n- **Category:** Another category"
+        report = self.report(findings=finding).replace(
+            "Part ID: part-000001", "Part ID: part-000001\n## Part ID: part-000001",
+        ).replace("Decision: APPROVED", "Decision: APPROVED\nDecision: APPROVED")
+        parsed = orchestrator.parse_part_review_report(report, "part-000001", [self.segment])
+        self.assertTrue(any("Decision field" in error for error in parsed["errors"]))
+        self.assertTrue(any("Part ID field" in error for error in parsed["errors"]))
+        self.assertTrue(any("repeats field 'Category'" in error for error in parsed["errors"]))
+
+    def test_rejects_contradictory_decision_and_finding(self):
+        report = self.report(decision="APPROVED", findings=self.finding("F1", "Must fix"))
+        parsed = orchestrator.parse_part_review_report(report, "part-000001", [self.segment])
+        self.assertTrue(any("contradicts a Must fix" in error for error in parsed["errors"]))
+        valid_change_request = self.report(decision="CHANGES_REQUESTED", findings=self.finding("F1", "Must fix"))
+        parsed = orchestrator.parse_part_review_report(
+            valid_change_request, "part-000001", [self.segment],
+        )
+        self.assertTrue(parsed["valid"], parsed["errors"])
+
+    def test_review_prompt_requests_stable_report_and_feedback_keeps_detail(self):
+        header = orchestrator.Orchestrator._code_review_header()
+        self.assertIn("### Finding F1", header)
+        self.assertIn("Recommended correction", header)
+        runner = object.__new__(orchestrator.Orchestrator)
+        runner.state = {"proposal_version": 7}
+        sections = runner._part_sections(
+            {"Assignment": "Full assignment", "Approved proposal": "Full proposal"},
+            [self.segment], campaign_id="campaign", part_id="part-000001", excluded_count=0,
+        )
+        self.assertEqual(list(sections)[:3], ["Review metadata", "Assignment", "Approved proposal"])
+        self.assertEqual(list(sections)[-2:], ["Review file coverage", "Complete patch"])
+        self.assertIn("patch", sections["Complete patch"])
+        self.assertIn("Proposal version: 7", sections["Review metadata"])
+        report = self.report(findings=self.finding("F1"), final="Positive observation. Limitation: no runtime test.")
+        parsed = orchestrator.parse_part_review_report(report, "part-000001", [self.segment])
+        rendered = orchestrator.render_review_feedback([{
+            "part_id": "part-000001", "attempt": 1, "report": report, "validation": parsed,
+        }])
+        for expected in ("Non-blocking findings", "src/first.py:12", "Accepted jobs would remain queued",
+                         "Catch and log", "Positive observation", "no runtime test", "Original reviewer reports"):
+            self.assertIn(expected, rendered)
 
 
 class WorkflowTests(unittest.TestCase):
@@ -153,6 +292,52 @@ class WorkflowTests(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(content, encoding="utf-8")
         codex.on_call = implementation
+
+    def create_completed_review_for_recovery(self, workflow_id: str):
+        codex = FakeCodex(
+            "# Proposal\nReview the saved implementation.\n", self.refined(), "Implemented a small change.\n",
+        )
+        self.implement_files(codex, {"src/recovery.py": "def answer():\n    return 42\n"})
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05),
+            response_factory=lambda _prompt, _budget, _executable: claude_reviewer.ReviewResult(
+                "Decision: APPROVED\nNo acceptance-blocking findings.", 0.05,
+            ),
+        )
+        runner = orchestrator.Orchestrator(
+            self.target, task="Implement a small change", budget_usd=1.0, workflow_id=workflow_id,
+            process_runner=codex, claude_runner=claude,
+        )
+        runner.start()
+        completed = runner.approve()
+        self.assertEqual(completed["status"], "complete")
+        # The original failure happened before a delivery file was written; keep the
+        # reconstructed diff identical to the saved code-review campaign.
+        runner.delivery_path.unlink()
+        state = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        part = state["review_campaign"]["part_reviews"][0]
+        original_report = part["report"].replace("\nPart ID:", "\n## Part ID:")
+        part["report"] = original_report
+        for context in state["claude_contexts"]:
+            if context.get("stage") == "code_review" and context.get("review_kind") == "part":
+                context["report"] = original_report
+        part["status"] = "invalid_report"
+        part.setdefault("validation_history", []).append({
+            "validator_version": "part-review-v1", "valid": False,
+            "errors": ["Markdown Part ID heading was rejected by the previous validator."],
+        })
+        state["review_campaign"]["status"] = "in_progress"
+        state["review_campaign"]["files_reviewed"] = []
+        state["review_campaign"]["files_not_reviewed"] = [
+            {"path": "src/recovery.py", "reason": "review part is invalid_report"},
+        ]
+        state["review_files_not_reviewed"] = state["review_campaign"]["files_not_reviewed"]
+        state["status"] = "failed"
+        state["stage"] = "code_review"
+        state["error"] = "Old part report validation failed."
+        state["code_review"] = None
+        runner.state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        return runner, claude, state
 
     def test_missing_budget_uses_two_dollars_and_persists_it(self):
         codex = FakeCodex("# Proposal\nInitial plan.\n", self.refined())
@@ -669,6 +854,112 @@ class WorkflowTests(unittest.TestCase):
             ["reviewed"] * len(completed["review_campaign"]["parts"]),
         )
 
+    def test_local_recovery_dry_run_revalidates_reports_without_writing_or_calling_provider(self):
+        runner, claude, saved = self.create_completed_review_for_recovery("local-review-dry-run")
+        before = runner.state_path.read_bytes()
+        prompts_before = len(claude.prompts)
+        result = orchestrator.recover_code_review(
+            self.target, "local-review-dry-run", apply=False,
+        )
+        self.assertEqual(result["provider_invocations"], 0)
+        self.assertEqual(result["persisted_reports"], 1)
+        self.assertEqual(result["valid_reports"], 1)
+        self.assertEqual(result["invalid_reports"], 0)
+        self.assertTrue(result["campaign_would_be_complete"])
+        self.assertEqual(result["claude_spent_usd"], saved["authorization"]["claude_aily"]["spent_usd"])
+        self.assertEqual(runner.state_path.read_bytes(), before)
+        self.assertEqual(len(claude.prompts), prompts_before)
+
+    def test_recover_review_cli_defaults_to_dry_run(self):
+        output = StringIO()
+        with patch.object(orchestrator, "recover_code_review", return_value={
+            "mode": "dry-run", "provider_invocations": 0, "errors": [],
+        }) as recovery, redirect_stdout(output):
+            result = orchestrator.main([
+                "recover-review", "--target", str(self.target), "--workflow-id", "cli-recovery",
+            ])
+        self.assertEqual(result, 0)
+        self.assertFalse(recovery.call_args.kwargs["apply"])
+        self.assertIn('"provider_invocations": 0', output.getvalue())
+
+    def test_local_recovery_apply_is_auditable_idempotent_and_preserves_call_costs(self):
+        runner, claude, saved = self.create_completed_review_for_recovery("local-review-apply")
+        prompts_before = len(claude.prompts)
+        original_contexts = copy.deepcopy(saved["claude_contexts"])
+        original_calls = copy.deepcopy(saved["review_campaign"]["part_reviews"][0]["calls"])
+        original_report = saved["review_campaign"]["part_reviews"][0]["report"]
+        original_spend = saved["authorization"]["claude_aily"]["spent_usd"]
+        result = orchestrator.recover_code_review(self.target, "local-review-apply", apply=True)
+        self.assertTrue(result["applied"])
+        self.assertTrue(result["campaign_completed"])
+        recovered = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        part = recovered["review_campaign"]["part_reviews"][0]
+        self.assertEqual(part["status"], "reviewed")
+        self.assertEqual(part["report"], original_report)
+        self.assertEqual(part["calls"], original_calls)
+        self.assertEqual(recovered["claude_contexts"], original_contexts)
+        self.assertEqual(recovered["authorization"]["claude_aily"]["spent_usd"], original_spend)
+        self.assertEqual(recovered["status"], "failed")
+        self.assertEqual(recovered["stage"], "code_review")
+        self.assertEqual(recovered["review_campaign"]["recovery_history"][0]["old_validator_statuses"], {
+            "part-000001": "invalid_report",
+        })
+        self.assertEqual(len(part["validated_reports"]), 1)
+        before_second_apply = runner.state_path.read_bytes()
+        second = orchestrator.recover_code_review(self.target, "local-review-apply", apply=True)
+        self.assertTrue(second["already_applied"])
+        self.assertFalse(second["applied"])
+        self.assertEqual(runner.state_path.read_bytes(), before_second_apply)
+        self.assertEqual(len(claude.prompts), prompts_before)
+
+    def test_local_recovery_rejects_invalid_saved_report_without_mutation(self):
+        runner, claude, saved = self.create_completed_review_for_recovery("local-review-invalid")
+        part = saved["review_campaign"]["part_reviews"][0]
+        bad_report = part["report"].replace("Findings:\nNone", "Findings:\nF1 has a problem")
+        part["report"] = bad_report
+        for context in saved["claude_contexts"]:
+            if context.get("stage") == "code_review" and context.get("review_kind") == "part":
+                context["report"] = bad_report
+        runner.state_path.write_text(json.dumps(saved, indent=2) + "\n", encoding="utf-8")
+        before = runner.state_path.read_bytes()
+        prompts_before = len(claude.prompts)
+        result = orchestrator.recover_code_review(self.target, "local-review-invalid", apply=True)
+        self.assertFalse(result["applied"])
+        self.assertGreater(result["invalid_reports"], 0)
+        self.assertTrue(any("individually headed finding blocks" in error for error in result["errors"]))
+        self.assertEqual(runner.state_path.read_bytes(), before)
+        self.assertEqual(len(claude.prompts), prompts_before)
+
+    def test_local_recovery_rejects_changed_target_diff_without_mutation(self):
+        runner, claude, _saved = self.create_completed_review_for_recovery("local-review-changed-diff")
+        source = self.target / "src" / "recovery.py"
+        source.write_text("def answer():\n    return 43\n", encoding="utf-8")
+        before = runner.state_path.read_bytes()
+        prompts_before = len(claude.prompts)
+        result = orchestrator.recover_code_review(
+            self.target, "local-review-changed-diff", apply=True,
+        )
+        self.assertFalse(result["applied"])
+        self.assertTrue(any("target diff" in error or "patch segment hash" in error
+                            for error in result["errors"]))
+        self.assertEqual(runner.state_path.read_bytes(), before)
+        self.assertEqual(len(claude.prompts), prompts_before)
+
+    def test_local_recovery_does_not_complete_campaign_with_pending_integration_review(self):
+        runner, _claude, saved = self.create_completed_review_for_recovery("local-review-incomplete")
+        saved["review_campaign"]["integration_review"] = {
+            "required": True, "status": "pending", "report": None, "calls": [],
+        }
+        runner.state_path.write_text(json.dumps(saved, indent=2) + "\n", encoding="utf-8")
+        result = orchestrator.recover_code_review(self.target, "local-review-incomplete", apply=True)
+        recovered = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertTrue(result["applied"])
+        self.assertFalse(result["campaign_would_be_complete"])
+        self.assertEqual(recovered["review_campaign"]["status"], "in_progress")
+        self.assertEqual(recovered["review_campaign"]["part_reviews"][0]["status"], "reviewed")
+        self.assertIsNone(recovered["code_review"])
+        self.assertEqual(recovered["stage"], "code_review")
+
     def test_saved_part_report_is_recovered_without_repeating_paid_call(self):
         changed = {
             f"modules/recovery/file_{index}.py": f"def operation_{index}():\n" + "    return 'recoverable'\n" * 45
@@ -851,7 +1142,7 @@ class WorkflowTests(unittest.TestCase):
         runner.start()
         claude.auto_structure = False
         with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "14000"}):
-            with self.assertRaisesRegex(orchestrator.WorkflowError, "incomplete structured report"):
+            with self.assertRaisesRegex(orchestrator.WorkflowError, "report for part-000001 is invalid"):
                 runner.approve()
         saved = json.loads(runner.state_path.read_text(encoding="utf-8"))
         self.assertEqual(saved["status"], "failed")
@@ -928,6 +1219,16 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(state["status"], "complete")
         self.assertEqual(len(codex.commands), 3)
         self.assertTrue(orchestrator._clearly_no_review_findings(state["code_review"]))
+        delivery = (runner.workflow_dir / "delivery.md").read_text(encoding="utf-8")
+        self.assertIn("## Structured code-review feedback", delivery)
+        self.assertIn("## Suggestions", delivery)
+        self.assertIn("src/feature.py", delivery)
+        self.assertIn("consider a clearer variable name", delivery)
+        output = StringIO()
+        with redirect_stdout(output):
+            orchestrator._print_summary(state)
+        self.assertIn("code_review_feedback", output.getvalue())
+        self.assertIn("Original reviewer reports", output.getvalue())
 
     def test_new_and_legacy_code_review_authorization_limits_are_distinct(self):
         new = orchestrator.new_workflow_authorization(self.target, "new-scope", 1.0, 9)

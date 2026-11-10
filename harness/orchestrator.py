@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -13,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
@@ -28,6 +30,7 @@ DEFAULT_MAX_CODE_REVIEW_CALLS = 16
 MAX_AUTHORIZED_CODE_REVIEW_CALLS = 64
 MAX_PLANNING_FAILURE_OUTPUT_CHARS = 50_000
 MAX_PLANNING_FAILURE_RECORDS = 3
+PART_REVIEW_VALIDATOR_VERSION = "part-review-v2"
 CODEX_EXECUTABLE = "codex"
 WORKFLOW_ROOT = ".engineering/workflows"
 PLANNING_PRINCIPLES = """Engineering Judgment & Proportional Design
@@ -135,6 +138,298 @@ class ReviewSegment:
     patch_line_end: int
     patch_line_count: int
     patch_sha256: str
+
+
+PART_REVIEW_FIELDS = (
+    "Severity", "Category", "File/location", "Description", "Impact and reasoning",
+    "Recommended correction",
+)
+PART_REVIEW_SEVERITIES = ("Must fix", "Should fix", "Optional improvement")
+PART_REVIEW_SECTIONS = (
+    "Files reviewed", "Findings", "Cross-component concerns", "Overall assessment",
+)
+
+
+def _normalize_review_text(value: str) -> str:
+    value = value.strip()
+    value = re.sub(r"^(?:\*\*|__|`)", "", value)
+    value = re.sub(r"(?:\*\*|__|`)\s*$", "", value)
+    return value.strip()
+
+
+def parse_part_review_report(report: str, expected_part_id: str, segments: list[ReviewSegment]) -> dict:
+    """Parse and substantively validate one independent part-review report."""
+    errors: list[str] = []
+    if not isinstance(report, str) or not report.strip():
+        return {"valid": False, "errors": ["report is empty"], "findings": []}
+
+    lines = report.splitlines()
+
+    def values_for(pattern: str, source_lines: list[str] | None = None) -> list[tuple[int, str]]:
+        candidates = lines if source_lines is None else source_lines
+        return [(i, m.group(1).strip()) for i, line in enumerate(candidates)
+                if (m := re.match(pattern, line, re.I))]
+
+    section_line_re = re.compile(
+        r"^\s{0,3}(?:#{1,6}\s*)?(?:\*\*)?(?:Files reviewed|Findings|Cross-component concerns|"
+        r"Overall assessment)(?:\*\*)?(?:[ \t]*:.*|[ \t]*)$", re.I,
+    )
+    section_starts = [i for i, line in enumerate(lines) if section_line_re.match(line)]
+    header_lines = lines[:min(section_starts)] if section_starts else lines
+
+    decisions = values_for(
+        r"^\s*(?:#{1,6}\s*)?(?:\*\*)?Decision(?:\*\*)?\s*:\s*(?:\*\*)?(.*?)\s*(?:\*\*)?\s*$",
+        header_lines,
+    )
+    if len(decisions) != 1:
+        errors.append(f"expected exactly one Decision field; found {len(decisions)}")
+        decision = None
+    else:
+        decision = _normalize_review_text(decisions[0][1]).upper()
+        if decision not in {"APPROVED", "CHANGES_REQUESTED"}:
+            errors.append("Decision must be APPROVED or CHANGES_REQUESTED")
+
+    part_ids = values_for(
+        r"^\s*(?:#{1,6}\s*)?(?:\*\*)?Part ID(?:\*\*)?\s*:\s*(?:\*\*)?(.*?)\s*(?:\*\*)?\s*$",
+        header_lines,
+    )
+    if len(part_ids) != 1:
+        errors.append(f"expected exactly one Part ID field; found {len(part_ids)}")
+    else:
+        actual_part_id = _normalize_review_text(part_ids[0][1])
+        if actual_part_id != expected_part_id:
+            errors.append(f"Part ID is {actual_part_id!r}; expected {expected_part_id!r}")
+
+    heading_positions: dict[str, list[tuple[int, str]]] = {name: [] for name in PART_REVIEW_SECTIONS}
+    section_re = re.compile(
+        r"^\s{0,3}(?:#{1,6}\s*)?(?:\*\*)?(Files reviewed|Findings|Cross-component concerns|Overall assessment)"
+        r"(?:\*\*)?\s*:?\s*(?:\*\*)?[ \t]*(.*?)\s*$", re.I,
+    )
+    canonical = {name.casefold(): name for name in PART_REVIEW_SECTIONS}
+    for index, line in enumerate(lines):
+        match = section_re.match(line)
+        if match:
+            heading_positions[canonical[match.group(1).casefold()]].append((index, match.group(2).strip()))
+    for name, positions in heading_positions.items():
+        if len(positions) != 1:
+            errors.append(f"expected exactly one {name!r} section; found {len(positions)}")
+    if all(len(heading_positions[name]) == 1 for name in PART_REVIEW_SECTIONS):
+        ordered = [heading_positions[name][0][0] for name in PART_REVIEW_SECTIONS]
+        if ordered != sorted(ordered):
+            errors.append("required sections are out of order")
+        if decisions and part_ids and not (decisions[0][0] < part_ids[0][0] < ordered[0]):
+            errors.append("Decision and Part ID must appear before the report sections")
+
+    sections: dict[str, str] = {}
+    for name, positions in heading_positions.items():
+        if len(positions) != 1:
+            continue
+        start, inline = positions[0]
+        next_positions = [items[0][0] for section, items in heading_positions.items()
+                          if items and items[0][0] > start]
+        end = min(next_positions) if next_positions else len(lines)
+        body = "\n".join(lines[start + 1:end]).strip()
+        sections[name] = "\n".join(part for part in (inline, body) if part).strip()
+        if not sections[name]:
+            errors.append(f"{name!r} section is empty")
+
+    files_section = sections.get("Files reviewed", "")
+    listed_paths: set[str] = set()
+    for line in files_section.splitlines():
+        item = re.match(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)(.*?)\s*$", line)
+        if not item:
+            continue
+        entry = item.group(1)
+        quoted = re.findall(r"`([^`]+)`", entry)
+        if quoted:
+            listed_paths.update(quoted)
+        else:
+            listed_paths.add(entry.split(" — ", 1)[0].strip())
+    assigned_paths = {segment.path for segment in segments}
+    missing_paths = sorted(assigned_paths - listed_paths)
+    if missing_paths:
+        errors.append("Files reviewed is missing assigned path(s): " + ", ".join(missing_paths))
+
+    findings_text = sections.get("Findings", "").strip()
+    empty_findings = bool(re.fullmatch(r"(?is)(?:none|no findings\.?|n/?a)\s*", findings_text))
+    findings: list[dict] = []
+    if not findings_text:
+        errors.append("Findings section must explicitly say None or contain finding blocks")
+    elif not empty_findings:
+        block_start = re.compile(
+            r"^\s*(?:#{1,6}\s+(?:Finding\s+)?(F\d+|\d+)(?:\s*[-:.)].*)?"
+            r"|\*\*Finding\s+(F\d+|\d+)\*\*|Finding\s+(F\d+|\d+)\s*:?)\s*$", re.I,
+        )
+        finding_starts = []
+        for i, line in enumerate(findings_text.splitlines()):
+            match = block_start.match(line)
+            if match:
+                identifier = next((value for value in match.groups() if value), None)
+                if identifier:
+                    finding_starts.append((i, identifier.upper()))
+        finding_lines = findings_text.splitlines()
+        if not finding_starts:
+            errors.append("Findings must be exactly an explicit empty marker or contain individually headed finding blocks")
+        else:
+            if "\n".join(finding_lines[:finding_starts[0][0]]).strip():
+                errors.append("unexpected text appears before the first finding block")
+            ids = [identifier for _, identifier in finding_starts]
+            if len(set(ids)) != len(ids):
+                errors.append("finding block identifiers must be unique")
+            for position, (start, identifier) in enumerate(finding_starts):
+                end = finding_starts[position + 1][0] if position + 1 < len(finding_starts) else len(finding_lines)
+                block = finding_lines[start + 1:end]
+                fields: dict[str, list[list[str]]] = {name: [] for name in PART_REVIEW_FIELDS}
+                current_field: str | None = None
+                label_re = re.compile(
+                    r"^\s*(?:[-*+]\s*)?(?:\*\*)?(Severity|Category|File/location|Description|"
+                    r"Impact and reasoning|Recommended correction)(?:\*\*)?\s*:\s*(?:\*\*)?(.*?)"
+                    r"\s*(?:\*\*)?\s*$", re.I,
+                )
+                field_names = {name.casefold(): name for name in PART_REVIEW_FIELDS}
+                for body_line in block:
+                    label = label_re.match(body_line)
+                    if label:
+                        current_field = field_names[label.group(1).casefold()]
+                        fields[current_field].append([label.group(2).strip()])
+                    elif current_field and body_line.strip():
+                        fields[current_field][-1].append(body_line.strip())
+                    elif body_line.strip():
+                        errors.append(f"finding {identifier} has text outside a recognized field")
+                finding: dict[str, str] = {"id": identifier}
+                for name, values in fields.items():
+                    if not values:
+                        errors.append(f"finding {identifier} is missing required field {name!r}")
+                        continue
+                    if len(values) > 1:
+                        errors.append(f"finding {identifier} repeats field {name!r}")
+                    value = _normalize_review_text("\n".join(values[0]))
+                    if not value:
+                        errors.append(f"finding {identifier} has an empty {name!r} field")
+                    finding[name] = value
+                severity = finding.get("Severity", "")
+                if severity.casefold() not in {item.casefold() for item in PART_REVIEW_SEVERITIES}:
+                    errors.append(
+                        f"finding {identifier} has unsupported severity {severity!r}; expected "
+                        + ", ".join(PART_REVIEW_SEVERITIES)
+                    )
+                findings.append(finding)
+
+    if decision == "APPROVED" and any(
+            item.get("Severity", "").casefold() == "must fix" for item in findings):
+        errors.append("Decision APPROVED contradicts a Must fix finding")
+    if decision == "CHANGES_REQUESTED" and not any(
+            item.get("Severity", "").casefold() == "must fix" for item in findings):
+        errors.append("Decision CHANGES_REQUESTED requires at least one Must fix finding")
+
+    return {
+        "valid": not errors,
+        "errors": errors,
+        "decision": decision,
+        "part_id": expected_part_id if len(part_ids) == 1 else None,
+        "findings": findings,
+        "sections": sections,
+    }
+
+
+def _validated_campaign_reports(campaign: dict) -> list[dict]:
+    reports: list[dict] = []
+    for part in campaign.get("part_reviews", []):
+        segments = [
+            ReviewSegment(
+                segment.get("path", ""), "", segment.get("patch_line_start", 1),
+                segment.get("patch_line_end", 1), segment.get("patch_line_count", 1),
+                segment.get("patch_sha256", ""),
+            )
+            for segment in part.get("segments", [])
+        ]
+        attempts = part.get("validated_reports") or ([{
+            "report": part.get("report"),
+            "prompt_sha256": part.get("context_sha256"),
+            "campaign_call_number": None,
+            "submitted_at": None,
+        }] if part.get("status") == "reviewed" and part.get("report") else [])
+        for attempt in attempts:
+            raw_report = attempt.get("report")
+            if not isinstance(raw_report, str):
+                continue
+            parsed = attempt.get("validation") or parse_part_review_report(
+                raw_report, part.get("part_id", ""), segments,
+            )
+            reports.append({
+                "part_id": part.get("part_id"),
+                "attempt": attempt.get("campaign_call_number"),
+                "submitted_at": attempt.get("submitted_at"),
+                "report": raw_report,
+                "validation": parsed,
+            })
+    return reports
+
+
+def render_review_feedback(reports: list[dict]) -> str:
+    """Surface validated feedback while retaining every source report verbatim."""
+    if not reports:
+        return "No validated code-review reports were recorded."
+    lines = ["## Review decisions", ""]
+    decisions = []
+    for item in reports:
+        validation = item.get("validation") or {}
+        decision = validation.get("decision") or "unavailable"
+        label = f"{item.get('part_id', 'unknown part')}"
+        if item.get("attempt") is not None:
+            label += f", call {item['attempt']}"
+        decisions.append(f"- {label}: **{decision}**")
+    lines.extend(decisions)
+
+    grouped: dict[str, list[tuple[dict, dict]]] = {severity: [] for severity in PART_REVIEW_SEVERITIES}
+    for item in reports:
+        validation = item.get("validation") or {}
+        for finding in validation.get("findings", []):
+            severity = next((name for name in PART_REVIEW_SEVERITIES
+                             if name.casefold() == finding.get("Severity", "").casefold()), None)
+            if severity:
+                grouped[severity].append((item, finding))
+    for severity, heading in (("Must fix", "Blocking findings"), ("Should fix", "Non-blocking findings"),
+                              ("Optional improvement", "Suggestions")):
+        lines.extend(["", f"## {heading}", ""])
+        items = grouped[severity]
+        if not items:
+            lines.append("None reported.")
+            continue
+        for item, finding in items:
+            attempt = f", call {item['attempt']}" if item.get("attempt") is not None else ""
+            lines.extend([
+                f"### {finding.get('id', 'Finding')} — {item.get('part_id', 'unknown part')}{attempt}",
+                "",
+                f"- Category: {finding.get('Category', '')}",
+                f"- Location: {finding.get('File/location', '')}",
+                f"- Description: {finding.get('Description', '')}",
+                f"- Why it matters: {finding.get('Impact and reasoning', '')}",
+                f"- Recommended correction: {finding.get('Recommended correction', '')}",
+                "",
+            ])
+    lines.extend(["## Reviewer observations and limits", ""])
+    for item in reports:
+        sections = (item.get("validation") or {}).get("sections", {})
+        label = item.get("part_id", "unknown part")
+        if item.get("attempt") is not None:
+            label += f", call {item['attempt']}"
+        lines.extend([
+            f"### {label}", "",
+            "Cross-component concerns:",
+            sections.get("Cross-component concerns", "Not available."),
+            "",
+            "Overall assessment (including positive observations and limitations):",
+            sections.get("Overall assessment", "Not available."),
+            "",
+        ])
+    lines.extend(["## Original reviewer reports", ""])
+    for item in reports:
+        label = item.get("part_id", "unknown part")
+        if item.get("attempt") is not None:
+            label += f", call {item['attempt']}"
+        lines.extend([f"### {label}", "", item["report"].rstrip(), ""])
+    return "\n".join(lines).rstrip() + "\n"
 
 
 CLAUDE_CODE_REVIEW_GUIDANCE = """Independent review roles and duties
@@ -1364,6 +1659,26 @@ class Orchestrator:
         return (
             "Perform an independent, read-only code review. Treat the implementation and approved proposal as claims "
             "to verify against the original assignment. Apply all shared review criteria and the specific scope for "
+            "this part. Do not implement changes. Return exactly one `Decision: APPROVED` or "
+            "`Decision: CHANGES_REQUESTED` line, followed by exactly one `Part ID: <id>` line. "
+            "Use the sections `Files reviewed`, `Findings`, `Cross-component concerns`, and `Overall assessment` "
+            "in that order. Markdown heading markers are allowed on the Part ID and section lines. "
+            "Represent every finding in its own uniquely labeled `### Finding F1` block. Include exactly one "
+            "non-empty field for each of: "
+            "`Severity`, `Category`, `File/location`, `Description`, `Impact and reasoning`, and "
+            "`Recommended correction`. Use severity `Must fix`, `Should fix`, or `Optional improvement`. "
+            "Do not place findings outside their blocks. Write `Findings: None` when there are no findings. "
+            "Write one of `APPROVED` or `CHANGES_REQUESTED` only. Do not claim approval when a Must fix finding "
+            "exists; use `Decision: CHANGES_REQUESTED` for acceptance-blocking defects. Give a substantive "
+            "overall assessment including positive observations and limitations where relevant."
+        )
+
+    @staticmethod
+    def _legacy_code_review_header() -> str:
+        """Return the exact v1 header so persisted requests can be verified without another provider call."""
+        return (
+            "Perform an independent, read-only code review. Treat the implementation and approved proposal as claims "
+            "to verify against the original assignment. Apply all shared review criteria and the specific scope for "
             "this part. Do not implement changes. Return a structured report with exactly these headings: `Part ID: "
             "<id>`, `Files reviewed`, `Findings`, `Cross-component concerns`, and `Overall assessment`. Format each "
             "finding with fields `Severity`, `Category`, `File/location`, `Description`, `Impact and reasoning`, and "
@@ -1449,6 +1764,7 @@ class Orchestrator:
         campaign_id: str,
         limit: int,
         excluded_count: int,
+        header: str | None = None,
     ) -> list[ReviewSegment]:
         lines = patch.splitlines(keepends=True)
         safe_boundaries = _safe_patch_boundaries(lines, path)
@@ -1462,7 +1778,7 @@ class Orchestrator:
                 candidate_text = "".join(lines[start:end])
                 candidate = self._review_segment(path, candidate_text, start + 1, end, len(lines))
                 if self._serialized_review_fits(
-                    self._code_review_header(),
+                    header or self._code_review_header(),
                     self._part_sections(
                         shared, [candidate], campaign_id=campaign_id, part_id="part-000001",
                         excluded_count=excluded_count,
@@ -1491,8 +1807,9 @@ class Orchestrator:
         *,
         campaign_id: str,
         limit: int,
+        header: str | None = None,
     ) -> tuple[list[dict], bool]:
-        header = self._code_review_header()
+        header = header or self._code_review_header()
         probe = self._review_segment("review-context-probe.txt", "x")
         probe_sections = self._part_sections(
             shared, [probe], campaign_id=campaign_id, part_id="part-000001",
@@ -1525,7 +1842,7 @@ class Orchestrator:
             else:
                 segments.extend(self._split_oversized_segment(
                     path, patch, shared=shared, campaign_id=campaign_id, limit=limit,
-                    excluded_count=len(review_diff.excluded_files),
+                    excluded_count=len(review_diff.excluded_files), header=header,
                 ))
 
         pending = sorted(segments, key=lambda item: (item.path, item.patch_line_start))
@@ -1652,14 +1969,25 @@ class Orchestrator:
             campaign_id = uuid.uuid4().hex
 
         shared = self._code_review_shared_context(review_diff)
+        saved_headers = [
+            context.get("header_id") for context in self.state.get("claude_contexts", [])
+            if context.get("stage") == "code_review"
+            and context.get("campaign_id") == campaign_id
+            and context.get("review_kind") == "part"
+        ]
+        legacy_campaign = bool(existing) and (
+            existing.get("header_id") == "code-review-part-v1"
+            or (not existing.get("header_id") and "code-review-part-v1" in saved_headers)
+        )
+        review_header = self._legacy_code_review_header() if legacy_campaign else self._code_review_header()
         shared_hash = _review_patch_sha256(_format_context_prompt(
-            redact(self._code_review_header()),
+            redact(review_header),
             {name: redact(value).strip() for name, value in shared.items()},
         ))
         source_hash = self._campaign_source_hash(review_diff)
         try:
             parts, multipart = self._partition_review_segments(
-                review_diff, shared, campaign_id=campaign_id, limit=limit,
+                review_diff, shared, campaign_id=campaign_id, limit=limit, header=review_header,
             )
         except WorkflowError as exc:
             if not existing:
@@ -1709,6 +2037,8 @@ class Orchestrator:
         authorization = self.state["authorization"]["claude_aily"]
         campaign = {
             "campaign_id": campaign_id,
+            "header_id": "code-review-part-v2",
+            "report_contract_version": PART_REVIEW_VALIDATOR_VERSION,
             "status": "planned",
             "strategy": "multi_part_with_integration" if multipart else "single_call",
             "created_at": now(),
@@ -1815,49 +2145,12 @@ class Orchestrator:
         self.state["review_files_not_reviewed"] = campaign["files_not_reviewed"]
 
     @staticmethod
+    def _part_report_validation(report: str, part_id: str, segments: list[ReviewSegment]) -> dict:
+        return parse_part_review_report(report, part_id, segments)
+
+    @staticmethod
     def _part_report_is_structured(report: str, part_id: str, segments: list[ReviewSegment]) -> bool:
-        if not re.search(rf"(?im)^\s*Part ID:\s*{re.escape(part_id)}\s*$", report):
-            return False
-        if not re.search(r"(?im)^\s*Decision:\s*(?:APPROVED|CHANGES_REQUESTED)\b", report):
-            return False
-        for heading in ("Files reviewed", "Findings", "Cross-component concerns", "Overall assessment"):
-            if not re.search(
-                    rf"(?im)^\s*(?:#+\s*)?{re.escape(heading)}\s*:?\s*(?:.*)?$", report):
-                return False
-        findings_match = re.search(
-            r"(?ims)^\s*(?:#+\s*)?Findings\s*:?\s*(.*?)"
-            r"(?=^\s*(?:#+\s*)?Cross-component concerns\b)", report,
-        )
-        if not findings_match:
-            return False
-        findings = findings_match.group(1).strip()
-        if findings and not re.fullmatch(r"(?is)(?:none|no findings\.?|n/a)\s*", findings):
-            for field in (
-                "Severity", "Category", "File/location", "Description", "Impact and reasoning",
-                "Recommended correction",
-            ):
-                if not re.search(rf"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?{re.escape(field)}(?:\*\*)?\s*:", findings):
-                    return False
-        files_match = re.search(
-            r"(?ims)^\s*(?:#{1,6}\s*)?Files reviewed\s*:?\s*\n(.*?)"
-            r"(?=^\s*(?:#{1,6}\s*)?(?:Findings|Cross-component concerns|Overall assessment)\b|\Z)",
-            report,
-        )
-        if not files_match:
-            return False
-        listed_paths: set[str] = set()
-        for line in files_match.group(1).splitlines():
-            item_match = re.match(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)(.*?)\s*$", line)
-            if not item_match:
-                continue
-            item = item_match.group(1)
-            backticked_paths = re.findall(r"`([^`]+)`", item)
-            if backticked_paths:
-                listed_paths.update(backticked_paths)
-            else:
-                listed_paths.add(item.split(" — ", 1)[0].strip())
-        assigned_paths = {segment.path for segment in segments}
-        return assigned_paths <= listed_paths
+        return parse_part_review_report(report, part_id, segments)["valid"]
 
     @staticmethod
     def _integration_report_is_structured(report: str) -> bool:
@@ -1879,12 +2172,20 @@ class Orchestrator:
             record = part_records[part["part_id"]]
             if record["status"] == "reviewed":
                 continue
-            if record["status"] == "report_saved" and record.get("report"):
-                record["status"] = (
-                    "reviewed" if self._part_report_is_structured(
-                        record["report"], part["part_id"], part["segments"],
-                    ) else "invalid_report"
+            if record["status"] in {"report_saved", "invalid_report"} and record.get("report"):
+                validation = self._part_report_validation(
+                    record["report"], part["part_id"], part["segments"],
                 )
+                previous_status = record["status"]
+                record["status"] = "reviewed" if validation["valid"] else "invalid_report"
+                record.setdefault("validation_history", []).append({
+                    "validator_version": PART_REVIEW_VALIDATOR_VERSION,
+                    "validated_at": now(),
+                    "previous_status": previous_status,
+                    "valid": validation["valid"],
+                    "errors": validation["errors"],
+                    "report_sha256": _sha256_text(record["report"]),
+                })
                 record["segments"] = self._campaign_part_manifest([part])[0]["segments"]
                 self._sync_review_coverage(campaign, review_diff)
                 self._save()
@@ -1908,16 +2209,22 @@ class Orchestrator:
                 })
                 record["report"] = report
                 record["context_sha256"] = recoverable["prompt_sha256"]
-                record["status"] = (
-                    "reviewed" if self._part_report_is_structured(report, part["part_id"], part["segments"])
-                    else "invalid_report"
-                )
+                validation = self._part_report_validation(report, part["part_id"], part["segments"])
+                record["status"] = "reviewed" if validation["valid"] else "invalid_report"
+                record.setdefault("validation_history", []).append({
+                    "validator_version": PART_REVIEW_VALIDATOR_VERSION,
+                    "validated_at": now(),
+                    "valid": validation["valid"],
+                    "errors": validation["errors"],
+                    "report_sha256": _sha256_text(report),
+                })
                 record["segments"] = self._campaign_part_manifest([part])[0]["segments"]
                 self._sync_review_coverage(campaign, review_diff)
                 self._save()
                 if record["status"] != "reviewed":
                     raise WorkflowError(
-                        f"Persisted Claude output for {part['part_id']} is not a complete structured report."
+                        f"Persisted Claude report for {part['part_id']} is invalid: "
+                        + "; ".join(validation["errors"])
                     )
                 continue
             sections = self._part_sections(
@@ -1930,7 +2237,7 @@ class Orchestrator:
                     self._code_review_header(), "code_review", sections,
                     metadata={
                         "proposal_version": self.state.get("proposal_version", 1),
-                        "header_id": "code-review-part-v1",
+                        "header_id": "code-review-part-v2",
                         "review_kind": "part",
                         "campaign_id": campaign["campaign_id"],
                         "part_id": part["part_id"],
@@ -1970,17 +2277,23 @@ class Orchestrator:
             })
             record["report"] = report
             record["context_sha256"] = manifest["prompt_sha256"]
-            record["status"] = (
-                "reviewed" if self._part_report_is_structured(report, part["part_id"], part["segments"])
-                else "invalid_report"
-            )
+            validation = self._part_report_validation(report, part["part_id"], part["segments"])
+            record["status"] = "reviewed" if validation["valid"] else "invalid_report"
+            record.setdefault("validation_history", []).append({
+                "validator_version": PART_REVIEW_VALIDATOR_VERSION,
+                "validated_at": now(),
+                "valid": validation["valid"],
+                "errors": validation["errors"],
+                "report_sha256": _sha256_text(report),
+            })
             record["segments"] = self._campaign_part_manifest([part])[0]["segments"]
             self._sync_review_coverage(campaign, review_diff)
             self._save()
             if record["status"] != "reviewed":
                 raise WorkflowError(
-                    f"Claude returned an incomplete structured report for {part['part_id']}; "
-                    "the part remains unreviewed and may be retried only within the saved call and budget limits."
+                    f"Claude report for {part['part_id']} is invalid: "
+                    + "; ".join(validation["errors"])
+                    + ". The report remains preserved and the part is unreviewed."
                 )
 
         if len(parts) == 1:
@@ -2541,6 +2854,11 @@ class Orchestrator:
         campaign = self.state.get("review_campaign")
         sections.extend(["", "## Code review campaign", ""])
         if campaign:
+            feedback_reports = _validated_campaign_reports(campaign)
+            if feedback_reports:
+                sections.extend([
+                    "## Structured code-review feedback", "", render_review_feedback(feedback_reports), "",
+                ])
             invocation_count = sum(
                 call.get("call_state") != "validation_failed"
                 for record in campaign.get("part_reviews", []) for call in record.get("calls", [])
@@ -2596,6 +2914,336 @@ class Orchestrator:
             self.state.get("proposal") or "",
         ])
         return "\n".join(sections).rstrip() + "\n"
+
+
+def recover_code_review(target: str | Path, workflow_id: str, *, apply: bool = False) -> dict:
+    """Revalidate persisted part reports locally; never calls a provider."""
+    runner = Orchestrator(target, workflow_id=workflow_id)
+    _safe_artifact(runner.state_path)
+    try:
+        original_bytes = runner.state_path.read_bytes()
+        state = json.loads(original_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WorkflowError(f"Workflow state is missing or invalid: {runner.state_path}") from exc
+    if state.get("workflow_id") != workflow_id or state.get("target") != str(runner.target):
+        raise WorkflowError("Workflow state belongs to another target or workflow ID.")
+    authorization = validate_workflow_authorization(state, runner.target, workflow_id)
+    if authorization["claude_aily"].get("active_call") or authorization["claude_aily"].get("budget_unknown"):
+        raise WorkflowError(
+            "Local review recovery is unsafe while a Claude call is active or its cost is unknown."
+        )
+    if state.get("status") != "failed" or state.get("stage") != "code_review":
+        raise WorkflowError("Local code-review recovery requires a failed workflow at the code_review stage.")
+    campaign = state.get("review_campaign")
+    if not isinstance(campaign, dict) or not campaign.get("campaign_id"):
+        raise WorkflowError("No persisted code-review campaign is available to recover.")
+
+    runner.state = state
+    try:
+        review_diff = _review_diff(state, runner.target)
+    except Exception as exc:
+        raise WorkflowError(f"Could not safely reconstruct the saved target diff: {redact(str(exc))}") from exc
+    errors: list[str] = []
+    source_hash = runner._campaign_source_hash(review_diff)
+    if source_hash != campaign.get("source_patch_sha256"):
+        errors.append("current target diff or exclusions do not match the saved campaign source hash")
+
+    context_records = [
+        item for item in state.get("claude_contexts", [])
+        if item.get("stage") == "code_review" and item.get("campaign_id") == campaign["campaign_id"]
+        and item.get("review_kind") == "part"
+    ]
+    header_ids = {
+        item.get("header_id") for item in context_records
+        if item.get("call_state") == "completed" and isinstance(item.get("report"), str)
+    }
+    if header_ids == {"code-review-part-v1"}:
+        header = runner._legacy_code_review_header()
+    elif header_ids == {"code-review-part-v2"}:
+        header = runner._code_review_header()
+    else:
+        errors.append("saved code-review contexts do not identify one supported prompt contract")
+        header = runner._legacy_code_review_header()
+
+    shared = runner._code_review_shared_context(review_diff)
+    shared_hash = _review_patch_sha256(_format_context_prompt(
+        redact(header), {name: redact(value).strip() for name, value in shared.items()},
+    ))
+    if shared_hash != campaign.get("shared_context_sha256"):
+        errors.append("current assignment, proposal, implementation summary, repository context, or review guidance "
+                      "does not match the saved shared-context hash")
+
+    patch_by_path = dict(review_diff.file_patches)
+    parts: list[dict] = []
+    for saved_part in campaign.get("parts", []):
+        segments: list[ReviewSegment] = []
+        for item in saved_part.get("segments", []):
+            path = item.get("path")
+            patch = patch_by_path.get(path)
+            if patch is None:
+                errors.append(f"saved part {saved_part.get('part_id')} references missing changed path {path!r}")
+                continue
+            lines = patch.splitlines(keepends=True)
+            start, end, count = (item.get("patch_line_start"), item.get("patch_line_end"),
+                                 item.get("patch_line_count"))
+            if (not isinstance(start, int) or not isinstance(end, int) or not isinstance(count, int)
+                    or start < 1 or end < start or end > len(lines) or count != len(lines)):
+                errors.append(f"saved patch range is invalid for {path!r}")
+                continue
+            text = "".join(lines[start - 1:end])
+            digest = _review_patch_sha256(text)
+            if digest != item.get("patch_sha256"):
+                errors.append(f"saved patch segment hash no longer matches {path!r}")
+                continue
+            segments.append(ReviewSegment(path, text, start, end, count, digest))
+        parts.append({"part_id": saved_part.get("part_id"), "segments": segments})
+    try:
+        runner._validate_review_partition(review_diff, parts)
+    except WorkflowError as exc:
+        errors.append(str(exc))
+    if runner._campaign_part_manifest(parts) != campaign.get("parts"):
+        errors.append("reconstructed patch partition does not match the saved campaign manifest")
+
+    reviews_by_part = {item.get("part_id"): item for item in campaign.get("part_reviews", [])}
+    reports_by_part: dict[str, list[dict]] = {}
+    validations: list[dict] = []
+    for part in parts:
+        part_id = part["part_id"]
+        record = reviews_by_part.get(part_id)
+        part_contexts = [item for item in context_records if item.get("part_id") == part_id]
+        contexts = [item for item in part_contexts if item.get("call_state") == "completed"]
+        if not contexts:
+            if record:
+                saved_calls = Counter(
+                    (item.get("prompt_sha256"), item.get("cost_usd"), item.get("call_state"),
+                     item.get("campaign_call_number")) for item in record.get("calls", [])
+                )
+                expected_calls = Counter(
+                    (item.get("prompt_sha256"), item.get("cost_usd"), item.get("call_state"),
+                     item.get("campaign_call_number")) for item in part_contexts
+                )
+                if expected_calls != saved_calls:
+                    errors.append(f"{part_id} campaign call metadata does not preserve each saved provider attempt")
+            continue
+        sections = runner._part_sections(
+            shared, part["segments"], campaign_id=campaign["campaign_id"], part_id=part_id,
+            excluded_count=len(review_diff.excluded_files),
+        )
+        safe_header = redact(header)
+        safe_sections = {
+            name: redact(value) if name == "Complete patch" else redact(value).strip()
+            for name, value in sections.items()
+        }
+        prompt = _format_context_prompt(safe_header, safe_sections)
+        prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        section_manifest = [
+            {"name": name, "characters": len(value), "sha256": _sha256_text(value)}
+            for name, value in safe_sections.items()
+        ]
+        patch_hash = _review_patch_sha256(sections["Complete patch"])
+        expected_files = sorted({segment.path for segment in part["segments"]})
+        for context in contexts:
+            call_number = context.get("campaign_call_number")
+            metadata_errors = []
+            if context.get("prompt_sha256") != prompt_sha256:
+                metadata_errors.append("prompt hash does not match the saved report request")
+            if context.get("header_sha256") != _sha256_text(safe_header):
+                metadata_errors.append("header hash does not match the saved prompt contract")
+            if context.get("sections") != section_manifest:
+                metadata_errors.append("section hashes do not match the reconstructed prompt")
+            if context.get("part_patch_sha256") != patch_hash:
+                metadata_errors.append("part patch hash does not match the current target diff")
+            if context.get("shared_context_sha256") != campaign.get("shared_context_sha256"):
+                metadata_errors.append("saved shared-context metadata does not match the campaign")
+            if context.get("included_files") != expected_files:
+                metadata_errors.append("included-file metadata does not match this part")
+            if context.get("excluded_files") != campaign.get("excluded_files"):
+                metadata_errors.append("excluded-file metadata does not match the campaign")
+            if context.get("characters") != len(prompt) or context.get("utf8_bytes") != len(prompt.encode("utf-8")):
+                metadata_errors.append("saved prompt length metadata does not match the reconstructed prompt")
+            if context.get("complete") is not True:
+                metadata_errors.append("saved prompt manifest was not marked complete")
+            if context.get("report") is None or not isinstance(context.get("report"), str):
+                metadata_errors.append("completed provider context has no persisted report text")
+            cost = context.get("cost_usd")
+            if isinstance(cost, bool) or not isinstance(cost, (int, float)) or cost < 0:
+                metadata_errors.append("completed provider context has no valid recorded cost")
+            if metadata_errors:
+                errors.extend(f"{part_id} call {call_number}: {item}" for item in metadata_errors)
+            report = context.get("report") if isinstance(context.get("report"), str) else ""
+            validation = parse_part_review_report(report, part_id, part["segments"])
+            attempt = {
+                "part_id": part_id,
+                "attempt": call_number,
+                "submitted_at": context.get("submitted_at"),
+                "prompt_sha256": context.get("prompt_sha256"),
+                "cost_usd": cost,
+                "report": report,
+                "validation": validation,
+                "errors": metadata_errors + validation["errors"],
+            }
+            validations.append(attempt)
+            reports_by_part.setdefault(part_id, []).append(attempt)
+            if not validation["valid"]:
+                errors.extend(f"{part_id} call {call_number}: {item}" for item in validation["errors"])
+        if record:
+            if not record.get("report"):
+                errors.append(f"{part_id} has completed report contexts but no campaign report text")
+            elif contexts and record.get("report") != contexts[-1].get("report"):
+                errors.append(f"{part_id} campaign report is not the latest persisted provider response")
+            calls = record.get("calls", [])
+            expected_calls = Counter(
+                (item.get("prompt_sha256"), item.get("cost_usd"), item.get("call_state"),
+                 item.get("campaign_call_number")) for item in part_contexts
+            )
+            saved_calls = Counter(
+                (item.get("prompt_sha256"), item.get("cost_usd"), item.get("call_state"),
+                 item.get("campaign_call_number")) for item in calls
+            )
+            if expected_calls != saved_calls:
+                errors.append(f"{part_id} campaign call metadata does not preserve each saved provider attempt")
+
+    missing_parts = [part["part_id"] for part in parts if not reports_by_part.get(part["part_id"])]
+    campaign_complete = not missing_parts and all(
+        all(attempt["validation"]["valid"] and not attempt["errors"] for attempt in attempts)
+        for attempts in reports_by_part.values()
+    ) and not errors
+    integration = campaign.get("integration_review", {})
+    integration_complete = not integration.get("required") or integration.get("status") == "reviewed"
+    campaign_complete = campaign_complete and integration_complete
+
+    original_reports = [attempt for attempts in reports_by_part.values() for attempt in attempts]
+    digest_material = [
+        {"part_id": item["part_id"], "attempt": item["attempt"],
+         "report_sha256": _sha256_text(item["report"]), "prompt_sha256": item["prompt_sha256"]}
+        for item in original_reports
+    ]
+    recovery_digest = _sha256_text(json.dumps(digest_material, sort_keys=True, separators=(",", ":")))
+    already_applied = any(
+        item.get("validator_version") == PART_REVIEW_VALIDATOR_VERSION
+        and item.get("recovery_digest") == recovery_digest
+        for item in campaign.get("recovery_history", [])
+    )
+    result = {
+        "workflow_id": workflow_id,
+        "target": str(runner.target),
+        "mode": "apply" if apply else "dry-run",
+        "provider_invocations": 0,
+        "source_patch_sha256": source_hash,
+        "shared_context_sha256": shared_hash,
+        "persisted_reports": len(validations),
+        "valid_reports": sum(item["validation"]["valid"] and not item["errors"] for item in validations),
+        "invalid_reports": sum(not item["validation"]["valid"] or bool(item["errors"]) for item in validations),
+        "missing_parts": missing_parts,
+        "integration_review_status": integration.get("status"),
+        "campaign_would_be_complete": campaign_complete,
+        "errors": errors,
+        "report_validations": [
+            {key: item[key] for key in ("part_id", "attempt", "submitted_at", "cost_usd", "validation", "errors")}
+            for item in validations
+        ],
+        "recovery_digest": recovery_digest,
+        "already_applied": already_applied,
+        "applied": False,
+        "claude_spent_usd": state.get("authorization", {}).get("claude_aily", {}).get("spent_usd"),
+    }
+    if not apply or already_applied:
+        return result
+    if errors:
+        result["apply_error"] = "Recovery was not applied because source or report validation failed."
+        return result
+    if not validations:
+        result["apply_error"] = "Recovery was not applied because no persisted completed part reports were found."
+        return result
+
+    proposed = copy.deepcopy(state)
+    proposed_campaign = proposed["review_campaign"]
+    proposed_records = {item["part_id"]: item for item in proposed_campaign.get("part_reviews", [])}
+    for part_id, attempts in reports_by_part.items():
+        record = proposed_records[part_id]
+        previous_status = record.get("status")
+        validated_reports = record.setdefault("validated_reports", [])
+        known = {(item.get("prompt_sha256"), item.get("campaign_call_number")) for item in validated_reports}
+        for attempt in attempts:
+            identity = (attempt.get("prompt_sha256"), attempt.get("attempt"))
+            if identity in known:
+                continue
+            validated_reports.append({
+                "report": attempt["report"],
+                "prompt_sha256": attempt["prompt_sha256"],
+                "campaign_call_number": attempt["attempt"],
+                "submitted_at": attempt["submitted_at"],
+                "cost_usd": attempt["cost_usd"],
+                "call_state": "completed",
+                "validator_version": PART_REVIEW_VALIDATOR_VERSION,
+                "validation": attempt["validation"],
+            })
+        latest = attempts[-1]
+        record["report"] = latest["report"]
+        record["context_sha256"] = latest["prompt_sha256"]
+        record["status"] = "reviewed" if all(
+            item["validation"]["valid"] and not item["errors"] for item in attempts
+        ) else "invalid_report"
+        record["segments"] = next(
+            (item["segments"] for item in proposed_campaign.get("parts", []) if item["part_id"] == part_id), []
+        )
+        record.setdefault("validation_history", []).append({
+            "validator_version": PART_REVIEW_VALIDATOR_VERSION,
+            "validated_at": now(),
+            "previous_status": previous_status,
+            "valid": record["status"] == "reviewed",
+            "errors": [error for item in attempts for error in item["errors"]],
+            "report_sha256s": [_sha256_text(item["report"]) for item in attempts],
+            "source_patch_sha256": source_hash,
+        })
+
+    runner.state = proposed
+    runner._sync_review_coverage(proposed_campaign, review_diff)
+    all_parts_reviewed = all(item.get("status") == "reviewed"
+                             for item in proposed_campaign.get("part_reviews", []))
+    full_coverage = not proposed_campaign.get("files_not_reviewed")
+    if all_parts_reviewed and full_coverage and integration_complete:
+        proposed_campaign["status"] = "complete"
+        formatted = render_review_feedback(_validated_campaign_reports(proposed_campaign))
+        proposed_campaign["consolidated_report"] = formatted
+        proposed["code_review"] = formatted
+        proposed["code_review_context_sha256"] = proposed_campaign.get("shared_context_sha256")
+    else:
+        proposed_campaign["status"] = "in_progress"
+
+    proposed_campaign["header_id"] = next(iter(header_ids)) if len(header_ids) == 1 else proposed_campaign.get("header_id")
+    proposed_campaign["report_contract_version"] = PART_REVIEW_VALIDATOR_VERSION
+    proposed_campaign.setdefault("recovery_history", []).append({
+        "recovered_at": now(),
+        "validator_version": PART_REVIEW_VALIDATOR_VERSION,
+        "recovery_digest": recovery_digest,
+        "source_patch_sha256": source_hash,
+        "shared_context_sha256": shared_hash,
+        "old_validator_statuses": {
+            item["part_id"]: reviews_by_part[item["part_id"]].get("status")
+            for item in proposed_campaign.get("part_reviews", []) if item["part_id"] in reviews_by_part
+        },
+        "reports_revalidated": len(validations),
+        "campaign_completed": proposed_campaign.get("status") == "complete",
+        "workflow_status_preserved": proposed.get("status"),
+        "workflow_stage_preserved": proposed.get("stage"),
+    })
+    proposed["review_files_not_reviewed"] = proposed_campaign.get("files_not_reviewed", [])
+    proposed["review_campaign_call_count"] = state.get("review_campaign_call_count", sum(
+        call.get("call_state") != "validation_failed"
+        for record in proposed_campaign.get("part_reviews", []) for call in record.get("calls", [])
+    ))
+
+    if runner.state_path.read_bytes() != original_bytes:
+        raise WorkflowError("Workflow state changed during local recovery; no recovery changes were written.")
+    proposed["updated_at"] = now()
+    encoded = json.dumps(proposed, indent=2, ensure_ascii=False) + "\n"
+    _atomic_text(runner.state_path, encoded)
+    result["applied"] = True
+    result["campaign_completed"] = proposed_campaign.get("status") == "complete"
+    result["workflow_status_preserved"] = proposed.get("status")
+    result["workflow_stage_preserved"] = proposed.get("stage")
+    return result
 
 
 def _task_text(args: argparse.Namespace) -> str:
@@ -2660,6 +3308,15 @@ def _print_summary(state: dict) -> None:
         "effective_budget_usd": external_authorization.get("budget_usd"),
         "authorized_code_review_calls": external_authorization.get("max_code_reviews"),
         "review_campaign_status": state.get("review_campaign", {}).get("status"),
+        "code_review_feedback": (
+            render_review_feedback(_validated_campaign_reports(state.get("review_campaign", {})))
+            if state.get("review_campaign") else None
+        ),
+        "code_review_report": state.get("code_review"),
+        "integration_review_report": (
+            state.get("review_campaign", {}).get("integration_review", {}).get("report")
+            if state.get("review_campaign") else None
+        ),
         "review_files_not_reviewed": state.get("review_files_not_reviewed", []),
         "review_partition_failure": state.get("review_partition_failure"),
         "error": state.get("error"),
@@ -2698,6 +3355,16 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--codex", default=CODEX_EXECUTABLE)
         command.add_argument("--aily", default=claude_reviewer.AILY_EXECUTABLE)
 
+    recover = commands.add_parser(
+        "recover-review", help="Locally revalidate saved code-review reports without provider calls",
+    )
+    recover.add_argument("--target", required=True, help="Absolute Git repository root")
+    recover.add_argument("--workflow-id", required=True)
+    recover.add_argument(
+        "--apply", action="store_true",
+        help="Write validated recovery metadata to workflow state (dry-run is the default)",
+    )
+
     revise = commands.add_parser("revise", help="Request a proposal change before implementation")
     revise.add_argument("--target", required=True)
     revise.add_argument("--workflow-id", required=True)
@@ -2723,6 +3390,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Effective Claude/Aily budget: ${runner.budget_usd:.2f}")
             print(f"Authorized Claude code-review campaign calls: {runner.max_code_review_calls}")
             state = runner.start()
+        elif args.command == "recover-review":
+            result = recover_code_review(args.target, args.workflow_id, apply=args.apply)
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            return 1 if result.get("errors") or result.get("apply_error") else 0
         else:
             runner = Orchestrator(args.target, workflow_id=args.workflow_id, codex=args.codex, aily=args.aily)
             if args.command == "approve":
