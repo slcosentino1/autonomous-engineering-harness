@@ -265,6 +265,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(claude.prompts), 2)
         self.assertFalse(any("workspace-write" in command for command in codex.commands))
         self.assertIn("User-edited proposal", codex.prompts[2])
+        self.assertIn("uncertain outcomes", codex.prompts[2])
+        self.assertIn("external dependencies", codex.prompts[2])
         self.assertIn("empty-input", (runner.workflow_dir / "proposal.md").read_text(encoding="utf-8"))
 
     def test_user_can_reject_without_implementation(self):
@@ -477,6 +479,9 @@ class WorkflowTests(unittest.TestCase):
         current_proposal = orchestrator.clean_markdown(proposal).strip()
         self.assertEqual(section_hashes["Current proposal"], hashlib.sha256(current_proposal.encode("utf-8")).hexdigest())
         self.assertIn("must implement, should implement", codex.prompts[0])
+        self.assertIn("These are analysis prompts, not automatic implementation requirements", codex.prompts[0])
+        self.assertIn("State important unknowns", codex.prompts[0])
+        self.assertIn("observable outcomes and acceptance criteria", codex.prompts[0])
         self.assertIn("future production considerations", claude.prompts[0])
 
     def test_missing_or_oversized_review_context_prevents_a_paid_call(self):

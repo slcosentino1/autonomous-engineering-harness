@@ -33,7 +33,40 @@ PLANNING_PRINCIPLES = """Engineering Judgment & Proportional Design
 5. Avoid unnecessary abstractions, services, and components.
 6. Separate must implement, should implement, future production considerations, and out of scope.
 7. Do not invent product behavior; ask the user when a decision changes expected behavior.
-8. Make reversible technical assumptions autonomously and document them."""
+8. Make reversible technical assumptions autonomously and document them.
+
+Understand the problem before designing:
+- Identify explicit requirements, implicit constraints, business rules, inputs, outputs, and expected outcomes.
+- Trace the lifecycle of the main operations, including relevant component interactions and external systems.
+- Explain how the proposed components communicate and what information crosses their boundaries.
+
+Think beyond the happy path. Consider partial failures, unexpected responses, timeouts and uncertain outcomes,
+concurrent or duplicate requests, restarts and interrupted execution, invalid data, resource constraints, and
+operational limits. These are analysis prompts, not automatic implementation requirements. Address the scenarios
+that matter to the assignment and explain why other scenarios do not change the design.
+
+Analyze integrations and uncertainty:
+- Identify external systems, downstream dependencies, known contracts, and missing contract information.
+- Explain what can be implemented independently and what depends on another team or system.
+- Consider integration errors, timeouts, authentication, data contracts, and compatibility where relevant.
+- State important unknowns, why they matter, and plausible interpretations and consequences.
+- Separate confirmed requirements from assumptions. Never silently invent external behavior or product rules.
+- Make reversible technical assumptions when safe. Ask the user about ambiguities that change product behavior,
+  business rules, or an important architectural decision that cannot safely be assumed.
+- Identify what remains incomplete until an external dependency is clarified.
+
+Evaluate the architecture by its consequences. Consider maintainability, reliability, complexity, and operational
+cost. Compare realistic alternatives when their consequences differ materially. Do not add infrastructure, patterns,
+abstractions, or components without a clear requirement or risk-based justification. Do not turn every identified
+risk into implementation work.
+
+Plan verification from the start. Define observable outcomes and acceptance criteria for important requirements.
+Identify relevant functional, integration, failure, and boundary checks. State which checks can run locally, which
+need a mock or stub, and which require a real external integration.
+
+Classify decisions as must implement, should implement, future production considerations, out of scope, open
+questions or ambiguities, and external dependencies. Use only the categories that apply. Keep the proposal at the
+level of detail needed to explain the reasoning; do not make it longer or more sophisticated for its own sake."""
 CLAUDE_MAX_PAYLOAD_ENV = claude_reviewer.MAX_REVIEW_PAYLOAD_ENV
 WORKSPACE_OPERATIONS = [
     "read_create_edit_rename_delete_assignment_files_in_target",
