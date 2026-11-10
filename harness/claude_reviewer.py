@@ -56,16 +56,40 @@ def max_review_payload_chars() -> int:
     return value
 
 
-def validate_review_payload(prompt: str) -> int:
+def validate_review_payload(prompt: str, *, limit: int | None = None) -> int:
+    if not isinstance(prompt, str):
+        raise ReviewError("Claude review context must be text; no paid call was made.")
     if not prompt.strip():
         raise ReviewError("Claude review context is empty; no paid call was made.")
-    limit = max_review_payload_chars()
-    if len(prompt) > limit:
+    if "\x00" in prompt:
+        raise ReviewError("Claude review context contains a NUL byte; no paid call was made.")
+    try:
+        prompt_bytes = prompt.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ReviewError("Claude review context is not valid UTF-8 text; no paid call was made.") from exc
+    effective_limit = max_review_payload_chars() if limit is None else limit
+    if isinstance(effective_limit, bool) or not isinstance(effective_limit, int) or effective_limit < 1:
+        raise ReviewError(f"{MAX_REVIEW_PAYLOAD_ENV} must be a positive integer.")
+    if len(prompt) > effective_limit:
         raise ReviewError(
-            f"Claude review context is {len(prompt)} characters, above the configured {limit}-character "
+            f"Claude review context is {len(prompt)} characters ({len(prompt_bytes)} UTF-8 bytes), "
+            f"above the configured {effective_limit}-character "
             f"limit ({MAX_REVIEW_PAYLOAD_ENV}); no paid call was made."
         )
-    return limit
+    return effective_limit
+
+
+def validate_review_invocation(prompt: str, executable: str, *, limit: int | None = None) -> int:
+    """Validate all caller-controlled text arguments before marking a review submitted."""
+    if not isinstance(executable, str) or not executable:
+        raise ReviewError("Aily executable must be a non-empty text value; no paid call was made.")
+    if "\x00" in executable:
+        raise ReviewError("Aily executable contains a NUL byte; no paid call was made.")
+    try:
+        executable.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ReviewError("Aily executable is not valid UTF-8 text; no paid call was made.") from exc
+    return validate_review_payload(prompt, limit=limit)
 
 
 def _decode(stdout: str) -> tuple[str, float | None]:
@@ -104,7 +128,7 @@ def review(
         raise ReviewError("A positive USD budget is required for Claude review.")
     if not math.isfinite(float(budget_usd)) or budget_usd <= 0:
         raise ReviewError("A positive USD budget is required for Claude review.")
-    validate_review_payload(prompt)
+    validate_review_invocation(prompt, executable)
 
     command = [
         executable, "claude", "-p", prompt,
@@ -138,6 +162,8 @@ def review(
             raise ReviewError(f"Claude review timed out after {timeout_seconds} seconds.") from exc
         except OSError as exc:
             raise ReviewError(f"Aily could not start: {redact(str(exc))}") from exc
+        except ValueError as exc:
+            raise ReviewError(f"Aily command arguments could not be passed safely: {redact(str(exc))}") from exc
 
     stdout = result.stdout.decode("utf-8", "replace") if isinstance(result.stdout, bytes) else str(result.stdout or "")
     stderr = result.stderr.decode("utf-8", "replace") if isinstance(result.stderr, bytes) else str(result.stderr or "")

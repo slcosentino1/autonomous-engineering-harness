@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -35,6 +36,13 @@ def make_target(root: Path) -> Path:
     return root
 
 
+def prompt_section(prompt: str, name: str) -> str:
+    match = re.search(
+        rf"(?ms)^## {re.escape(name)}\n(.*?)(?=^## |\Z)", prompt,
+    )
+    return match.group(1).strip() if match else ""
+
+
 class FakeCodex:
     def __init__(self, *responses: str):
         self.responses = list(responses)
@@ -56,17 +64,63 @@ class FakeCodex:
 
 
 class FakeClaude:
-    def __init__(self, *results):
+    def __init__(self, *results, response_factory=None):
         self.results = list(results)
+        self.response_factory = response_factory
         self.prompts: list[str] = []
         self.budgets: list[float] = []
+        self.auto_structure = True
 
     def __call__(self, prompt, *, budget_usd, executable):
         self.prompts.append(prompt)
         self.budgets.append(budget_usd)
-        result = self.results.pop(0)
+        if self.results:
+            result = self.results.pop(0)
+        elif self.response_factory is not None:
+            result = self.response_factory(prompt, budget_usd, executable)
+        else:
+            raise AssertionError("Unexpected Claude call")
         if isinstance(result, Exception):
             raise result
+        if self.auto_structure and "final independent integration review" in prompt:
+            decision = "CHANGES_REQUESTED" if "Decision: CHANGES_REQUESTED" in result.text else "APPROVED"
+            report = (
+                f"Decision: {decision}\n\n## Consolidated findings\n{result.text}\n\n"
+                f"## Integration findings\n{result.text if decision == 'CHANGES_REQUESTED' else 'None'}\n\n"
+                f"## Overall assessment\n{result.text}"
+            )
+            return claude_reviewer.ReviewResult(report, result.cost_usd)
+        part_match = re.search(r"(?m)^Part ID: (part-\d+)$", prompt)
+        if part_match and self.auto_structure:
+            part_id = part_match.group(1)
+            decision = "CHANGES_REQUESTED" if "Decision: CHANGES_REQUESTED" in result.text else "APPROVED"
+            paths = []
+            for raw_path in re.findall(r"(?m)^FILE: (.+?); patch lines", prompt):
+                try:
+                    path = json.loads(raw_path)
+                except json.JSONDecodeError:
+                    continue
+                if path not in paths:
+                    paths.append(path)
+            findings = result.text if decision == "CHANGES_REQUESTED" else "None"
+            severity = "**Severity:** Must fix\n" if decision == "CHANGES_REQUESTED" else ""
+            if decision == "APPROVED" and "Optional improvement" in result.text:
+                findings = result.text
+                severity = "**Severity:** Optional improvement\n"
+            if findings != "None":
+                findings = (
+                    f"### Finding F1\n{severity}**Category:** Correctness\n**File/location:** "
+                    f"{paths[0] if paths else 'unknown'}\n**Description:** {result.text}\n"
+                    "**Impact and reasoning:** This affects the requested behavior.\n"
+                    "**Recommended correction:** Correct the affected behavior."
+                )
+            report = (
+                f"Decision: {decision}\n\nPart ID: {part_id}\n\nFiles reviewed:\n"
+                + "".join(f"- `{path}`\n" for path in paths)
+                + f"\nFindings:\n{severity}{findings}\n\nCross-component concerns:\n- None\n\n"
+                f"Overall assessment:\n{result.text}"
+            )
+            return claude_reviewer.ReviewResult(report, result.cost_usd)
         return result
 
 
@@ -88,6 +142,16 @@ class WorkflowTests(unittest.TestCase):
             "# Refined proposal\n\n## Scope\nAdd the requested behavior.\n\n"
             f"## Claude finding dispositions\n{dispositions}\n\nSecond plan review needed: {second_review}\n"
         )
+
+    def implement_files(self, codex: FakeCodex, changed: dict[str, str]) -> None:
+        def implementation(index, _command, _kwargs):
+            if index != 2:
+                return
+            for relative, content in changed.items():
+                path = self.target / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+        codex.on_call = implementation
 
     def test_missing_budget_uses_two_dollars_and_persists_it(self):
         codex = FakeCodex("# Proposal\nInitial plan.\n", self.refined())
@@ -117,6 +181,7 @@ class WorkflowTests(unittest.TestCase):
         output = StringIO()
         with patch.object(orchestrator, "Orchestrator") as factory:
             factory.return_value.budget_usd = 2.0
+            factory.return_value.max_code_review_calls = orchestrator.DEFAULT_MAX_CODE_REVIEW_CALLS
             factory.return_value.start.return_value = fake_state
             with redirect_stdout(output):
                 result = orchestrator.main([
@@ -124,6 +189,9 @@ class WorkflowTests(unittest.TestCase):
                 ])
         self.assertEqual(result, 0)
         self.assertEqual(factory.call_args.kwargs["budget_usd"], 2.0)
+        self.assertEqual(
+            factory.call_args.kwargs["max_code_review_calls"], orchestrator.DEFAULT_MAX_CODE_REVIEW_CALLS,
+        )
         self.assertIn("Effective Claude/Aily budget: $2.00", output.getvalue())
         self.assertIn('"effective_budget_usd": 2.0', output.getvalue())
         self.assertIsNone(factory.call_args.kwargs["model"])
@@ -140,15 +208,18 @@ class WorkflowTests(unittest.TestCase):
         output = StringIO()
         with patch.object(orchestrator, "Orchestrator") as factory:
             factory.return_value.budget_usd = 0.75
+            factory.return_value.max_code_review_calls = 12
             factory.return_value.start.return_value = fake_state
             with redirect_stdout(output):
                 result = orchestrator.main([
                     "start", "--target", str(self.target), "--task", "Add a feature",
                     "--budget-usd", "0.75", "--model", "codex-model-test",
+                    "--max-code-review-calls", "12",
                 ])
         self.assertEqual(result, 0)
         self.assertEqual(factory.call_args.kwargs["budget_usd"], 0.75)
         self.assertEqual(factory.call_args.kwargs["model"], "codex-model-test")
+        self.assertEqual(factory.call_args.kwargs["max_code_review_calls"], 12)
         self.assertIn("Effective Claude/Aily budget: $0.75", output.getvalue())
 
     def test_plan_is_saved_and_implementation_waits_for_explicit_approval(self):
@@ -189,6 +260,10 @@ class WorkflowTests(unittest.TestCase):
             self.target, workflow_id="approval-flow", process_runner=codex, claude_runner=claude,
         ).approve()
         self.assertEqual(approved["status"], "complete")
+        self.assertEqual(approved["review_campaign"]["strategy"], "single_call")
+        self.assertEqual(len(approved["review_campaign"]["parts"]), 1)
+        self.assertEqual(approved["review_campaign"]["integration_review"]["status"], "not_required")
+        self.assertEqual(approved["review_campaign_call_count"], 1)
         self.assertEqual(len(codex.commands), 3)
         self.assertEqual([command[command.index("--sandbox") + 1] for command in codex.commands],
                          ["read-only", "read-only", "workspace-write"])
@@ -315,6 +390,679 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("Handle empty input", codex.prompts[-1])
         self.assertIn("reran the unit tests", state["correction_summary"])
 
+    def test_code_review_context_records_exclusions_and_preserves_all_relevant_files(self):
+        metadata = self.target / ".DS_Store"
+        metadata.write_bytes(b"baseline metadata")
+        git(self.target, "add", "-f", ".DS_Store")
+        git(self.target, "commit", "-q", "-m", "metadata baseline")
+        codex = FakeCodex(
+            "# Proposal\nPlan.\n", self.refined(), "Implementation complete.\n",
+        )
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Plan looks good.", 0.1),
+            claude_reviewer.ReviewResult("Decision: APPROVED\nNo actionable findings.", 0.1),
+        )
+
+        def implement(index, _command, _kwargs):
+            if index != 2:
+                return
+            metadata.write_bytes(b"metadata changed\x00with binary data")
+            for relative, content in (
+                ("app/service.py", "def process(item):\n    return item\n"),
+                ("tests/test_service.py", "def test_service():\n    assert True\n"),
+                ("docs/api.md", "# API contract\n"),
+                ("contracts/service.v1", "request: item\nresponse: status\n"),
+            ):
+                path = self.target / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+
+        codex.on_call = implement
+        runner = orchestrator.Orchestrator(
+            self.target, task="Build an API", budget_usd=1.0, workflow_id="file-coverage-review",
+            process_runner=codex, claude_runner=claude,
+        )
+        runner.start()
+        state = orchestrator.Orchestrator(
+            self.target, workflow_id="file-coverage-review", process_runner=codex, claude_runner=claude,
+        ).approve()
+        self.assertEqual(state["status"], "complete")
+        self.assertEqual(state["review_included_files"], [
+            "app/service.py", "contracts/service.v1", "docs/api.md", "tests/test_service.py",
+        ])
+        self.assertEqual(state["review_exclusions"], [
+            {"path": ".DS_Store", "reason": "operating-system metadata"},
+            {
+                "path": ".engineering/workflows/file-coverage-review/proposal.md",
+                "reason": "workflow state is not part of the implementation diff",
+            },
+            {
+                "path": ".engineering/workflows/file-coverage-review/state.json",
+                "reason": "workflow state is not part of the implementation diff",
+            },
+        ])
+        code_context = state["claude_contexts"][-1]
+        self.assertEqual(code_context["call_state"], "completed")
+        self.assertEqual(code_context["included_files"], state["review_included_files"])
+        self.assertEqual(code_context["excluded_files"], state["review_exclusions"])
+        prompt = claude.prompts[-1]
+        self.assertIn("app/service.py", prompt)
+        self.assertIn("tests/test_service.py", prompt)
+        self.assertIn("contracts/service.v1", prompt)
+        self.assertNotIn(".DS_Store", prompt)
+        self.assertEqual(
+            state["review_campaign"]["excluded_files"][0]["reason"], "operating-system metadata",
+        )
+        self.assertNotIn("\x00", prompt)
+
+    def test_large_review_uses_adaptive_parts_shared_context_and_integration(self):
+        changed = {
+            "services/ledger/engine.py": "def calculate():\n" + "    value = 1  # ledger operation\n" * 45,
+            "services/ledger/model.py": "class LedgerModel:\n" + "    value = 'entry'\n" * 45,
+            "checks/ledger/test_engine.py": "def test_calculate():\n" + "    assert 1 == 1\n" * 45,
+            "contracts/ledger.contract": "ledger request contract\n" * 45,
+            "plugins/codec/custom.data": "codec mapping row\n" * 45,
+        }
+        codex = FakeCodex("# Proposal\nA small service with explicit contracts.\n", self.refined(), "Implemented all changed modules.\n")
+
+        def implementation(index, _command, _kwargs):
+            if index == 2:
+                for relative, content in changed.items():
+                    path = self.target / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(content, encoding="utf-8")
+
+        codex.on_call = implementation
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Decision: APPROVED\nPlan review passed.", 0.05),
+            response_factory=lambda _prompt, _budget, _executable: claude_reviewer.ReviewResult(
+                "Decision: APPROVED\nNo acceptance-blocking findings.", 0.05,
+            ),
+        )
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add a ledger processing API", budget_usd=1.0,
+            workflow_id="multipart-review", process_runner=codex, claude_runner=claude,
+        )
+        runner.start()
+        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "15000"}):
+            state = orchestrator.Orchestrator(
+                self.target, workflow_id="multipart-review", process_runner=codex,
+                claude_runner=claude,
+            ).approve()
+
+        campaign = state["review_campaign"]
+        self.assertEqual(state["status"], "complete")
+        self.assertEqual(campaign["status"], "complete")
+        self.assertEqual(campaign["strategy"], "multi_part_with_integration")
+        self.assertGreaterEqual(len(campaign["parts"]), 2)
+        self.assertEqual(campaign["integration_review"]["status"], "reviewed")
+        self.assertEqual(set(campaign["files_reviewed"]), set(changed))
+        self.assertEqual(campaign["files_not_reviewed"], [])
+
+        flattened = [segment for part in campaign["parts"] for segment in part["segments"]]
+        assignments = {}
+        for segment in flattened:
+            assignments.setdefault(segment["path"], 0)
+            assignments[segment["path"]] += 1
+        self.assertEqual(assignments, {path: 1 for path in changed})
+        self.assertTrue(any(
+            {"services/ledger/engine.py", "services/ledger/model.py"}
+            <= {segment["path"] for segment in part["segments"]}
+            for part in campaign["parts"]
+        ))
+        self.assertTrue(all(
+            part["status"] == "reviewed" and f"Part ID: {part['part_id']}" in part["report"]
+            for part in campaign["part_reviews"]
+        ))
+        code_calls = [item for item in state["claude_contexts"] if item["stage"] == "code_review"]
+        self.assertEqual(len(code_calls), len(campaign["parts"]) + 1)
+        self.assertEqual(state["review_campaign_call_count"], len(code_calls))
+        self.assertEqual(
+            state["authorization"]["claude_aily"]["spent_usd"],
+            round(0.05 * (len(code_calls) + 1), 4),
+        )
+        self.assertLessEqual(
+            state["review_campaign_call_count"],
+            state["authorization"]["claude_aily"]["max_code_reviews"],
+        )
+        self.assertTrue(all(item["characters"] <= 15000 for item in code_calls))
+        self.assertTrue(all(item["payload_limit_characters"] == 15000 for item in code_calls))
+        self.assertEqual(
+            {item["shared_context_sha256"] for item in code_calls},
+            {campaign["shared_context_sha256"]},
+        )
+        for context, prompt in zip(code_calls, claude.prompts[1:], strict=True):
+            self.assertEqual(context["characters"], len(prompt))
+            self.assertEqual(context["utf8_bytes"], len(prompt.encode("utf-8")))
+            self.assertEqual(context["prompt_sha256"], hashlib.sha256(prompt.encode("utf-8")).hexdigest())
+        part_prompts = [
+            prompt for prompt in claude.prompts
+            if "Part ID: part-" in prompt and "final independent integration review" not in prompt
+        ]
+        integration_prompt = next(prompt for prompt in claude.prompts if "final independent integration review" in prompt)
+        self.assertEqual(len(part_prompts), len(campaign["parts"]))
+        for section in (
+            "Assignment", "Approved proposal", "Implementation summary", "Independent reviewer role",
+            "Engineering Judgment & Proportional Design", "Repository/module map and dependencies",
+        ):
+            values = {prompt_section(prompt, section) for prompt in part_prompts}
+            self.assertEqual(len(values), 1, section)
+        self.assertIn("Individual part reports", integration_prompt)
+        self.assertIn("Part ID: part-000001", integration_prompt)
+        self.assertEqual(integration_prompt.count("Part ID: part-"), len(campaign["parts"]))
+        self.assertIn("Deduplicate findings", integration_prompt)
+        self.assertIn("Senior Software Architect", part_prompts[0])
+        self.assertIn("Product Engineer", integration_prompt)
+        delivery = (runner.workflow_dir / "delivery.md").read_text(encoding="utf-8")
+        self.assertIn("multi_part_with_integration", delivery)
+        self.assertIn("Integration report", delivery)
+        self.assertIn("Claude invocation attempts", delivery)
+
+    def test_oversized_file_is_split_only_at_safe_patch_boundaries(self):
+        file_path = "modules/unusual/component.py"
+        content = "".join(
+            f"def operation_{index}():\n" + "    result = 'component operation value'\n" * 35 + "\n"
+            for index in range(8)
+        )
+        codex = FakeCodex("# Proposal\nKeep the component modular.\n", self.refined(), "Implemented component.\n")
+        def write_component(index, _command, _kwargs):
+            if index == 2:
+                (self.target / file_path).parent.mkdir(parents=True, exist_ok=True)
+                (self.target / file_path).write_text(content, encoding="utf-8")
+
+        codex.on_call = write_component
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Decision: APPROVED\nPlan review passed.", 0.05),
+            response_factory=lambda _prompt, _budget, _executable: claude_reviewer.ReviewResult(
+                "Decision: APPROVED\nNo acceptance-blocking findings.", 0.05,
+            ),
+        )
+        runner = orchestrator.Orchestrator(
+            self.target, task="Review the component", budget_usd=1.0, workflow_id="safe-file-split",
+            process_runner=codex, claude_runner=claude,
+        )
+        runner.start()
+        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "13500"}):
+            state = orchestrator.Orchestrator(
+                self.target, workflow_id="safe-file-split", process_runner=codex, claude_runner=claude,
+            ).approve()
+        campaign = state["review_campaign"]
+        segment_ranges = sorted(
+            (item["patch_line_start"], item["patch_line_end"], item["patch_line_count"])
+            for part in campaign["parts"] for item in part["segments"]
+        )
+        self.assertGreater(len(segment_ranges), 1)
+        self.assertEqual({item["path"] for part in campaign["parts"] for item in part["segments"]}, {file_path})
+        self.assertEqual(segment_ranges[0][0], 1)
+        self.assertEqual(segment_ranges[-1][1], segment_ranges[0][2])
+        self.assertTrue(all(left[1] + 1 == right[0] for left, right in zip(segment_ranges, segment_ranges[1:])))
+        source_patch = dict(orchestrator._review_diff(state, self.target).file_patches)[file_path]
+        source_lines = source_patch.splitlines(keepends=True)
+        reconstructed = "".join("".join(source_lines[start - 1:end]) for start, end, _total in segment_ranges)
+        self.assertEqual(reconstructed, source_patch)
+        self.assertEqual(state["review_campaign"]["status"], "complete")
+
+    def test_resume_reuses_successful_parts_and_retries_only_failed_part(self):
+        changed = {
+            f"components/ledger/file_{index}.py": (
+                f"def operation_{index}():\n" + "    result = 'component operation'\n" * 45
+            )
+            for index in range(5)
+        }
+        codex = FakeCodex("# Proposal\nKeep boundaries proportional.\n", self.refined(), "Implemented modules.\n")
+        self.implement_files(codex, changed)
+        attempts: dict[str, int] = {}
+        failed_id: list[str | None] = [None]
+
+        def respond(prompt, _budget, _executable):
+            if "final independent integration review" in prompt:
+                return claude_reviewer.ReviewResult("Decision: APPROVED\nNo integration defects.", 0.05)
+            part_id = re.search(r"(?m)^Part ID: (part-\d+)$", prompt).group(1)
+            attempts[part_id] = attempts.get(part_id, 0) + 1
+            if failed_id[0] is None and part_id != "part-000001":
+                failed_id[0] = part_id
+                raise claude_reviewer.ReviewError("temporary Aily failure", cost_usd=0.03)
+            return claude_reviewer.ReviewResult("Decision: APPROVED\nNo acceptance-blocking findings.", 0.05)
+
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05),
+            response_factory=respond,
+        )
+        runner = orchestrator.Orchestrator(
+            self.target, task="Process ledger records", budget_usd=1.0, workflow_id="part-resume",
+            process_runner=codex, claude_runner=claude,
+        )
+        runner.start()
+        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "14000"}):
+            with self.assertRaisesRegex(orchestrator.WorkflowError, "temporary Aily failure"):
+                orchestrator.Orchestrator(
+                    self.target, workflow_id="part-resume", process_runner=codex, claude_runner=claude,
+                ).approve()
+            failed = json.loads(runner.state_path.read_text(encoding="utf-8"))
+            campaign = failed["review_campaign"]
+            self.assertEqual(campaign["part_reviews"][0]["status"], "reviewed")
+            self.assertTrue(any(part["status"] == "call_failed" for part in campaign["part_reviews"]))
+            before_resume_part_prompts = [
+                prompt for prompt in claude.prompts if "Part ID: part-" in prompt
+                and "final independent integration review" not in prompt
+            ]
+            self.assertGreaterEqual(len(campaign["parts"]), 2)
+            self.assertEqual(len(before_resume_part_prompts), 2)
+
+            completed = orchestrator.Orchestrator(
+                self.target, workflow_id="part-resume", process_runner=codex, claude_runner=claude,
+            ).resume()
+
+        self.assertEqual(completed["status"], "complete")
+        self.assertEqual(len(codex.commands), 3)
+        final_part_prompts = [
+            prompt for prompt in claude.prompts if "Part ID: part-" in prompt
+            and "final independent integration review" not in prompt
+        ]
+        self.assertEqual(sum("Part ID: part-000001" in prompt for prompt in final_part_prompts), 1)
+        failed_part = failed_id[0]
+        self.assertIsNotNone(failed_part)
+        self.assertEqual(sum(f"Part ID: {failed_part}" in prompt for prompt in final_part_prompts), 2)
+        self.assertEqual(
+            [part["status"] for part in completed["review_campaign"]["part_reviews"]],
+            ["reviewed"] * len(completed["review_campaign"]["parts"]),
+        )
+
+    def test_saved_part_report_is_recovered_without_repeating_paid_call(self):
+        changed = {
+            f"modules/recovery/file_{index}.py": f"def operation_{index}():\n" + "    return 'recoverable'\n" * 45
+            for index in range(5)
+        }
+        codex = FakeCodex("# Proposal\nKeep the report state durable.\n", self.refined(), "Implemented.\n")
+        self.implement_files(codex, changed)
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05),
+            response_factory=lambda _prompt, _budget, _executable: claude_reviewer.ReviewResult(
+                "Decision: APPROVED\nNo acceptance-blocking findings.", 0.05,
+            ),
+        )
+        runner = orchestrator.Orchestrator(
+            self.target, task="Implement recovery", budget_usd=1.0, workflow_id="persisted-report-recovery",
+            process_runner=codex, claude_runner=claude,
+        )
+        runner.start()
+
+        class InterruptedAfterSavedCall(orchestrator.Orchestrator):
+            interrupted = False
+
+            def _call_claude(self, header, stage, sections, *, metadata=None):
+                result = super()._call_claude(header, stage, sections, metadata=metadata)
+                if stage == "code_review" and (metadata or {}).get("review_kind") == "part" and not self.interrupted:
+                    self.interrupted = True
+                    raise orchestrator.WorkflowError("simulated interruption after report persistence")
+                return result
+
+        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "14000"}):
+            with self.assertRaisesRegex(orchestrator.WorkflowError, "simulated interruption"):
+                InterruptedAfterSavedCall(
+                    self.target, workflow_id="persisted-report-recovery", process_runner=codex,
+                    claude_runner=claude,
+                ).approve()
+            state_before = json.loads(runner.state_path.read_text(encoding="utf-8"))
+            part_record = state_before["review_campaign"]["part_reviews"][0]
+            self.assertEqual(part_record["status"], "report_saved")
+            self.assertTrue(any(
+                context.get("part_id") == part_record["part_id"] and context.get("report")
+                for context in state_before["claude_contexts"]
+            ))
+            prompts_before_resume = len(claude.prompts)
+            completed = orchestrator.Orchestrator(
+                self.target, workflow_id="persisted-report-recovery", process_runner=codex,
+                claude_runner=claude,
+            ).resume()
+        self.assertEqual(completed["status"], "complete")
+        first_id = part_record["part_id"]
+        self.assertEqual(sum(
+            f"Part ID: {first_id}" in prompt and "final independent integration review" not in prompt
+            for prompt in claude.prompts
+        ), 1)
+        self.assertGreater(len(claude.prompts), prompts_before_resume)
+
+    def test_saved_integration_report_is_recovered_without_repeating_paid_call(self):
+        changed = {
+            f"application/sync/file_{index}.py": f"def operation_{index}():\n" + "    return 'sync'\n" * 55
+            for index in range(5)
+        }
+        codex = FakeCodex("# Proposal\nIntegrate the sync modules.\n", self.refined(), "Implemented.\n")
+        self.implement_files(codex, changed)
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05),
+            response_factory=lambda _prompt, _budget, _executable: claude_reviewer.ReviewResult(
+                "Decision: APPROVED\nNo integration defects.", 0.05,
+            ),
+        )
+        runner = orchestrator.Orchestrator(
+            self.target, task="Implement sync processing", budget_usd=1.0, workflow_id="integration-recovery",
+            process_runner=codex, claude_runner=claude,
+        )
+        runner.start()
+
+        class InterruptedAfterIntegration(orchestrator.Orchestrator):
+            def _call_claude(self, header, stage, sections, *, metadata=None):
+                result = super()._call_claude(header, stage, sections, metadata=metadata)
+                if (stage == "code_review" and (metadata or {}).get("review_kind") == "integration"):
+                    raise orchestrator.WorkflowError("simulated integration persistence boundary")
+                return result
+
+        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "14000"}):
+            with self.assertRaisesRegex(orchestrator.WorkflowError, "integration persistence boundary"):
+                InterruptedAfterIntegration(
+                    self.target, workflow_id="integration-recovery", process_runner=codex,
+                    claude_runner=claude,
+                ).approve()
+            saved = json.loads(runner.state_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["review_campaign"]["integration_review"]["status"], "report_saved")
+            calls_before_resume = len(claude.prompts)
+            completed = orchestrator.Orchestrator(
+                self.target, workflow_id="integration-recovery", process_runner=codex,
+                claude_runner=claude,
+            ).resume()
+        self.assertEqual(completed["status"], "complete")
+        self.assertEqual(len(claude.prompts), calls_before_resume)
+        self.assertEqual(completed["review_campaign"]["integration_review"]["status"], "reviewed")
+
+    def test_unknown_part_spend_blocks_all_later_campaign_calls(self):
+        changed = {
+            f"modules/records/part_{index}.py": (
+                f"def operation_{index}():\n" + "    return 'record operation'\n" * 50
+            ) for index in range(5)
+        }
+        codex = FakeCodex("# Proposal\nUse the existing contract.\n", self.refined(), "Implemented records.\n")
+        self.implement_files(codex, changed)
+
+        def respond(prompt, _budget, _executable):
+            return claude_reviewer.ReviewResult("Decision: APPROVED\nNo acceptance-blocking findings.", None)
+
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05),
+            response_factory=respond,
+        )
+        runner = orchestrator.Orchestrator(
+            self.target, task="Implement records", budget_usd=1.0, workflow_id="unknown-part-spend",
+            process_runner=codex, claude_runner=claude,
+        )
+        runner.start()
+        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "14000"}):
+            with self.assertRaisesRegex(orchestrator.WorkflowError, "previous call has no recorded cost"):
+                orchestrator.Orchestrator(
+                    self.target, workflow_id="unknown-part-spend", process_runner=codex,
+                    claude_runner=claude,
+                ).approve()
+        state = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertTrue(state["authorization"]["claude_aily"]["budget_unknown"])
+        self.assertEqual(len(claude.prompts), 2)  # plan plus one part; no later part or integration call
+        self.assertEqual(state["review_campaign"]["status"], "in_progress")
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "no recorded cost"):
+            orchestrator.Orchestrator(
+                self.target, workflow_id="unknown-part-spend", process_runner=codex,
+                claude_runner=claude,
+            ).resume()
+
+    def test_existing_single_call_authorization_does_not_expand_for_multipart_review(self):
+        changed = {
+            f"areas/component/file_{index}.py": f"def item_{index}():\n" + "    return 3\n" * 80
+            for index in range(5)
+        }
+        codex = FakeCodex("# Proposal\nPlan.\n", self.refined(), "Implementation.\n")
+        self.implement_files(codex, changed)
+        claude = FakeClaude(claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05))
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add large feature", budget_usd=1.0, max_code_review_calls=1,
+            workflow_id="legacy-review-limit", process_runner=codex, claude_runner=claude,
+        )
+        runner.start()
+        external = runner.state["authorization"]["claude_aily"]
+        external.pop("code_review_policy")
+        external["max_code_reviews"] = 1
+        runner._save()
+        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "12000"}):
+            with self.assertRaisesRegex(orchestrator.WorkflowError, "requires .* Claude calls.*authorizes 1"):
+                runner.approve()
+        saved = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["authorization"]["claude_aily"]["max_code_reviews"], 1)
+        self.assertNotIn("code_review_policy", saved["authorization"]["claude_aily"])
+        self.assertEqual(len(claude.prompts), 1)
+        self.assertEqual(saved["review_campaign"]["status"], "blocked_authorization")
+        self.assertTrue(saved["review_campaign"]["files_not_reviewed"])
+
+    def test_invalid_part_report_cannot_complete_campaign_or_omit_files(self):
+        changed = {
+            f"packages/suite/file_{index}.py": f"def item_{index}():\n" + "    return 'review me'\n" * 80
+            for index in range(5)
+        }
+        codex = FakeCodex("# Proposal\nPlan.\n", self.refined(), "Implementation.\n")
+        self.implement_files(codex, changed)
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05),
+            response_factory=lambda _prompt, _budget, _executable: claude_reviewer.ReviewResult(
+                "Decision: APPROVED\nUnstructured response.", 0.05,
+            ),
+        )
+        runner = orchestrator.Orchestrator(
+            self.target, task="Review all modules", budget_usd=1.0, workflow_id="incomplete-part-report",
+            process_runner=codex, claude_runner=claude,
+        )
+        runner.start()
+        claude.auto_structure = False
+        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "14000"}):
+            with self.assertRaisesRegex(orchestrator.WorkflowError, "incomplete structured report"):
+                runner.approve()
+        saved = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["status"], "failed")
+        self.assertNotEqual(saved["review_campaign"]["status"], "complete")
+        self.assertEqual(saved["review_campaign"]["part_reviews"][0]["status"], "invalid_report")
+        self.assertTrue(saved["review_campaign"]["files_not_reviewed"])
+        self.assertFalse((runner.workflow_dir / "delivery.md").exists())
+
+    def test_unsafe_single_file_split_is_recorded_and_can_resume_with_higher_limit(self):
+        relative = "generated/one_line.py"
+        codex = FakeCodex("# Proposal\nKeep generated content intact.\n", self.refined(), "Implemented.\n")
+        def write_one_line(index, _command, _kwargs):
+            if index == 2:
+                (self.target / relative).parent.mkdir(parents=True, exist_ok=True)
+                (self.target / relative).write_text("VALUE = '" + ("x" * 6000) + "'\n", encoding="utf-8")
+        codex.on_call = write_one_line
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05),
+            response_factory=lambda _prompt, _budget, _executable: claude_reviewer.ReviewResult(
+                "Decision: APPROVED\nNo acceptance-blocking findings.", 0.05,
+            ),
+        )
+        runner = orchestrator.Orchestrator(
+            self.target, task="Implement generated data", budget_usd=1.0, workflow_id="unsafe-file-split",
+            process_runner=codex, claude_runner=claude,
+        )
+        runner.start()
+        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "13000"}):
+            with self.assertRaisesRegex(orchestrator.WorkflowError, "cannot be split at a safe patch boundary"):
+                runner.approve()
+        failed = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(failed["review_files_not_reviewed"][0]["path"], relative)
+        self.assertIn("cannot be split at a safe patch boundary", failed["review_files_not_reviewed"][0]["reason"])
+        self.assertEqual(len(claude.prompts), 1)
+        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "20000"}):
+            completed = runner.resume()
+        self.assertEqual(completed["status"], "complete")
+        self.assertEqual(completed["review_campaign"]["strategy"], "single_call")
+        self.assertEqual(completed["review_files_not_reviewed"], [])
+        self.assertEqual(len(claude.prompts), 2)
+
+    def test_path_grouping_uses_repository_structure_without_architecture_assumptions(self):
+        self.assertGreater(
+            orchestrator._path_affinity("odd/component/alpha.py", "odd/component/beta.py")[0],
+            orchestrator._path_affinity("views/alpha.py", "storage/beta.json")[0],
+        )
+        self.assertGreater(
+            orchestrator._path_affinity("features/submit.py", "checks/test_submit.py")[0], 0,
+        )
+
+    def test_optional_review_findings_do_not_trigger_correction(self):
+        codex = FakeCodex(
+            "# Proposal\nPlan.\n", self.refined(), "Implemented.\n",
+        )
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05),
+            claude_reviewer.ReviewResult(
+                "Decision: APPROVED\nOptional improvement: consider a clearer variable name.", 0.05,
+            ),
+        )
+        path = self.target / "src" / "feature.py"
+        path.parent.mkdir()
+        codex.on_call = lambda index, _command, _kwargs: (
+            path.write_text("def value(): return 1\n", encoding="utf-8") if index == 2 else None
+        )
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add a feature", budget_usd=1.0, workflow_id="optional-review",
+            process_runner=codex, claude_runner=claude,
+        )
+        runner.start()
+        state = orchestrator.Orchestrator(
+            self.target, workflow_id="optional-review", process_runner=codex, claude_runner=claude,
+        ).approve()
+        self.assertEqual(state["status"], "complete")
+        self.assertEqual(len(codex.commands), 3)
+        self.assertTrue(orchestrator._clearly_no_review_findings(state["code_review"]))
+
+    def test_new_and_legacy_code_review_authorization_limits_are_distinct(self):
+        new = orchestrator.new_workflow_authorization(self.target, "new-scope", 1.0, 9)
+        self.assertEqual(new["claude_aily"]["max_code_reviews"], 9)
+        self.assertEqual(new["claude_aily"]["code_review_policy"]["max_calls"], 9)
+        old = orchestrator.new_workflow_authorization(self.target, "legacy-scope", 1.0, 1)
+        old["claude_aily"].pop("code_review_policy")
+        old["scope_sha256"] = orchestrator.authorization_scope_digest(old)
+        state = {"authorization": old}
+        self.assertEqual(
+            orchestrator.validate_workflow_authorization(state, Path(old["target"]), "legacy-scope")
+            ["claude_aily"]["max_code_reviews"], 1,
+        )
+        old["claude_aily"]["max_code_reviews"] = 9
+        old["scope_sha256"] = orchestrator.authorization_scope_digest(old)
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "review limit"):
+            orchestrator.validate_workflow_authorization(state, Path(old["target"]), "legacy-scope")
+
+    def test_optional_improvements_and_structured_report_compatibility(self):
+        self.assertTrue(orchestrator._clearly_no_review_findings(
+            "Decision: APPROVED\nOptional improvements\n- Optional improvement: rename helper."
+        ))
+        self.assertFalse(orchestrator._clearly_no_review_findings(
+            "Decision: CHANGES_REQUESTED\nFindings: Must fix missing authorization."
+        ))
+        self.assertFalse(orchestrator._clearly_no_review_findings(
+            "Decision: APPROVED\nSeverity: Must fix\nFinding: broken required behavior."
+        ))
+        segment = orchestrator.ReviewSegment("src/a.py", "complete patch", 1, 1, 1, "hash")
+        self.assertTrue(orchestrator.Orchestrator._part_report_is_structured(
+            "Decision: APPROVED\nPart ID: part-000001\nFiles reviewed:\n- src/a.py\nFindings: None\n"
+            "Cross-component concerns: None\nOverall assessment: adequate.",
+            "part-000001", [segment],
+        ))
+        self.assertTrue(orchestrator.Orchestrator._integration_report_is_structured(
+            "Decision: APPROVED\nConsolidated findings: None\nIntegration findings: None\n"
+            "Overall assessment: coherent."
+        ))
+
+    def test_review_coverage_distinguishes_identical_segments_from_different_files(self):
+        first = {
+            "path": "src/first.py", "patch_line_start": 1, "patch_line_end": 3,
+            "patch_sha256": "identical-content-hash",
+        }
+        second = {
+            "path": "src/second.py", "patch_line_start": 1, "patch_line_end": 3,
+            "patch_sha256": "identical-content-hash",
+        }
+        campaign = {
+            "parts": [
+                {"part_id": "part-1", "segments": [first]},
+                {"part_id": "part-2", "segments": [second]},
+            ],
+            "part_reviews": [
+                {"part_id": "part-1", "status": "reviewed", "segments": [first]},
+                {"part_id": "part-2", "status": "pending", "segments": [second]},
+            ],
+        }
+        runner = object.__new__(orchestrator.Orchestrator)
+        runner.state = {}
+
+        runner._sync_review_coverage(
+            campaign,
+            orchestrator.ReviewDiff("", ("src/first.py", "src/second.py"), (), ()),
+        )
+
+        self.assertEqual(campaign["files_reviewed"], ["src/first.py"])
+        self.assertEqual(
+            [item["path"] for item in campaign["files_not_reviewed"]], ["src/second.py"],
+        )
+
+    def test_file_coverage_waits_for_every_assigned_segment(self):
+        first = {
+            "path": "src/module.py", "patch_line_start": 1, "patch_line_end": 4,
+            "patch_sha256": "first-segment",
+        }
+        second = {
+            "path": "src/module.py", "patch_line_start": 5, "patch_line_end": 8,
+            "patch_sha256": "second-segment",
+        }
+        campaign = {
+            "parts": [
+                {"part_id": "part-1", "segments": [first]},
+                {"part_id": "part-2", "segments": [second]},
+            ],
+            "part_reviews": [
+                {"part_id": "part-1", "status": "reviewed", "segments": [first]},
+                {"part_id": "part-2", "status": "pending", "segments": [second]},
+            ],
+        }
+        runner = object.__new__(orchestrator.Orchestrator)
+        runner.state = {}
+        review_diff = orchestrator.ReviewDiff("", ("src/module.py",), (), ())
+
+        runner._sync_review_coverage(campaign, review_diff)
+        self.assertEqual(campaign["files_reviewed"], [])
+        self.assertEqual([item["path"] for item in campaign["files_not_reviewed"]], ["src/module.py"])
+
+        campaign["part_reviews"][1]["status"] = "reviewed"
+        runner._sync_review_coverage(campaign, review_diff)
+        self.assertEqual(campaign["files_reviewed"], ["src/module.py"])
+        self.assertEqual(campaign["files_not_reviewed"], [])
+
+    def test_part_report_requires_each_assigned_file_in_files_reviewed_section(self):
+        segments = [
+            orchestrator.ReviewSegment("src/first.py", "patch 1", 1, 1, 1, "hash-1"),
+            orchestrator.ReviewSegment("src/second.py", "patch 2", 1, 1, 1, "hash-2"),
+        ]
+        report = (
+            "Decision: APPROVED\nPart ID: part-000001\nFiles reviewed:\n- `src/first.py`\n"
+            "Findings:\n- **Severity:** Optional improvement\n- **Category:** Design\n"
+            "- **File/location:** src/second.py\n- **Description:** Consider a clearer name.\n"
+            "- **Impact and reasoning:** The second file has an optional naming refinement.\n"
+            "- **Recommended correction:** Rename the helper.\n"
+            "Cross-component concerns:\n- None\nOverall assessment: adequate."
+        )
+
+        self.assertFalse(orchestrator.Orchestrator._part_report_is_structured(
+            report, "part-000001", segments,
+        ))
+
+    def test_part_report_accepts_all_assigned_files_listed_with_markdown_backticks(self):
+        segments = [
+            orchestrator.ReviewSegment("src/first.py", "patch 1", 1, 1, 1, "hash-1"),
+            orchestrator.ReviewSegment("src/second.py", "patch 2", 1, 1, 1, "hash-2"),
+        ]
+        report = (
+            "Decision: APPROVED\nPart ID: part-000001\n## Files reviewed\n"
+            "- `src/first.py` — complete patch\n- `src/second.py` — complete patch\n"
+            "Findings: None\nCross-component concerns: None\nOverall assessment: adequate."
+        )
+
+        self.assertTrue(orchestrator.Orchestrator._part_report_is_structured(
+            report, "part-000001", segments,
+        ))
+
     def test_failed_review_resume_retries_only_the_failed_stage(self):
         first_codex = FakeCodex("# Proposal\nInitial plan.\n")
         failed_claude = FakeClaude(claude_reviewer.ReviewError("Aily unavailable", cost_usd=0))
@@ -388,6 +1136,33 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(state["authorization"]["claude_aily"]["spent_usd"], 0)
         self.assertEqual(len(claude.prompts), 1)
 
+    def test_unresolved_active_call_blocks_resume_without_resetting_budget(self):
+        codex = FakeCodex("# Proposal\nInitial plan.\n", self.refined())
+        claude = FakeClaude(claude_reviewer.ReviewResult("Plan looks good.", 0.1))
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add a feature", budget_usd=1.0, workflow_id="active-review-call",
+            process_runner=codex, claude_runner=claude,
+        )
+        runner.start()
+        runner.state["status"] = "failed"
+        runner.state["stage"] = "code_review"
+        runner.state["authorization"]["claude_aily"]["active_call"] = {
+            "stage": "code_review", "started_at": "unknown", "cap_usd": 0.9,
+        }
+        runner._save()
+
+        resumed = orchestrator.Orchestrator(
+            self.target, workflow_id="active-review-call", process_runner=codex, claude_runner=claude,
+        )
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "prior Claude call ended without a recorded result"):
+            resumed.resume()
+        persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        authorization = persisted["authorization"]["claude_aily"]
+        self.assertTrue(authorization["budget_unknown"])
+        self.assertIsNone(authorization["active_call"])
+        self.assertEqual(authorization["spent_usd"], 0.1)
+        self.assertEqual(len(claude.prompts), 1)
+
     def test_exhausted_budget_prevents_a_later_paid_review(self):
         codex = FakeCodex(
             "# Proposal\nInitial plan.\n", self.refined(),
@@ -444,15 +1219,78 @@ class WorkflowTests(unittest.TestCase):
         (self.target / "src" / "external.txt").symlink_to(outside)
         state = {"baseline_commit": baseline, "preexisting_paths": ["src/app.py"]}
         packet = orchestrator._review_diff(state, self.target)
-        self.assertIn("No reviewable changes", packet)
-        self.assertNotIn("changed-secret-value", packet)
+        self.assertIn("No reviewable changes", packet.text)
+        self.assertNotIn("changed-secret-value", packet.text)
+        first_exclusions = dict(packet.excluded_files)
+        self.assertEqual(first_exclusions["src/app.py"], "pre-existing target change is protected from review")
+        self.assertEqual(first_exclusions[".env"], "sensitive path is excluded from external review")
+        self.assertIn("src/external.txt", first_exclusions)
 
         state["preexisting_paths"] = []
         packet = orchestrator._review_diff(state, self.target)
-        self.assertIn("[REDACTED]", packet)
-        self.assertNotIn("ghp_123456789012345678901234", packet)
-        self.assertNotIn("changed-secret-value", packet)
-        self.assertNotIn("OUTSIDE_REPOSITORY_SECRET", packet)
+        self.assertIn("[REDACTED]", packet.text)
+        self.assertNotIn("ghp_123456789012345678901234", packet.text)
+        self.assertNotIn("changed-secret-value", packet.text)
+        self.assertNotIn("OUTSIDE_REPOSITORY_SECRET", packet.text)
+        self.assertEqual(packet.included_paths, ("src/app.py",))
+
+    def test_review_diff_filters_metadata_and_binary_but_preserves_relevant_text(self):
+        root_metadata = self.target / ".DS_Store"
+        nested_metadata = self.target / "nested" / "folder" / ".DS_Store"
+        root_metadata.parent.mkdir(parents=True, exist_ok=True)
+        nested_metadata.parent.mkdir(parents=True)
+        root_metadata.write_bytes(b"root metadata")
+        nested_metadata.write_bytes(b"nested metadata")
+        git(self.target, "add", "-f", ".DS_Store", "nested/folder/.DS_Store")
+        git(self.target, "commit", "-q", "-m", "metadata baseline")
+        baseline = git(self.target, "rev-parse", "HEAD")
+        root_metadata.write_bytes(b"changed root metadata\x00")
+        nested_metadata.write_bytes(b"changed nested metadata")
+
+        (self.target / "._FinderInfo").write_text("resource fork", encoding="utf-8")
+        (self.target / "Thumbs.db").write_bytes(b"thumbnail cache")
+        (self.target / "__MACOSX").mkdir()
+        (self.target / "__MACOSX" / "._asset").write_bytes(b"resource fork")
+        (self.target / "assets").mkdir()
+        (self.target / "assets" / "image.png").write_bytes(b"\x89PNG\r\n\x1a\nnot a real image")
+        (self.target / "assets" / "opaque.bin").write_bytes(b"plain header\x00binary payload")
+        (self.target / "assets" / "invalid-utf8.bin").write_bytes(b"\xff\xfe\xfd\xfc")
+        (self.target / "assets" / "controls.bin").write_bytes(b"\x01\x02\x03")
+        expected_text = {
+            "src/service.py": "def process(item):\n    return item\n",
+            "tests/test_contract.py": "def test_contract():\n    assert True\n",
+            "docs/api-contract.md": "# API contract\n",
+            "schemas/custom.contract": "job_type: bulk\n",
+        }
+        for relative, content in expected_text.items():
+            path = self.target / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+
+        packet = orchestrator._review_diff(
+            {"baseline_commit": baseline, "preexisting_paths": []}, self.target,
+        )
+        excluded = dict(packet.excluded_files)
+        expected_excluded = {
+            ".DS_Store", "nested/folder/.DS_Store", "._FinderInfo", "Thumbs.db",
+            "__MACOSX/._asset", "assets/image.png", "assets/opaque.bin", "assets/invalid-utf8.bin",
+            "assets/controls.bin",
+        }
+        self.assertEqual(set(excluded), expected_excluded)
+        self.assertEqual(excluded[".DS_Store"], "operating-system metadata")
+        self.assertEqual(excluded["nested/folder/.DS_Store"], "operating-system metadata")
+        self.assertIn("NUL byte", excluded["assets/opaque.bin"])
+        self.assertIn("binary file signature", excluded["assets/image.png"])
+        self.assertIn("UTF-8", excluded["assets/invalid-utf8.bin"])
+        self.assertIn("control bytes", excluded["assets/controls.bin"])
+        self.assertEqual(set(packet.included_paths), set(expected_text))
+        for relative, content in expected_text.items():
+            for line in content.splitlines():
+                self.assertIn(f"+{line}", packet.text)
+        self.assertNotIn("not a real image", packet.text)
+        changed = set(packet.included_paths) | set(excluded)
+        self.assertEqual(changed, set(orchestrator._changed_paths(self.target, baseline)[0]
+                                      + orchestrator._changed_paths(self.target, baseline)[1]))
 
     def test_long_assignment_and_complete_proposal_reach_claude_with_audit_hashes(self):
         task = "# Full assignment\n" + ("requirement detail " * 120) + "\nASSIGNMENT_END_MARKER"
@@ -498,12 +1336,96 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(orchestrator.WorkflowError, "missing mandatory sections"):
             runner._call_claude(header, "plan_review_2", incomplete, metadata=metadata)
         self.assertEqual(len(claude.prompts), 1)
+        self.assertEqual(runner.state["claude_contexts"][-1]["call_state"], "validation_failed")
+
+        nul_context = dict(sections)
+        nul_context["Assignment"] += "\x00hidden"
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "contains a NUL byte"):
+            runner._call_claude(header, "plan_review_2", nul_context, metadata=metadata)
+        self.assertEqual(runner.state["claude_contexts"][-1]["call_state"], "validation_failed")
 
         with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "80"}):
             with self.assertRaisesRegex(orchestrator.WorkflowError, "no paid call was made"):
                 runner._call_claude(header, "plan_review_2", sections, metadata=metadata)
         self.assertEqual(len(claude.prompts), 1)
-        self.assertEqual(len(runner.state["claude_contexts"]), 1)
+        self.assertEqual(len(runner.state["claude_contexts"]), 4)
+        self.assertEqual(
+            [item["call_state"] for item in runner.state["claude_contexts"]],
+            ["completed", "validation_failed", "validation_failed", "validation_failed"],
+        )
+        self.assertEqual(runner.state["authorization"]["claude_aily"]["budget_unknown"], False)
+        self.assertIsNone(runner.state["authorization"]["claude_aily"]["active_call"])
+
+    def test_configured_higher_limit_is_used_for_exact_serialized_payload(self):
+        codex = FakeCodex("# Proposal\nComplete.\n", self.refined())
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Plan looks good.", 0.1),
+            claude_reviewer.ReviewResult("Second review complete.", 0.1),
+        )
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add a feature", budget_usd=1.0, workflow_id="higher-review-limit",
+            process_runner=codex, claude_runner=claude,
+        )
+        runner.start()
+        header, sections, metadata = runner._plan_review_prompt(2)
+        sections["Assignment"] += "é" * 110_000
+        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "120000"}):
+            _report, manifest = runner._call_claude(
+                header, "plan_review_2", sections, metadata=metadata,
+            )
+        submitted = claude.prompts[-1]
+        self.assertGreater(len(submitted), 100_000)
+        self.assertEqual(manifest["characters"], len(submitted))
+        self.assertEqual(manifest["utf8_bytes"], len(submitted.encode("utf-8")))
+        self.assertGreater(manifest["utf8_bytes"], manifest["characters"])
+        self.assertEqual(manifest["payload_limit_characters"], 120_000)
+        self.assertEqual(manifest["prompt_sha256"], hashlib.sha256(submitted.encode("utf-8")).hexdigest())
+
+    def test_validation_failure_can_resume_without_repeating_implementation(self):
+        codex = FakeCodex(
+            "# Proposal\nPlan.\n", self.refined(), "Implementation complete.\n",
+        )
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Plan looks good.", 0.1),
+            claude_reviewer.ReviewResult("Decision: APPROVED\nNo actionable findings.", 0.1),
+        )
+        (self.target / "src").mkdir()
+        codex.on_call = lambda index, _command, _kwargs: (
+            (self.target / "src" / "feature.py").write_text("def answer(): return 42\n", encoding="utf-8")
+            if index == 2 else None
+        )
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add a feature", budget_usd=1.0, workflow_id="review-validation-resume",
+            process_runner=codex, claude_runner=claude,
+        )
+        runner.start()
+        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "1000"}):
+            with self.assertRaisesRegex(orchestrator.WorkflowError, "shared code-review context cannot fit"):
+                runner.approve()
+
+        failed = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["stage"], "code_review")
+        self.assertEqual(failed["claude_contexts"][-1]["stage"], "plan_review_1")
+        self.assertNotIn("review_campaign", failed)
+        self.assertFalse(failed["authorization"]["claude_aily"]["budget_unknown"])
+        self.assertIsNone(failed["authorization"]["claude_aily"]["active_call"])
+
+        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "100000"}):
+            resumed = runner.resume()
+        self.assertEqual(resumed["status"], "complete")
+        self.assertEqual(len(codex.commands), 3)
+        self.assertEqual(len(claude.prompts), 2)
+        self.assertEqual([item["stage"] for item in resumed["claude_contexts"]], ["plan_review_1", "code_review"])
+        self.assertEqual(resumed["review_campaign"]["status"], "complete")
+
+    def test_invalid_context_limit_values_are_rejected(self):
+        for value in ("0", "-1", "not-a-number"):
+            with self.subTest(value=value), patch.dict(os.environ, {
+                claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: value,
+            }):
+                with self.assertRaisesRegex(claude_reviewer.ReviewError, "must be a positive integer"):
+                    claude_reviewer.max_review_payload_chars()
 
     def test_revise_invalidates_unverified_legacy_review_and_reuses_iteration(self):
         codex = FakeCodex(
@@ -603,12 +1525,13 @@ class WorkflowTests(unittest.TestCase):
         (self.target / "large.py").write_text(content, encoding="utf-8")
         state = {"baseline_commit": git(self.target, "rev-parse", "HEAD"), "preexisting_paths": []}
         diff = orchestrator._review_diff(state, self.target)
-        self.assertIn(content.rstrip(), diff)
-        self.assertGreater(len(diff), 1200)
-        self.assertNotIn("truncated", diff.lower())
+        self.assertIn("+# complete diff marker", diff.text)
+        self.assertEqual(diff.text.count("+line of relevant code"), 120)
+        self.assertGreater(len(diff.text), 1200)
+        self.assertNotIn("truncated", diff.text.lower())
         with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "100"}):
-            with self.assertRaisesRegex(orchestrator.WorkflowError, "no paid call was made"):
-                orchestrator._review_diff(state, self.target)
+            with self.assertRaisesRegex(claude_reviewer.ReviewError, "no paid call was made"):
+                claude_reviewer.validate_review_payload(diff.text)
 
     def test_redaction_preserves_long_text_and_adapter_refuses_oversize_before_call(self):
         long_context = "context " * 300
@@ -632,6 +1555,10 @@ class WorkflowTests(unittest.TestCase):
         with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "100"}):
             with self.assertRaisesRegex(claude_reviewer.ReviewError, "no paid call was made"):
                 claude_reviewer.review(long_context, budget_usd=0.5, process_runner=process_runner)
+        self.assertFalse(called)
+
+        with self.assertRaisesRegex(claude_reviewer.ReviewError, "contains a NUL byte"):
+            claude_reviewer.review("safe prefix\x00unsafe suffix", budget_usd=0.5, process_runner=process_runner)
         self.assertFalse(called)
 
     def test_aily_adapter_uses_budget_cap_and_isolated_review_directory(self):
