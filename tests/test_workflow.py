@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -639,6 +639,140 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(factory.call_args.kwargs["model"], "codex-model-test")
         self.assertEqual(factory.call_args.kwargs["max_code_review_calls"], 12)
         self.assertIn("Effective Claude/Aily budget: $0.75", output.getvalue())
+
+    def test_cli_dispatches_each_workflow_command_through_runner_methods(self):
+        commands = (
+            ("approve", "approve", []),
+            ("resume", "resume", []),
+            ("status", "status", []),
+            ("revise", "revise", ["--feedback", "Clarify the plan."]),
+            ("reject", "reject", []),
+        )
+        for command, method, extra in commands:
+            with self.subTest(command=command):
+                state = {
+                    "workflow_id": "cli-dispatch", "target": str(self.target),
+                    "status": "rejected" if command == "reject" else "complete",
+                    "stage": command, "authorization": {}, "plan_reviews": [],
+                }
+                output = StringIO()
+                with patch.object(orchestrator, "Orchestrator") as factory, redirect_stdout(output):
+                    getattr(factory.return_value, method).return_value = state
+                    result = orchestrator.main([
+                        command, "--target", str(self.target), "--workflow-id", "cli-dispatch", *extra,
+                    ])
+                self.assertEqual(result, 0)
+                getattr(factory.return_value, method).assert_called_once()
+                summary = json.loads(output.getvalue())
+                self.assertEqual(summary["workflow_id"], "cli-dispatch")
+                self.assertIn("claude_contexts", summary)
+
+    def test_cli_reads_task_and_feedback_files_and_reports_missing_files(self):
+        task_file = self.root / "assignment.md"
+        task_file.write_text("Implement from this task file.\n", encoding="utf-8")
+        feedback_file = self.root / "feedback.md"
+        feedback_file.write_text("Clarify the acceptance criteria.\n", encoding="utf-8")
+        state = {
+            "workflow_id": "cli-files", "target": str(self.target),
+            "status": "awaiting_approval", "authorization": {}, "plan_reviews": [],
+        }
+        output = StringIO()
+        with patch.object(orchestrator, "Orchestrator") as factory, redirect_stdout(output):
+            factory.return_value.budget_usd = 2.0
+            factory.return_value.max_code_review_calls = orchestrator.DEFAULT_MAX_CODE_REVIEW_CALLS
+            factory.return_value.start.return_value = state
+            self.assertEqual(orchestrator.main([
+                "start", "--target", str(self.target), "--task-file", str(task_file),
+            ]), 0)
+        self.assertEqual(factory.call_args.kwargs["task"], "Implement from this task file.\n")
+
+        with patch.object(orchestrator, "Orchestrator") as factory, redirect_stdout(StringIO()):
+            factory.return_value.revise.return_value = state
+            self.assertEqual(orchestrator.main([
+                "revise", "--target", str(self.target), "--workflow-id", "cli-files",
+                "--feedback-file", str(feedback_file),
+            ]), 0)
+        factory.return_value.revise.assert_called_once_with("Clarify the acceptance criteria.\n")
+
+        errors = StringIO()
+        with patch.object(orchestrator, "Orchestrator"), redirect_stderr(errors):
+            result = orchestrator.main([
+                "revise", "--target", str(self.target), "--workflow-id", "cli-files",
+                "--feedback-file", str(self.root / "missing-feedback.md"),
+            ])
+        self.assertEqual(result, 2)
+        self.assertIn("Could not read feedback file", errors.getvalue())
+
+        errors = StringIO()
+        with patch.object(orchestrator, "Orchestrator"), redirect_stderr(errors):
+            result = orchestrator.main([
+                "start", "--target", str(self.target), "--task-file", str(self.root / "missing-task.md"),
+            ])
+        self.assertEqual(result, 2)
+        self.assertIn("Could not read task file", errors.getvalue())
+
+    def test_cli_argument_requirements_and_direct_entrypoint_help(self):
+        errors = StringIO()
+        with redirect_stderr(errors), self.assertRaises(SystemExit) as missing_task:
+            orchestrator.main(["start", "--target", str(self.target)])
+        self.assertEqual(missing_task.exception.code, 2)
+
+        errors = StringIO()
+        with redirect_stderr(errors), self.assertRaises(SystemExit) as conflicting_task:
+            orchestrator.main([
+                "start", "--target", str(self.target), "--task", "inline",
+                "--task-file", str(self.root / "assignment.md"),
+            ])
+        self.assertEqual(conflicting_task.exception.code, 2)
+
+        errors = StringIO()
+        with redirect_stderr(errors), self.assertRaises(SystemExit) as missing_feedback:
+            orchestrator.main(["revise", "--target", str(self.target), "--workflow-id", "cli-revise"])
+        self.assertEqual(missing_feedback.exception.code, 2)
+
+        errors = StringIO()
+        with redirect_stderr(errors), self.assertRaises(SystemExit) as conflicting_feedback:
+            orchestrator.main([
+                "revise", "--target", str(self.target), "--workflow-id", "cli-revise",
+                "--feedback", "inline", "--feedback-file", str(self.root / "feedback.md"),
+            ])
+        self.assertEqual(conflicting_feedback.exception.code, 2)
+
+        errors = StringIO()
+        with redirect_stderr(errors), self.assertRaises(SystemExit) as invalid_limit:
+            orchestrator.main([
+                "start", "--target", str(self.target), "--task", "inline",
+                "--max-code-review-calls", "0",
+            ])
+        self.assertEqual(invalid_limit.exception.code, 2)
+
+        script = ROOT / "harness" / "orchestrator.py"
+        help_result = subprocess.run(
+            [sys.executable, str(script), "--help"], cwd=ROOT,
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        for command in ("start", "approve", "resume", "status", "recover-review", "revise", "reject"):
+            self.assertIn(command, help_result.stdout)
+            command_help = subprocess.run(
+                [sys.executable, str(script), command, "--help"], cwd=ROOT,
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(command_help.returncode, 0, command_help.stderr)
+
+    def test_cli_redacts_errors_and_preserves_error_exit_code(self):
+        secret = "api_key=very-secret-value"
+        errors = StringIO()
+        with patch.object(orchestrator, "Orchestrator") as factory, redirect_stderr(errors):
+            factory.return_value.budget_usd = 2.0
+            factory.return_value.max_code_review_calls = orchestrator.DEFAULT_MAX_CODE_REVIEW_CALLS
+            factory.return_value.start.side_effect = orchestrator.WorkflowError(f"failed with {secret}")
+            result = orchestrator.main([
+                "start", "--target", str(self.target), "--task", "Add a feature",
+            ])
+        self.assertEqual(result, 2)
+        self.assertNotIn(secret, errors.getvalue())
+        self.assertIn("[REDACTED]", errors.getvalue())
 
     def test_plan_is_saved_and_implementation_waits_for_explicit_approval(self):
         codex = FakeCodex(
