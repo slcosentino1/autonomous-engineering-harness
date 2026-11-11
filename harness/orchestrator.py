@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from collections import Counter
 from datetime import datetime, timezone
@@ -28,6 +29,14 @@ else:
     import fcntl
 
 import claude_reviewer
+from observability.tracer import (
+    OBSERVABILITY_PERMITTED_DATA,
+    OBSERVABILITY_SCOPE_VERSION,
+    NoOpTracer,
+    isolated_context,
+    observability_scope,
+    safe_workflow_reference,
+)
 from workflow import cli as _cli
 from workflow import persistence as _persistence
 from workflow import workspace as _workspace
@@ -71,6 +80,10 @@ DEFAULT_MAX_CODE_REVIEW_CALLS = _cli.DEFAULT_MAX_CODE_REVIEW_CALLS
 MAX_AUTHORIZED_CODE_REVIEW_CALLS = 64
 MAX_PLANNING_FAILURE_OUTPUT_CHARS = 50_000
 MAX_PLANNING_FAILURE_RECORDS = 3
+TRACE_STAGES = frozenset({
+    "planning", "plan_review_1", "plan_review_2", "plan_refine_1", "plan_refine_2",
+    "human_revision", "implementation", "code_review", "correction", "complete",
+})
 CODEX_EXECUTABLE = _cli.CODEX_EXECUTABLE
 PLANNING_PRINCIPLES = """Engineering Judgment & Proportional Design
 1. Explicit requirements take priority over technical recommendations.
@@ -580,6 +593,7 @@ def _clearly_no_review_findings(report: str) -> bool:
 def new_workflow_authorization(
     target: Path, workflow_id: str, budget_usd: float,
     max_code_review_calls: int = DEFAULT_MAX_CODE_REVIEW_CALLS,
+    tracing_enabled: bool = False,
 ) -> dict:
     """Create the single persistent authorization attached to a new workflow."""
     if (isinstance(max_code_review_calls, bool) or not isinstance(max_code_review_calls, int)
@@ -609,6 +623,7 @@ def new_workflow_authorization(
             "budget_unknown": False,
             "active_call": None,
         },
+        "observability": observability_scope(tracing_enabled),
         "restricted_operations": RESTRICTED_OPERATIONS.copy(),
     }
     authorization["scope_sha256"] = authorization_scope_digest(authorization)
@@ -637,6 +652,22 @@ def validate_workflow_authorization(state: dict, target: Path, workflow_id: str)
         raise WorkflowError("Saved Codex authorization is missing, changed, or broader than the supported stages.")
     if authorization.get("restricted_operations") != RESTRICTED_OPERATIONS:
         raise WorkflowError("Saved protected-operation boundaries are missing or changed.")
+    observability = authorization.get("observability")
+    if observability is not None:
+        enabled = observability.get("enabled") if isinstance(observability, dict) else None
+        endpoint_hash = observability.get("langfuse_base_url_sha256") if isinstance(observability, dict) else None
+        valid_endpoint_hash = (
+            isinstance(endpoint_hash, str) and re.fullmatch(r"[a-f0-9]{64}", endpoint_hash)
+            if enabled is True else endpoint_hash is None
+        )
+        if (not isinstance(observability, dict)
+                or set(observability) != {"version", "enabled", "permitted_data", "langfuse_base_url_sha256"}
+                or type(observability.get("version")) is not int
+                or observability.get("version") != OBSERVABILITY_SCOPE_VERSION
+                or type(enabled) is not bool
+                or observability.get("permitted_data") != OBSERVABILITY_PERMITTED_DATA
+                or not valid_endpoint_hash):
+            raise WorkflowError("Saved observability scope is invalid or changed.")
     external = authorization.get("claude_aily")
     if not isinstance(external, dict):
         raise WorkflowError("Saved Claude/Aily authorization is missing.")
@@ -690,6 +721,7 @@ class Orchestrator:
         timeout_seconds: int = 3600,
         process_runner: Callable = subprocess.run,
         claude_runner: Callable = claude_reviewer.review,
+        tracing_enabled: bool = False,
     ):
         if (isinstance(max_code_review_calls, bool) or not isinstance(max_code_review_calls, int)
                 or not 1 <= max_code_review_calls <= MAX_AUTHORIZED_CODE_REVIEW_CALLS):
@@ -709,6 +741,10 @@ class Orchestrator:
         self.timeout_seconds = timeout_seconds
         self.process_runner = process_runner
         self.claude_runner = claude_runner
+        self.tracing_enabled = bool(tracing_enabled)
+        self._tracer = None
+        self._active_trace_context = None
+        self._trace_started_at: float | None = None
         self.workflow_dir = _check_plain_directories(self.target, f"{WORKFLOW_ROOT}/{self.workflow_id}")
         self.state_path = self.workflow_dir / "state.json"
         self.proposal_path = self.workflow_dir / "proposal.md"
@@ -805,8 +841,7 @@ class Orchestrator:
         return clean_markdown(proposal)
 
     def start(self) -> dict:
-        with self._workflow_lock():
-            return self._start_locked()
+        return self._execute_locked(self._start_locked)
 
     def _start_locked(self) -> dict:
         if not self.task or not self.task.strip():
@@ -847,6 +882,7 @@ class Orchestrator:
             "planning_validation_failure_history_truncated": False,
             "authorization": new_workflow_authorization(
                 self.target, self.workflow_id, float(budget), self.max_code_review_calls,
+                tracing_enabled=self.tracing_enabled,
             ),
             "plan_reviews": [],
             "claude_contexts": [],
@@ -862,11 +898,11 @@ class Orchestrator:
             "error": None,
         }
         self._save()
+        self._begin_execution_trace("start")
         return self.run_pending()
 
     def approve(self) -> dict:
-        with self._workflow_lock():
-            return self._approve_locked()
+        return self._execute_locked(self._approve_locked)
 
     def _approve_locked(self) -> dict:
         self._load()
@@ -875,6 +911,7 @@ class Orchestrator:
         current_proposal = self._read_proposal()
         if current_proposal != clean_markdown(self.state.get("proposal", "")):
             raise WorkflowError("The proposal file changed after review; use revise to review the change before approval.")
+        self._begin_execution_trace("approve")
         self.state["implementation_approved_at"] = {"time": now(), "method": "explicit approve command"}
         self.state["status"] = "running"
         self.state["stage"] = "implementation"
@@ -883,8 +920,7 @@ class Orchestrator:
         return self.run_pending()
 
     def revise(self, feedback: str) -> dict:
-        with self._workflow_lock():
-            return self._revise_locked(feedback)
+        return self._execute_locked(lambda: self._revise_locked(feedback))
 
     def _revise_locked(self, feedback: str) -> dict:
         self._load()
@@ -892,6 +928,7 @@ class Orchestrator:
             raise WorkflowError("This workflow is not waiting for proposal feedback.")
         if not feedback.strip():
             raise WorkflowError("Proposal feedback must not be empty.")
+        self._begin_execution_trace("revise")
         self._invalidate_unverified_plan_reviews()
         self.state["proposal"] = self._read_proposal()
         self.state["proposal_version"] = max(1, int(self.state.get("proposal_version", 1)))
@@ -927,13 +964,13 @@ class Orchestrator:
         return self.state.get("project_guidance") or _project_guidance(self.target, self.state["task"])
 
     def reject(self, reason: str) -> dict:
-        with self._workflow_lock():
-            return self._reject_locked(reason)
+        return self._execute_locked(lambda: self._reject_locked(reason))
 
     def _reject_locked(self, reason: str) -> dict:
         self._load()
         if self.state.get("status") != "awaiting_approval":
             raise WorkflowError("This workflow is not waiting for a proposal decision.")
+        self._begin_execution_trace("reject")
         self.state["status"] = "rejected"
         self.state["rejection_reason"] = reason.strip() or "Rejected by the user."
         self.state["completed_at"] = now()
@@ -941,8 +978,7 @@ class Orchestrator:
         return self.state
 
     def resume(self) -> dict:
-        with self._workflow_lock():
-            return self._resume_locked()
+        return self._execute_locked(self._resume_locked)
 
     def _resume_locked(self) -> dict:
         self._load()
@@ -956,16 +992,97 @@ class Orchestrator:
         if (authorization["claude_aily"]["budget_unknown"]
                 and self.state.get("stage", "").startswith(("plan_review", "code_review"))):
             raise WorkflowError(self.state.get("error") or "Claude review stopped because spend is unknown.")
+        self._begin_execution_trace("resume")
         self.state["status"] = "running"
         self.state["error"] = None
         self._save()
         return self.run_pending()
+
+    def _execute_locked(self, operation: Callable[[], dict]) -> dict:
+        try:
+            with self._workflow_lock():
+                result = operation()
+        except BaseException as exc:
+            self._finish_execution_trace(exc)
+            raise
+        self._finish_execution_trace(None)
+        return result
+
+    def _begin_execution_trace(self, command: str) -> None:
+        authorization = self.state.get("authorization", {})
+        scope = authorization.get("observability", {})
+        if scope.get("enabled") is not True:
+            return
+        try:
+            from observability.langfuse import create_langfuse_tracer
+
+            self._tracer = create_langfuse_tracer(scope)
+            workflow_ref = safe_workflow_reference(self.workflow_id)
+            initial_stage = self.state.get("stage")
+            if not isinstance(initial_stage, str) or initial_stage not in TRACE_STAGES:
+                initial_stage = "unknown"
+            self._trace_started_at = time.monotonic()
+            self._active_trace_context = isolated_context(lambda: self._tracer.execution(
+                name="workflow.execution",
+                session_id=workflow_ref,
+                metadata={
+                    "command": command,
+                    "workflow_ref": workflow_ref,
+                    "initial_stage": initial_stage,
+                },
+            ))
+            self._active_trace_context.__enter__()
+        except Exception:
+            self._tracer = None
+            self._active_trace_context = None
+            self._trace_started_at = None
+            print("Tracing warning: could not initialize tracing; continuing without it.", file=sys.stderr)
+
+    def _trace_span(self, name: str, metadata: dict):
+        tracer = self._tracer or NoOpTracer()
+        return isolated_context(lambda: tracer.span(name=name, metadata=metadata))
+
+    def _finish_execution_trace(self, error: BaseException | None) -> None:
+        context = self._active_trace_context
+        tracer = self._tracer
+        self._active_trace_context = None
+        self._tracer = None
+        started_at = self._trace_started_at
+        self._trace_started_at = None
+        if context is None:
+            return
+        final_stage = self.state.get("stage") if isinstance(self.state, dict) else None
+        final_status = self.state.get("status") if isinstance(self.state, dict) else None
+        if not isinstance(final_stage, str) or final_stage not in TRACE_STAGES:
+            final_stage = "unknown"
+        if final_status not in {"running", "awaiting_approval", "failed", "complete", "rejected"}:
+            final_status = "unknown"
+        duration = max(0, round((time.monotonic() - started_at) * 1000)) if started_at is not None else 0
+        context.update(
+            final_stage=final_stage,
+            final_status=final_status,
+            duration_ms=duration,
+            execution_result="success" if error is None else "failure",
+            **({"error_category": type(error).__name__} if error is not None else {}),
+        )
+        context.__exit__(type(error) if error is not None else None, error, error.__traceback__ if error else None)
+        try:
+            tracer.flush()
+        except Exception:
+            print("Tracing warning: export failed; workflow result is unchanged.", file=sys.stderr)
 
     def status(self) -> dict:
         self._read_state()
         return self.state
 
     def _run_codex(self, prompt: str, *, sandbox: str) -> str:
+        metadata = {"provider": "Codex", "operation": "codex_execution", "sandbox": sandbox}
+        if self.model:
+            metadata["model"] = self.model
+        with self._trace_span("provider.codex", metadata):
+            return self._run_codex_impl(prompt, sandbox=sandbox)
+
+    def _run_codex_impl(self, prompt: str, *, sandbox: str) -> str:
         with tempfile.TemporaryDirectory(prefix="harness-codex-result-") as output_dir:
             output_path = Path(output_dir) / "last-message.md"
             authorization = self.state["authorization"]
@@ -1006,6 +1123,41 @@ class Orchestrator:
             return message
 
     def _call_claude(
+        self,
+        header: str,
+        stage: str,
+        sections: dict[str, str],
+        *,
+        metadata: dict | None = None,
+    ) -> tuple[str, dict]:
+        operation_metadata = {
+            "provider": "Claude_Aily",
+            "operation": "plan_review" if stage.startswith("plan_review_") else "code_review",
+        }
+        if stage.startswith("plan_review_"):
+            operation_metadata["iteration"] = int(stage[-1])
+        if stage == "code_review" and isinstance(metadata, dict):
+            retry_count = metadata.get("retry_count")
+            if isinstance(retry_count, int) and not isinstance(retry_count, bool) and retry_count >= 0:
+                operation_metadata["retry_count"] = retry_count
+            if metadata.get("review_kind") == "integration":
+                operation_metadata["review_kind"] = "integration"
+            else:
+                operation_metadata["review_kind"] = "part"
+                match = re.fullmatch(r"part-(\d+)", str(metadata.get("part_id", "")))
+                if match:
+                    operation_metadata["review_part_index"] = int(match.group(1))
+        with self._trace_span("provider.claude_review", operation_metadata) as span:
+            report, manifest = self._call_claude_impl(header, stage, sections, metadata=metadata)
+            cost = manifest.get("cost_usd") if isinstance(manifest, dict) else None
+            if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0:
+                span.update(reported_cost_usd=float(cost))
+            attempt = manifest.get("campaign_call_number") if isinstance(manifest, dict) else None
+            if isinstance(attempt, int) and not isinstance(attempt, bool) and attempt > 0:
+                span.update(attempt=attempt)
+            return report, manifest
+
+    def _call_claude_impl(
         self,
         header: str,
         stage: str,
@@ -1256,6 +1408,7 @@ class Orchestrator:
             request_review=self._call_claude,
             authorized_call_limit=authorization.get("max_code_reviews"),
             authorize_call_count=self._review_call_count_authorized,
+            trace_span=self._trace_span,
         )
 
     def _review_call_count_authorized(self, required_calls: int) -> bool:
@@ -1343,9 +1496,10 @@ class Orchestrator:
     def _run_review_campaign(
         self, campaign: dict, shared: dict[str, str], parts: list[dict], review_diff: ReviewDiff,
     ) -> str:
-        return self._campaign_helper(lambda: self._review_campaign()._run_review_campaign(
-            campaign, shared, parts, review_diff,
-        ))
+        with self._trace_span("review.campaign", {"review_part_count": len(parts)}):
+            return self._campaign_helper(lambda: self._review_campaign()._run_review_campaign(
+                campaign, shared, parts, review_diff,
+            ))
 
     def _set_stage(self, stage: str) -> None:
         self.state["stage"] = stage
@@ -1363,6 +1517,10 @@ class Orchestrator:
             raise WorkflowError("Workflow execution requires the workflow process lock.")
         while self.state.get("status") == "running":
             stage = self.state["stage"]
+            stage_label = stage if isinstance(stage, str) and stage in TRACE_STAGES else "unknown"
+            stage_started = time.monotonic()
+            stage_context = self._trace_span("workflow.stage", {"stage": stage_label})
+            stage_context.__enter__()
             try:
                 if stage == "planning":
                     guidance = self._guidance()
@@ -1576,6 +1734,9 @@ class Orchestrator:
             except Exception as exc:
                 self._fail(exc)
                 raise WorkflowError(f"Workflow stopped at {stage}: {redact(str(exc))}") from exc
+            finally:
+                stage_context.update(duration_ms=max(0, round((time.monotonic() - stage_started) * 1000)))
+                stage_context.__exit__(*sys.exc_info())
         return self.state
 
     def _repository_context_for_claude(self, guidance: dict, review_paths: list[str] | None = None) -> str:

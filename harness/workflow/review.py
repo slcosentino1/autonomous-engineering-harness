@@ -8,6 +8,7 @@ import json
 import re
 import uuid
 from collections import Counter
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -562,12 +563,22 @@ class ReviewCampaign:
         request_review: Callable[..., tuple[str, dict]] | None = None,
         authorized_call_limit: int | None = None,
         authorize_call_count: Callable[[int], bool] | None = None,
+        trace_span: Callable[[str, dict], object] | None = None,
     ):
         self.state = state
         self._save = save_state
         self._call_claude = request_review
         self.authorized_call_limit = authorized_call_limit
         self._authorize_call_count_callback = authorize_call_count
+        self._trace_span_callback = trace_span
+
+    def _trace_context(self, name: str, metadata: dict):
+        if self._trace_span_callback is None:
+            return nullcontext()
+        try:
+            return self._trace_span_callback(name, metadata)
+        except Exception:
+            return nullcontext()
 
     def _authorize_call_count(self, required_calls: int) -> bool:
         if self._authorize_call_count_callback is None:
@@ -1061,7 +1072,7 @@ class ReviewCampaign:
         self._require_save()
         self._save()
         part_records = {record["part_id"]: record for record in campaign["part_reviews"]}
-        for part in parts:
+        for part_index, part in enumerate(parts, start=1):
             record = part_records[part["part_id"]]
             if record["status"] == "reviewed":
                 continue
@@ -1127,23 +1138,30 @@ class ReviewCampaign:
                 part_id=part["part_id"], excluded_count=len(review_diff.excluded_files),
             )
             patch_hash = _review_patch_sha256(sections["Complete patch"])
+            part_trace = self._trace_context("review.part.provider_call", {
+                "review_part_index": part_index,
+                "review_part_count": len(parts),
+                "retry_count": len(record.get("calls", [])) if isinstance(record.get("calls", []), list) else 0,
+            })
             try:
                 self._require_review_call()
-                report, manifest = self._call_claude(
-                    self._code_review_header(), "code_review", sections,
-                    metadata={
-                        "proposal_version": self.state.get("proposal_version", 1),
-                        "header_id": "code-review-part-v2",
-                        "review_kind": "part",
-                        "campaign_id": campaign["campaign_id"],
-                        "part_id": part["part_id"],
-                        "shared_context_sha256": campaign["shared_context_sha256"],
-                        "part_patch_sha256": patch_hash,
-                        "payload_limit_chars": campaign["payload_limit_characters"],
-                        "included_files": sorted({segment.path for segment in part["segments"]}),
-                        "excluded_files": campaign["excluded_files"],
-                    },
-                )
+                with part_trace:
+                    report, manifest = self._call_claude(
+                        self._code_review_header(), "code_review", sections,
+                        metadata={
+                            "proposal_version": self.state.get("proposal_version", 1),
+                            "header_id": "code-review-part-v2",
+                            "review_kind": "part",
+                            "campaign_id": campaign["campaign_id"],
+                            "part_id": part["part_id"],
+                            "retry_count": len(record.get("calls", [])) if isinstance(record.get("calls", []), list) else 0,
+                            "shared_context_sha256": campaign["shared_context_sha256"],
+                            "part_patch_sha256": patch_hash,
+                            "payload_limit_chars": campaign["payload_limit_characters"],
+                            "included_files": sorted({segment.path for segment in part["segments"]}),
+                            "excluded_files": campaign["excluded_files"],
+                        },
+                    )
             except Exception:
                 context = next((
                     item for item in reversed(self.state.get("claude_contexts", []))
@@ -1187,6 +1205,8 @@ class ReviewCampaign:
             self._sync_review_coverage(campaign, review_diff)
             self._require_save()
             self._save()
+            if hasattr(part_trace, "update"):
+                part_trace.update(review_result=record["status"])
             if record["status"] != "reviewed":
                 raise ReviewCampaignError(
                     f"Claude report for {part['part_id']} is invalid: "
@@ -1282,22 +1302,32 @@ class ReviewCampaign:
                 if integration["status"] != "reviewed":
                     raise ReviewCampaignError("Persisted Claude integration output is not a complete structured report.")
             else:
+                integration_trace = self._trace_context(
+                    "review.integration.provider_call", {
+                        "review_part_count": len(parts),
+                    "retry_count": len(integration.get("calls", []))
+                    if isinstance(integration.get("calls", []), list) else 0,
+                    },
+                )
                 try:
                     self._require_review_call()
-                    report, manifest = self._call_claude(
-                        integration_header, "code_review", integration_sections,
-                        metadata={
-                            "proposal_version": self.state.get("proposal_version", 1),
-                            "header_id": "code-review-integration-v1",
-                            "review_kind": "integration",
-                            "campaign_id": campaign["campaign_id"],
-                            "part_id": "integration",
-                            "shared_context_sha256": campaign["shared_context_sha256"],
-                            "payload_limit_chars": campaign["payload_limit_characters"],
-                            "included_files": campaign["files_reviewed"],
-                            "excluded_files": campaign["excluded_files"],
-                        },
-                    )
+                    with integration_trace:
+                        report, manifest = self._call_claude(
+                            integration_header, "code_review", integration_sections,
+                            metadata={
+                                "proposal_version": self.state.get("proposal_version", 1),
+                                "header_id": "code-review-integration-v1",
+                                "review_kind": "integration",
+                                "campaign_id": campaign["campaign_id"],
+                                "part_id": "integration",
+                                "retry_count": len(integration.get("calls", []))
+                                if isinstance(integration.get("calls", []), list) else 0,
+                                "shared_context_sha256": campaign["shared_context_sha256"],
+                                "payload_limit_chars": campaign["payload_limit_characters"],
+                                "included_files": campaign["files_reviewed"],
+                                "excluded_files": campaign["excluded_files"],
+                            },
+                        )
                 except Exception:
                     context = next((
                         item for item in reversed(self.state.get("claude_contexts", []))
@@ -1333,6 +1363,8 @@ class ReviewCampaign:
                 )
                 self._require_save()
                 self._save()
+                if hasattr(integration_trace, "update"):
+                    integration_trace.update(review_result=integration["status"])
                 if integration["status"] != "reviewed":
                     raise ReviewCampaignError(
                         "Claude returned an incomplete integration report; campaign remains incomplete."

@@ -1,0 +1,2 @@
+# Optional dependency for --trace / HARNESS_TRACING_ENABLED=true.
+langfuse==4.18.0

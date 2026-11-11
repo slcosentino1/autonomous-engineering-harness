@@ -9,7 +9,7 @@ A small Python workflow that plans an assignment, waits for approval, implements
 - Aily CLI (`aily`) for Claude plan and code reviews
 - A Git target repository
 
-The harness has no Python package dependencies.
+The harness has no required Python package dependencies. Optional Langfuse tracing uses the pinned official SDK in [`requirements-tracing.txt`](requirements-tracing.txt).
 
 ## Workflow
 
@@ -37,6 +37,14 @@ python3 /path/to/autonomous-engineering-harness/harness/orchestrator.py start \
 ```
 
 For example, `--budget-usd 0.75` overrides the budget, and `--model MODEL_NAME` selects a Codex model explicitly. The selected model is saved with the workflow and reused on approval/resume. If omitted, no `--model` argument is passed to Codex.
+
+## Optional Langfuse tracing
+
+Tracing is disabled by default. Enable it for a new workflow with `start --trace` or set `HARNESS_TRACING_ENABLED=true` before `start`; either setting enables tracing. Credentials come from `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY`; `LANGFUSE_BASE_URL` is optional and defaults to `https://cloud.langfuse.com`.
+
+Install the optional SDK with `python3 -m pip install -r requirements-tracing.txt`. Missing credentials or the SDK produce a sanitized warning and the workflow continues without exporting traces. Langfuse events contain operational metadata only: workflow command and pseudonymous reference, stage/provider/operation, configured model when safe to record, duration, status, review-part index/count, and provider cost already reported by the harness. Prompts, assignments, feedback, source, diffs, reports, CLI output, secrets, and filesystem paths are not sent.
+
+The authorization saved at `start` records whether tracing is enabled, its fixed metadata scope, and a hash of the authorized Langfuse endpoint. It never stores credentials. Approval, revision, and resume reuse that saved setting and endpoint; older workflows without an observability scope remain tracing-disabled. Trace data is buffered locally while the workflow lock is held and exported only after the operation releases the lock. Langfuse initialization, export, and shutdown failures do not affect workflow results.
 
 The workflow prints its ID and proposal path. Review the proposal, then explicitly approve it:
 

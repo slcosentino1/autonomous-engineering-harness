@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Callable
 
 import claude_reviewer
+from observability.tracer import tracing_enabled_from_environment
 from workflow.review import _validated_campaign_reports, render_review_feedback
 
 
@@ -126,6 +127,7 @@ def main(
     start.add_argument("--codex", default=CODEX_EXECUTABLE)
     start.add_argument("--aily", default=claude_reviewer.AILY_EXECUTABLE)
     start.add_argument("--model", help="Optional Codex model; omit to use the CLI's configured default")
+    start.add_argument("--trace", action="store_true", help="Enable metadata-only Langfuse tracing for this workflow")
 
     for name, help_text in (
         ("approve", "Explicitly approve the saved proposal and start implementation"),
@@ -169,6 +171,7 @@ def main(
                 args.target, task=task_text(args, workflow_error=workflow_error),
                 budget_usd=args.budget_usd, max_code_review_calls=args.max_code_review_calls,
                 workflow_id=args.workflow_id, codex=args.codex, aily=args.aily, model=args.model,
+                tracing_enabled=args.trace or tracing_enabled_from_environment(),
             )
             print(f"Effective Claude/Aily budget: ${runner.budget_usd:.2f}")
             print(f"Authorized Claude code-review campaign calls: {runner.max_code_review_calls}")
