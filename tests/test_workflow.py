@@ -290,6 +290,64 @@ class ReviewContractExtractionTests(unittest.TestCase):
             orchestrator.Orchestrator._validate_review_partition(review_diff, parts)
 
 
+class ReviewCampaignBoundaryTests(unittest.TestCase):
+    def test_campaign_runs_through_state_and_provider_callbacks_without_orchestrator(self):
+        patch = "diff --git a/src/feature.py b/src/feature.py\n+value = 1\n"
+        segment = review_contracts.ReviewSegment(
+            "src/feature.py", patch, 1, 1, 1, review_contracts._review_patch_sha256(patch),
+        )
+        review_diff = review_contracts.ReviewDiff(
+            patch, (segment.path,), (), ((segment.path, patch),),
+        )
+        part = {"part_id": "part-000001", "segments": [segment]}
+        campaign = {
+            "campaign_id": "callback-campaign",
+            "status": "planned",
+            "shared_context_sha256": "shared-hash",
+            "payload_limit_characters": 10000,
+            "parts": review_contracts.ReviewCampaign._campaign_part_manifest([part]),
+            "part_reviews": [{"part_id": part["part_id"], "status": "pending", "report": None, "calls": []}],
+            "integration_review": {"required": False, "status": "not_required", "report": None, "calls": []},
+            "files_reviewed": [],
+            "files_not_reviewed": [{"path": segment.path, "reason": "pending"}],
+            "excluded_files": [],
+        }
+        state = {"review_campaign": campaign, "claude_contexts": [], "proposal_version": 1}
+        report = (
+            "Decision: APPROVED\nPart ID: part-000001\n\n"
+            "## Files reviewed\n- `src/feature.py`\n\n"
+            "## Findings\nNone\n\n"
+            "## Cross-component concerns\nNone\n\n"
+            "## Overall assessment\nThe changed file was reviewed."
+        )
+        saves = []
+        calls = []
+
+        def request_review(header, stage, sections, *, metadata):
+            calls.append((header, stage, sections, metadata))
+            return report, {
+                "prompt_sha256": "prompt-hash", "cost_usd": 0.05, "call_state": "completed",
+                "campaign_call_number": 1,
+            }
+
+        campaign_ops = review_contracts.ReviewCampaign(
+            state,
+            save_state=lambda: saves.append("saved"),
+            request_review=request_review,
+        )
+
+        result = campaign_ops._run_review_campaign(
+            campaign, {"Assignment": "Review this change"}, [part], review_diff,
+        )
+
+        self.assertEqual(result, report)
+        self.assertEqual(campaign["status"], "complete")
+        self.assertEqual(campaign["files_reviewed"], [segment.path])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1], "code_review")
+        self.assertGreater(len(saves), 1)
+
+
 class WorkspaceModuleTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="workspace-module-tests-")
