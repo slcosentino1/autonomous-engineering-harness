@@ -21,6 +21,7 @@ sys.path.insert(0, str(ROOT / "harness"))
 
 import claude_reviewer  # noqa: E402
 import orchestrator  # noqa: E402
+from workflow import review as review_contracts  # noqa: E402
 
 
 def git(root: Path, *args: str) -> str:
@@ -262,6 +263,29 @@ class PartReviewParserTests(unittest.TestCase):
         for expected in ("Non-blocking findings", "src/first.py:12", "Accepted jobs would remain queued",
                          "Catch and log", "Positive observation", "no runtime test", "Original reviewer reports"):
             self.assertIn(expected, rendered)
+
+
+class ReviewContractExtractionTests(unittest.TestCase):
+    def test_orchestrator_reexports_review_contracts_for_compatibility(self):
+        self.assertIs(orchestrator.ReviewDiff, review_contracts.ReviewDiff)
+        self.assertIs(orchestrator.ReviewSegment, review_contracts.ReviewSegment)
+        self.assertIs(orchestrator.parse_part_review_report, review_contracts.parse_part_review_report)
+        self.assertIs(orchestrator.render_review_feedback, review_contracts.render_review_feedback)
+
+    def test_partition_validation_keeps_workflow_error_and_message(self):
+        patch = "first line\nsecond line\n"
+        segment_text = "first line\n"
+        segment = review_contracts.ReviewSegment(
+            "src/module.py", segment_text, 1, 1, 2, review_contracts._review_patch_sha256(segment_text),
+        )
+        review_diff = review_contracts.ReviewDiff(
+            patch, ("src/module.py",), (), (("src/module.py", patch),),
+        )
+        parts = [{"part_id": "part-000001", "segments": [segment]}]
+        expected = "Review partition does not cover the complete changed file patch: src/module.py."
+        self.assertEqual(review_contracts._review_partition_error(review_diff, parts), expected)
+        with self.assertRaisesRegex(orchestrator.WorkflowError, expected.replace(".", r"\.")):
+            orchestrator.Orchestrator._validate_review_partition(review_diff, parts)
 
 
 class WorkflowTests(unittest.TestCase):
