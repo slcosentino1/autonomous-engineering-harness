@@ -167,6 +167,13 @@ def main(
     args = parser.parse_args(argv)
     try:
         if args.command == "start":
+            if args.trace:
+                from observability.langfuse import LangfusePreflightError, preflight_langfuse_tracing
+
+                try:
+                    preflight_langfuse_tracing()
+                except LangfusePreflightError as exc:
+                    raise workflow_error(str(exc)) from exc
             runner = runner_factory(
                 args.target, task=task_text(args, workflow_error=workflow_error),
                 budget_usd=args.budget_usd, max_code_review_calls=args.max_code_review_calls,

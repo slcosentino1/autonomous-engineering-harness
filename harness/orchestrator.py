@@ -817,11 +817,20 @@ class Orchestrator:
 
         return validate_workflow_authorization(self.state, self.target, self.workflow_id)
 
-    def _load(self) -> None:
+    def _load(self, *, preflight_tracing: bool = False) -> None:
         """Load state for a locked mutation, recovering only a truly ownerless call."""
         if not self._process_lock_held:
             raise WorkflowError("Workflow state recovery requires the workflow process lock.")
         authorization = self._read_state()
+        observability = authorization.get("observability")
+        if (preflight_tracing and isinstance(observability, dict)
+                and observability.get("enabled") is True):
+            from observability.langfuse import LangfusePreflightError, preflight_langfuse_tracing
+
+            try:
+                preflight_langfuse_tracing()
+            except LangfusePreflightError as exc:
+                raise WorkflowError(str(exc)) from exc
         external = authorization["claude_aily"]
         if external.get("active_call"):
             external["budget_unknown"] = True
@@ -905,7 +914,7 @@ class Orchestrator:
         return self._execute_locked(self._approve_locked)
 
     def _approve_locked(self) -> dict:
-        self._load()
+        self._load(preflight_tracing=True)
         if self.state.get("status") != "awaiting_approval":
             raise WorkflowError("This workflow is not waiting for implementation approval.")
         current_proposal = self._read_proposal()
@@ -923,7 +932,7 @@ class Orchestrator:
         return self._execute_locked(lambda: self._revise_locked(feedback))
 
     def _revise_locked(self, feedback: str) -> dict:
-        self._load()
+        self._load(preflight_tracing=True)
         if self.state.get("status") != "awaiting_approval":
             raise WorkflowError("This workflow is not waiting for proposal feedback.")
         if not feedback.strip():
@@ -981,7 +990,7 @@ class Orchestrator:
         return self._execute_locked(self._resume_locked)
 
     def _resume_locked(self) -> dict:
-        self._load()
+        self._load(preflight_tracing=True)
         if self.state.get("status") == "awaiting_approval":
             return self.state
         if self.state.get("status") == "complete":

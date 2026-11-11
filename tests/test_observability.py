@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import os
+import json
+import subprocess
 import sys
+import tempfile
 import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from io import StringIO
@@ -35,6 +38,9 @@ class FakeRunner:
     def start(self):
         return {"workflow_id": "trace-test", "status": "awaiting_approval", "stage": "implementation"}
 
+    def status(self):
+        return {"workflow_id": "trace-test", "status": "awaiting_approval", "stage": "implementation"}
+
 
 class FakeClient:
     def __init__(self):
@@ -60,6 +66,68 @@ class FakeClient:
 
 
 class ObservabilityTests(unittest.TestCase):
+    @staticmethod
+    def _make_target(path: Path) -> Path:
+        path.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(path)], check=True)
+        subprocess.run(["git", "-C", str(path), "config", "user.name", "Harness Test"], check=True)
+        subprocess.run(["git", "-C", str(path), "config", "user.email", "harness-test@example.invalid"], check=True)
+        (path / "README.md").write_text("test target\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(path), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(path), "commit", "-q", "-m", "baseline"], check=True)
+        return path
+
+    @staticmethod
+    def _saved_runner(
+        target: Path,
+        workflow_id: str,
+        *,
+        status: str = "awaiting_approval",
+        stage: str = "implementation",
+        tracing_enabled: bool = True,
+        legacy_scope: bool = False,
+    ):
+        runner = orchestrator.Orchestrator(target, workflow_id=workflow_id)
+        runner.workflow_dir.mkdir(parents=True)
+        authorization = orchestrator.new_workflow_authorization(
+            target.resolve(), workflow_id, 2.0, tracing_enabled=tracing_enabled,
+        )
+        if legacy_scope:
+            authorization.pop("observability")
+            authorization["scope_sha256"] = orchestrator.authorization_scope_digest(authorization)
+        proposal = "# Proposal\n\nA saved proposal for this test.\n"
+        state = {
+            "version": 1,
+            "workflow_id": workflow_id,
+            "target": str(target.resolve()),
+            "task": "test task",
+            "status": status,
+            "stage": stage,
+            "proposal": proposal,
+            "proposal_version": 1,
+            "project_guidance": {},
+            "plan_reviews": [],
+            "authorization": authorization,
+        }
+        runner.state_path.write_text(json.dumps(state), encoding="utf-8")
+        runner.proposal_path.write_text(proposal, encoding="utf-8")
+        return runner, state
+
+    @staticmethod
+    def _run_cli(command, runner):
+        args = [command, "--target", str(runner.target), "--workflow-id", runner.workflow_id]
+        if command == "revise":
+            args.extend(["--feedback", "Clarify the proposal."])
+        with redirect_stdout(StringIO()):
+            return cli.main(
+                args,
+                runner_factory=lambda *_args, **_kwargs: runner,
+                recover_review=lambda *_args, **_kwargs: {"errors": []},
+                workflow_error=orchestrator.WorkflowError,
+                workflow_root=".engineering/workflows",
+                max_authorized_code_review_calls=64,
+            )
+
     def test_tracing_is_disabled_by_default_and_environment_is_explicit(self):
         self.assertFalse(tracing_enabled_from_environment({}))
         self.assertFalse(tracing_enabled_from_environment({"HARNESS_TRACING_ENABLED": "false"}))
@@ -67,6 +135,18 @@ class ObservabilityTests(unittest.TestCase):
         self.assertTrue(tracing_enabled_from_environment({"HARNESS_TRACING_ENABLED": "1"}))
 
     def test_cli_trace_flag_and_environment_enable_only_new_starts(self):
+        imports = []
+        initialization_commands = []
+
+        class ReadySDK:
+            @staticmethod
+            def Langfuse(**_kwargs):
+                return FakeClient()
+
+            @staticmethod
+            def propagate_attributes(**_kwargs):
+                raise AssertionError("preflight must not send or create a trace")
+
         def run(args, environ):
             created = []
 
@@ -75,7 +155,33 @@ class ObservabilityTests(unittest.TestCase):
                 created.append(runner)
                 return runner
 
-            with patch.dict(os.environ, environ, clear=True):
+            configured = dict(environ)
+            explicit_trace = "--trace" in args
+            if explicit_trace:
+                configured.setdefault("LANGFUSE_PUBLIC_KEY", "public")
+                configured.setdefault("LANGFUSE_SECRET_KEY", "secret")
+            if explicit_trace:
+                importer = patch.object(
+                    langfuse.importlib, "import_module",
+                    side_effect=lambda name: (imports.append(name), ReadySDK())[1],
+                )
+                initialize = patch.object(
+                    langfuse.subprocess,
+                    "run",
+                    side_effect=lambda command, **_kwargs: (
+                        initialization_commands.append(command),
+                        type("Result", (), {"returncode": 0})(),
+                    )[1],
+                )
+            else:
+                importer = patch.object(
+                    langfuse.importlib, "import_module",
+                    side_effect=AssertionError("unexpected SDK check"),
+                )
+                initialize = patch.object(
+                    langfuse.subprocess, "run", side_effect=AssertionError("unexpected client initialization"),
+                )
+            with patch.dict(os.environ, configured, clear=True), importer, initialize:
                 with redirect_stdout(StringIO()):
                     result = cli.main(
                         ["start", "--target", "/tmp/target", "--task", "safe task", *args],
@@ -91,6 +197,274 @@ class ObservabilityTests(unittest.TestCase):
         self.assertTrue(run(["--trace"], {}).tracing_enabled)
         self.assertTrue(run([], {"HARNESS_TRACING_ENABLED": "true"}).tracing_enabled)
         self.assertFalse(run([], {"LANGFUSE_PUBLIC_KEY": "present", "LANGFUSE_SECRET_KEY": "present"}).tracing_enabled)
+        self.assertEqual(imports, ["langfuse"])
+        self.assertEqual(initialization_commands[0][0], sys.executable)
+        self.assertIn("-c", initialization_commands[0])
+
+    def test_cli_status_never_runs_langfuse_preflight(self):
+        with patch.dict(os.environ, {"HARNESS_TRACING_ENABLED": "true"}, clear=True):
+            with patch.object(langfuse.importlib, "import_module", side_effect=AssertionError("unexpected SDK check")):
+                with redirect_stdout(StringIO()):
+                    result = cli.main(
+                        ["status", "--target", "/tmp/target", "--workflow-id", "trace-test"],
+                        runner_factory=FakeRunner,
+                        recover_review=lambda *_args, **_kwargs: {},
+                        workflow_error=RuntimeError,
+                        workflow_root=".engineering/workflows",
+                        max_authorized_code_review_calls=64,
+                    )
+        self.assertEqual(result, 0)
+
+    def test_saved_tracing_preflight_runs_for_approve_resume_and_revise_before_execution(self):
+        events = []
+        with tempfile.TemporaryDirectory(prefix="harness-tracing-preflight-") as temp:
+            target = self._make_target(Path(temp) / "target")
+            for command in ("approve", "resume", "revise"):
+                status = "failed" if command == "resume" else "awaiting_approval"
+                stage = "implementation" if command == "resume" else "implementation"
+                runner, _state = self._saved_runner(
+                    target, f"trace-{command}", status=status, stage=stage, tracing_enabled=True,
+                )
+
+                def execute(runner=runner):
+                    events.append("workflow_execution")
+                    runner.state["status"] = "awaiting_approval"
+                    return runner.state
+
+                runner.run_pending = execute
+                runner._begin_execution_trace = lambda _command: events.append("begin_trace")
+                with patch.dict(os.environ, {}, clear=True), \
+                        patch.object(langfuse, "preflight_langfuse_tracing",
+                                     side_effect=lambda: events.append("preflight")), \
+                        patch("orchestrator._project_guidance", return_value={}):
+                    result = self._run_cli(command, runner)
+                self.assertEqual(result, 0)
+                self.assertEqual(events, ["preflight", "begin_trace", "workflow_execution"])
+                events.clear()
+
+    def test_disabled_and_legacy_saved_workflows_do_not_preflight(self):
+        with tempfile.TemporaryDirectory(prefix="harness-tracing-disabled-") as temp:
+            target = self._make_target(Path(temp) / "target")
+            cases = (
+                ("approve", False, False), ("resume", False, False), ("revise", False, False),
+                ("approve", True, True), ("resume", True, True), ("revise", True, True),
+            )
+            for index, (command, enabled, legacy) in enumerate(cases):
+                status = "failed" if command == "resume" else "awaiting_approval"
+                runner, _state = self._saved_runner(
+                    target, f"no-trace-{index}", status=status, tracing_enabled=enabled, legacy_scope=legacy,
+                )
+                execution = []
+
+                def execute(runner=runner):
+                    execution.append(True)
+                    runner.state["status"] = "awaiting_approval"
+                    return runner.state
+
+                runner.run_pending = execute
+                runner._begin_execution_trace = lambda _command: None
+                with patch.object(langfuse, "preflight_langfuse_tracing",
+                                  side_effect=AssertionError("disabled workflow must not preflight")), \
+                        patch("orchestrator._project_guidance", return_value={}):
+                    result = self._run_cli(command, runner)
+                self.assertEqual(result, 0)
+                self.assertEqual(execution, [True])
+
+    def test_saved_tracing_preflight_failure_stops_before_provider_execution(self):
+        with tempfile.TemporaryDirectory(prefix="harness-tracing-preflight-fail-") as temp:
+            target = self._make_target(Path(temp) / "target")
+            runner, _state = self._saved_runner(target, "preflight-failure", tracing_enabled=True)
+            runner.run_pending = lambda: self.fail("provider execution must not start")
+            before = runner.state_path.read_bytes()
+            stderr = StringIO()
+            with patch.dict(os.environ, {}, clear=True), \
+                    patch.object(langfuse, "preflight_langfuse_tracing",
+                                 side_effect=langfuse.LangfusePreflightError("SDK unavailable")), \
+                    redirect_stderr(stderr):
+                result = cli.main(
+                    ["approve", "--target", str(target), "--workflow-id", runner.workflow_id],
+                    runner_factory=lambda *_args, **_kwargs: runner,
+                    recover_review=lambda *_args, **_kwargs: {"errors": []},
+                    workflow_error=orchestrator.WorkflowError,
+                    workflow_root=".engineering/workflows",
+                    max_authorized_code_review_calls=64,
+                )
+            self.assertEqual(result, 2)
+            self.assertIn("SDK unavailable", stderr.getvalue())
+            self.assertEqual(runner.state_path.read_bytes(), before)
+
+    def test_status_reject_and_recover_review_never_run_saved_scope_preflight(self):
+        with tempfile.TemporaryDirectory(prefix="harness-tracing-nonexecution-") as temp:
+            target = self._make_target(Path(temp) / "target")
+            for command in ("status", "reject", "recover-review"):
+                runner, _state = self._saved_runner(target, f"no-preflight-{command}", tracing_enabled=True)
+                runner._begin_execution_trace = lambda _command: None
+                args = [command, "--target", str(target), "--workflow-id", runner.workflow_id]
+                with patch.dict(os.environ, {"HARNESS_TRACING_ENABLED": "true"}, clear=True), \
+                        patch.object(langfuse, "preflight_langfuse_tracing",
+                                     side_effect=AssertionError(f"{command} must not preflight")), \
+                        redirect_stdout(StringIO()):
+                    result = cli.main(
+                        args,
+                        runner_factory=lambda *_args, **_kwargs: runner,
+                        recover_review=lambda *_args, **_kwargs: {"errors": []},
+                        workflow_error=orchestrator.WorkflowError,
+                        workflow_root=".engineering/workflows",
+                        max_authorized_code_review_calls=64,
+                    )
+                self.assertEqual(result, 0)
+
+    def test_missing_sdk_preflight_stops_before_workflow_factory_and_suggests_one_time_install(self):
+        created = []
+        stderr = StringIO()
+
+        def factory(*_args, **_kwargs):
+            created.append(True)
+            return FakeRunner()
+
+        with patch.dict(os.environ, {}, clear=True):
+            with patch.object(
+                langfuse.importlib, "import_module", side_effect=ModuleNotFoundError("langfuse"),
+            ):
+                with redirect_stderr(stderr):
+                    result = cli.main(
+                        ["start", "--target", "/tmp/target", "--task", "safe task", "--trace"],
+                        runner_factory=factory,
+                        recover_review=lambda *_args, **_kwargs: {},
+                        workflow_error=orchestrator.WorkflowError,
+                        workflow_root=".engineering/workflows",
+                        max_authorized_code_review_calls=64,
+                    )
+        self.assertEqual(result, 2)
+        self.assertEqual(created, [])
+        message = stderr.getvalue()
+        self.assertIn("current Python environment", message)
+        self.assertIn("python -m pip install -r requirements-tracing.txt", message)
+        self.assertIn("once", message)
+        self.assertIn("No workflow was started", message)
+
+    def test_preflight_checks_credentials_and_endpoint_without_initializing_when_invalid(self):
+        created = []
+
+        class SDK:
+            @staticmethod
+            def Langfuse(**_kwargs):
+                created.append(True)
+
+            propagate_attributes = object()
+
+        with self.assertRaisesRegex(langfuse.LangfusePreflightError, "credentials are incomplete"):
+            langfuse.preflight_langfuse_tracing(sdk_loader=lambda: SDK, environ={})
+        self.assertEqual(created, [])
+
+        configured = {"LANGFUSE_PUBLIC_KEY": "public", "LANGFUSE_SECRET_KEY": "secret",
+                      "LANGFUSE_BASE_URL": "not-a-url"}
+        with self.assertRaisesRegex(langfuse.LangfusePreflightError, "LANGFUSE_BASE_URL is invalid"):
+            langfuse.preflight_langfuse_tracing(sdk_loader=lambda: SDK, environ=configured)
+        self.assertEqual(created, [])
+
+    def test_missing_credentials_stop_cli_before_workflow_creation(self):
+        class SDK:
+            @staticmethod
+            def Langfuse(**_kwargs):
+                raise AssertionError("client must not be initialized without credentials")
+
+            propagate_attributes = lambda **_kwargs: None
+
+        stderr = StringIO()
+        with patch.dict(os.environ, {}, clear=True):
+            with patch.object(langfuse.importlib, "import_module", return_value=SDK()):
+                with redirect_stderr(stderr):
+                    result = cli.main(
+                        ["start", "--target", "/tmp/target", "--task", "safe task", "--trace"],
+                        runner_factory=lambda *_args, **_kwargs: self.fail("workflow must not start"),
+                        recover_review=lambda *_args, **_kwargs: {},
+                        workflow_error=orchestrator.WorkflowError,
+                        workflow_root=".engineering/workflows",
+                        max_authorized_code_review_calls=64,
+                    )
+        self.assertEqual(result, 2)
+        self.assertIn("credentials are incomplete", stderr.getvalue())
+        self.assertIn("LANGFUSE_PUBLIC_KEY", stderr.getvalue())
+        self.assertIn("LANGFUSE_SECRET_KEY", stderr.getvalue())
+        self.assertIn("No workflow was started", stderr.getvalue())
+
+    def test_client_initialization_failure_aborts_explicit_trace_without_leaking_secrets(self):
+        class BrokenSDK:
+            @staticmethod
+            def Langfuse(**_kwargs):
+                raise RuntimeError("private initialization detail with SECRET_VALUE")
+
+            propagate_attributes = lambda **_kwargs: None
+
+        stderr = StringIO()
+        with patch.dict(os.environ, {
+            "LANGFUSE_PUBLIC_KEY": "public", "LANGFUSE_SECRET_KEY": "SECRET_VALUE",
+        }, clear=True):
+            with patch.object(langfuse.importlib, "import_module", return_value=BrokenSDK()):
+                with patch.object(
+                    langfuse.subprocess, "run",
+                    return_value=type("Result", (), {"returncode": 1, "stderr": "SECRET_VALUE"})(),
+                ):
+                    with redirect_stderr(stderr):
+                        result = cli.main(
+                            ["start", "--target", "/tmp/target", "--task", "safe task", "--trace"],
+                            runner_factory=lambda *_args, **_kwargs: self.fail("workflow must not start"),
+                            recover_review=lambda *_args, **_kwargs: {},
+                            workflow_error=orchestrator.WorkflowError,
+                            workflow_root=".engineering/workflows",
+                            max_authorized_code_review_calls=64,
+                        )
+        self.assertEqual(result, 2)
+        self.assertIn("could not be initialized locally", stderr.getvalue())
+        self.assertNotIn("SECRET_VALUE", stderr.getvalue())
+
+    def test_valid_preflight_initializes_and_closes_client_before_start(self):
+        initialization = []
+
+        class SDK:
+            @staticmethod
+            def Langfuse(**_kwargs):
+                return FakeClient()
+
+            @staticmethod
+            def propagate_attributes(**_kwargs):
+                raise AssertionError("preflight must not test remote connectivity")
+
+        created = []
+
+        def factory(*factory_args, **kwargs):
+            runner = FakeRunner(*factory_args, **kwargs)
+            created.append(runner)
+            return runner
+
+        with patch.dict(os.environ, {
+            "LANGFUSE_PUBLIC_KEY": "public", "LANGFUSE_SECRET_KEY": "secret",
+            "LANGFUSE_BASE_URL": "https://trace.example.test",
+        }, clear=True):
+            with patch.object(langfuse.importlib, "import_module", return_value=SDK()):
+                with patch.object(
+                    langfuse.subprocess, "run",
+                    side_effect=lambda command, **kwargs: (
+                        initialization.append((command, kwargs)),
+                        type("Result", (), {"returncode": 0})(),
+                    )[1],
+                ):
+                    with redirect_stdout(StringIO()):
+                        result = cli.main(
+                            ["start", "--target", "/tmp/target", "--task", "safe task", "--trace"],
+                            runner_factory=factory,
+                            recover_review=lambda *_args, **_kwargs: {},
+                            workflow_error=orchestrator.WorkflowError,
+                            workflow_root=".engineering/workflows",
+                            max_authorized_code_review_calls=64,
+                        )
+        self.assertEqual(result, 0)
+        self.assertEqual(len(created), 1)
+        self.assertTrue(created[0].tracing_enabled)
+        self.assertEqual(initialization[0][0][0], sys.executable)
+        self.assertEqual(initialization[0][1]["env"]["LANGFUSE_BASE_URL"], "https://trace.example.test")
+        self.assertIn("shutdown()", initialization[0][0][-1])
 
     def test_disabled_scope_returns_noop_without_importing_langfuse(self):
         with patch.object(langfuse.importlib, "import_module", side_effect=AssertionError("unexpected SDK import")):
@@ -183,7 +557,7 @@ class ObservabilityTests(unittest.TestCase):
         self.assertGreaterEqual(stderr.getvalue().count("Tracing warning:"), 2)
         self.assertNotIn("unsafe", stderr.getvalue())
 
-    def test_export_contains_only_allowlisted_metadata(self):
+    def test_export_arguments_contain_only_harness_allowlisted_metadata(self):
         tracer = langfuse.BufferedLangfuseTracer(
             session_id="session", public_key="public", secret_key="secret", base_url="https://cloud.langfuse.com",
         )
@@ -222,6 +596,20 @@ class ObservabilityTests(unittest.TestCase):
         for secret in ("PRIVATE_PROMPT", "PRIVATE_SOURCE", "PRIVATE_SECRET", "PRIVATE_REPORT", "/private/workspace"):
             self.assertNotIn(secret, payload)
         self.assertEqual([event[0] for event in client.observations], ["workflow.execution", "provider.claude_review"])
+        root, review = client.observations
+        harness_metadata_keys = {
+            "command", "session_id", "initial_stage", "final_stage", "final_status",
+            "execution_result", "duration_ms", "stage", "provider", "operation", "sandbox",
+            "model", "iteration", "review_kind", "review_part_index", "review_part_count",
+            "review_result", "cost_usd", "error_category", "retry_count", "attempt", "status",
+        }
+        for _name, _kind, metadata, _kwargs in client.observations:
+            self.assertLessEqual(set(metadata), harness_metadata_keys)
+        self.assertIn("Command: start", root[3]["input"])
+        self.assertIn("Provider: claude", review[3]["input"])
+        self.assertIn("Operation: plan_review", review[3]["input"])
+        self.assertIn("Status: success", review[3]["output"])
+        self.assertIs(type(review[2]["duration_ms"]), int)
         self.assertTrue(client.flush_called)
         self.assertTrue(client.shutdown_called)
 
@@ -284,6 +672,13 @@ class ObservabilityTests(unittest.TestCase):
                 metadata={"provider": "codex", "model": "gpt-known-model"},
             ):
                 pass
+            with self.assertRaisesRegex(RuntimeError, "review failed"):
+                with tracer.generation(
+                    name="provider.claude_review",
+                    metadata={"provider": "claude", "operation": "code_review"},
+                ) as span:
+                    span.update(cost_usd=0.025)
+                    raise RuntimeError("review failed")
 
         client = FakeClient()
 
@@ -302,14 +697,19 @@ class ObservabilityTests(unittest.TestCase):
 
         claude = client.observations[1]
         self.assertEqual(claude[1], "generation")
-        self.assertEqual(claude[2]["cost_usd"], 0.125)
+        self.assertNotIn("cost_usd", claude[2])
         self.assertEqual(claude[3]["cost_details"], {"total": 0.125})
         self.assertNotIn("usage_details", claude[3])
         self.assertNotIn("model", claude[3])
+        self.assertIn("Cost: USD 0.125", claude[3]["output"])
         codex = client.observations[2]
         self.assertEqual(codex[3]["model"], "gpt-known-model")
         self.assertNotIn("model", codex[2])
         self.assertNotIn("cost_details", codex[3])
+        failed_claude = client.observations[3]
+        self.assertEqual(failed_claude[2]["status"], "failure")
+        self.assertEqual(failed_claude[3]["cost_details"], {"total": 0.025})
+        self.assertNotIn("cost_usd", failed_claude[2])
 
     def test_trace_session_reference_is_stable_across_resumed_executions(self):
         auth = orchestrator.new_workflow_authorization(Path("/target"), "same-workflow", 2.0, tracing_enabled=True)

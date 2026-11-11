@@ -9,7 +9,22 @@ A small Python workflow that plans an assignment, waits for approval, implements
 - Aily CLI (`aily`) for Claude plan and code reviews
 - A Git target repository
 
-The harness has no required Python package dependencies. Optional Langfuse tracing uses the pinned official SDK in [`requirements-tracing.txt`](requirements-tracing.txt).
+The harness core uses only the Python standard library and has no `requirements.txt`. Optional Langfuse tracing uses the pinned SDK in [`requirements-tracing.txt`](requirements-tracing.txt).
+
+The harness runs under the Python interpreter used to invoke `orchestrator.py`; it does not create or switch environments. For a persistent environment, create and activate a virtual environment in the harness checkout:
+
+```sh
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+After activation, use `python` both to launch the harness and to install packages. If you enable tracing, install its optional dependency once into that same environment:
+
+```sh
+python -m pip install -r requirements-tracing.txt
+```
+
+There are no core packages to install. `.venv/` is ignored by Git. If you use another persistent environment, activate it before running the harness and install the optional file with that environment's `python -m pip`.
 
 ## Workflow
 
@@ -31,7 +46,7 @@ Provide an absolute target path and assignment. Claude/Aily calls default to a t
 New workflows authorize at most 16 Claude code-review campaign calls by default, including any final integration review. Set `--max-code-review-calls` from 1 to 64 to authorize a different maximum. The limit is saved at workflow start and applies to every part, integration review, and retry; it never expands on resume. Existing workflows that only authorize one code-review call retain that limit.
 
 ```sh
-python3 /path/to/autonomous-engineering-harness/harness/orchestrator.py start \
+python /path/to/autonomous-engineering-harness/harness/orchestrator.py start \
   --target /absolute/path/to/target-repository \
   --task-file /absolute/path/to/assignment.md
 ```
@@ -42,7 +57,9 @@ For example, `--budget-usd 0.75` overrides the budget, and `--model MODEL_NAME` 
 
 Tracing is disabled by default. Enable it for a new workflow with `start --trace` or set `HARNESS_TRACING_ENABLED=true` before `start`; either setting enables tracing. Credentials come from `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY`; `LANGFUSE_BASE_URL` is optional and defaults to `https://cloud.langfuse.com`.
 
-Install the optional SDK with `python3 -m pip install -r requirements-tracing.txt`. Missing credentials or the SDK produce a sanitized warning and the workflow continues without exporting traces. Langfuse events contain operational metadata only: workflow command, a stable pseudonymous session ID, stage/provider/operation, configured model when known, elapsed duration, status, review-part index/count, and reported provider cost. The raw workflow ID, prompts, assignments, feedback, source, diffs, reports, CLI output, secrets, and filesystem paths are not sent. Target validation status is omitted unless the workflow has reliable structured evidence for it.
+Install the optional SDK once in the persistent environment with `python -m pip install -r requirements-tracing.txt`. When `--trace` is explicit, a local preflight checks that the SDK imports in the current interpreter, credentials and endpoint are configured, and the SDK client can initialize. If the SDK is missing, the command stops before creating a workflow and tells you to activate the same environment and install the optional requirements. This local check does not verify remote connectivity or guarantee trace delivery. Tracing enabled only through `HARNESS_TRACING_ENABLED=true` keeps the existing best-effort startup behavior without the explicit-flag preflight. Langfuse events contain operational metadata only: workflow command, a stable pseudonymous session ID, stage/provider/operation, configured model when known, elapsed duration, status, review-part index/count, and reported provider cost. The raw workflow ID, prompts, assignments, feedback, source, diffs, reports, CLI output, secrets, and filesystem paths are not sent. Target validation status is omitted unless the workflow has reliable structured evidence for it.
+
+The descriptions shown in Langfuse Input and Output are generated from these safe fields (for example, provider, operation, stage, status, duration, and reported cost). Prompt and project content are not used to populate them.
 
 The authorization saved at `start` records whether tracing is enabled, its fixed metadata scope, and a hash of the authorized Langfuse endpoint. It never stores credentials. Approval, revision, and resume reuse that saved setting and endpoint; older workflows without an observability scope remain tracing-disabled. Trace data is buffered locally while the workflow lock is held and exported only after the operation releases the lock. Langfuse initialization, export, and shutdown failures do not affect workflow results.
 
@@ -51,7 +68,7 @@ Elapsed `duration_ms` values come from the harness monotonic clock and cover roo
 The workflow prints its ID and proposal path. Review the proposal, then explicitly approve it:
 
 ```sh
-python3 /path/to/autonomous-engineering-harness/harness/orchestrator.py approve \
+python /path/to/autonomous-engineering-harness/harness/orchestrator.py approve \
   --target /absolute/path/to/target-repository \
   --workflow-id WORKFLOW_ID
 ```
@@ -59,7 +76,7 @@ python3 /path/to/autonomous-engineering-harness/harness/orchestrator.py approve 
 To ask for a proposal change, give concise feedback. The workflow uses a remaining Claude plan review when available, then returns to `awaiting_approval`:
 
 ```sh
-python3 /path/to/autonomous-engineering-harness/harness/orchestrator.py revise \
+python /path/to/autonomous-engineering-harness/harness/orchestrator.py revise \
   --target /absolute/path/to/target-repository \
   --workflow-id WORKFLOW_ID \
   --feedback "Include the empty-input case in the proposal."
@@ -68,7 +85,7 @@ python3 /path/to/autonomous-engineering-harness/harness/orchestrator.py revise \
 Reject a proposal to stop without implementation:
 
 ```sh
-python3 /path/to/autonomous-engineering-harness/harness/orchestrator.py reject \
+python /path/to/autonomous-engineering-harness/harness/orchestrator.py reject \
   --target /absolute/path/to/target-repository --workflow-id WORKFLOW_ID \
   --reason "The proposal is out of scope."
 ```
@@ -76,10 +93,10 @@ python3 /path/to/autonomous-engineering-harness/harness/orchestrator.py reject \
 Check or resume a workflow with:
 
 ```sh
-python3 /path/to/autonomous-engineering-harness/harness/orchestrator.py status \
+python /path/to/autonomous-engineering-harness/harness/orchestrator.py status \
   --target /absolute/path/to/target-repository --workflow-id WORKFLOW_ID
 
-python3 /path/to/autonomous-engineering-harness/harness/orchestrator.py resume \
+python /path/to/autonomous-engineering-harness/harness/orchestrator.py resume \
   --target /absolute/path/to/target-repository --workflow-id WORKFLOW_ID
 ```
 
@@ -111,8 +128,8 @@ These are workflow guardrails. They do not override OS, provider, or organizatio
 ## Development checks
 
 ```sh
-python3 -m unittest discover -s tests
-python3 -m compileall -q harness tests
+python -m unittest discover -s tests
+python -m compileall -q harness tests
 git diff --check
 ```
 
