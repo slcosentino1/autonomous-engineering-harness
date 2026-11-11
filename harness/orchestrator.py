@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
+import errno
 import hashlib
 import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -20,6 +23,11 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import Callable
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 import claude_reviewer
 
@@ -33,6 +41,7 @@ MAX_PLANNING_FAILURE_RECORDS = 3
 PART_REVIEW_VALIDATOR_VERSION = "part-review-v2"
 CODEX_EXECUTABLE = "codex"
 WORKFLOW_ROOT = ".engineering/workflows"
+WORKFLOW_LOCK_NAME_RE = re.compile(r"^\.[A-Za-z0-9][A-Za-z0-9._-]{0,79}\.lock$")
 PLANNING_PRINCIPLES = """Engineering Judgment & Proportional Design
 1. Explicit requirements take priority over technical recommendations.
 2. Do not turn general best practices into requirements automatically.
@@ -530,7 +539,11 @@ def _check_plain_directories(root: Path, relative: str, *, create: bool = False)
             if current.is_symlink() or not current.is_dir():
                 raise WorkflowError(f"Workflow path contains a symlink or non-directory: {current}")
         elif create:
-            current.mkdir()
+            try:
+                current.mkdir()
+            except FileExistsError:
+                if current.is_symlink() or not current.is_dir():
+                    raise WorkflowError(f"Workflow path contains a symlink or non-directory: {current}")
     return current
 
 
@@ -557,10 +570,84 @@ def _atomic_text(path: Path, value: str) -> None:
             pass
 
 
+def _lock_workflow_fd(fd: int) -> None:
+    if os.name == "nt":
+        if os.fstat(fd).st_size == 0:
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.write(fd, b"\0")
+            os.fsync(fd)
+        os.lseek(fd, 0, os.SEEK_SET)
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            busy_errnos = {errno.EACCES, errno.EAGAIN, getattr(errno, "EDEADLK", -1)}
+            if exc.errno in busy_errnos:
+                raise BlockingIOError(errno.EWOULDBLOCK, "workflow lock is held") from exc
+            raise
+    else:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_workflow_fd(fd: int) -> None:
+    if os.name == "nt":
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def _workflow_process_lock(target: Path, workflow_id: str):
+    """Exclusively coordinate mutating commands for one workflow across processes.
+
+    The lock file intentionally remains after release. Ownership is determined by
+    the kernel lock, never by the file's existence, so a process crash cannot leave
+    a stale lock that blocks future recovery.
+    """
+    workflows_dir = _check_plain_directories(target, WORKFLOW_ROOT, create=True)
+    lock_path = workflows_dir / f".{workflow_id}.lock"
+    _safe_artifact(lock_path)
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise WorkflowError(f"Could not open workflow process lock: {redact(str(exc))}") from exc
+
+    acquired = False
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise WorkflowError(f"Workflow process lock is not a regular file: {lock_path}")
+        try:
+            _lock_workflow_fd(fd)
+        except BlockingIOError as exc:
+            raise WorkflowError(
+                f"Workflow {workflow_id} is already being modified by another process."
+            ) from exc
+        except OSError as exc:
+            raise WorkflowError(f"Could not acquire workflow process lock: {redact(str(exc))}") from exc
+        acquired = True
+        yield
+    finally:
+        try:
+            if acquired:
+                _unlock_workflow_fd(fd)
+        finally:
+            os.close(fd)
+
+
 def _changed_paths(target: Path, baseline: str) -> tuple[list[str], list[str]]:
     tracked = git(target, "diff", "--name-only", "-z", baseline, "--").decode("utf-8", "surrogateescape").split("\0")
     untracked = git(target, "ls-files", "--others", "--exclude-standard", "-z").decode("utf-8", "surrogateescape").split("\0")
-    return sorted({item for item in tracked if item}), sorted({item for item in untracked if item})
+    lock_prefix = f"{WORKFLOW_ROOT}/"
+    user_paths = {
+        item for item in untracked
+        if item and not (
+            item.startswith(lock_prefix)
+            and "/" not in item[len(lock_prefix):]
+            and WORKFLOW_LOCK_NAME_RE.fullmatch(item[len(lock_prefix):])
+        )
+    }
+    return sorted({item for item in tracked if item}), sorted(user_paths)
 
 
 def _protected_paths(target: Path, baseline: str) -> list[str]:
@@ -1164,12 +1251,15 @@ class Orchestrator:
         self.state_path = self.workflow_dir / "state.json"
         self.proposal_path = self.workflow_dir / "proposal.md"
         self.delivery_path = self.workflow_dir / "delivery.md"
+        self._process_lock_held = False
 
     @staticmethod
     def _new_workflow_id() -> str:
         return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
 
     def _save(self) -> None:
+        if not self._process_lock_held:
+            raise WorkflowError("Workflow state writes require the workflow process lock.")
         self.state["updated_at"] = now()
         authorization = self.state.get("authorization")
         if isinstance(authorization, dict):
@@ -1200,7 +1290,19 @@ class Orchestrator:
             self.state["planning_validation_failure_history_truncated"] = True
         self._save()
 
-    def _load(self) -> None:
+    @contextlib.contextmanager
+    def _workflow_lock(self):
+        if self._process_lock_held:
+            raise WorkflowError("Workflow process locks cannot be nested.")
+        with _workflow_process_lock(self.target, self.workflow_id):
+            self._process_lock_held = True
+            try:
+                yield
+            finally:
+                self._process_lock_held = False
+
+    def _read_state(self) -> dict:
+        """Read and validate persisted state without recovery or disk writes."""
         _safe_artifact(self.state_path)
         try:
             self.state = json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -1214,7 +1316,14 @@ class Orchestrator:
         if self.model is not None and self.model != saved_model:
             raise WorkflowError("Codex model is fixed when the workflow starts.")
         self.model = saved_model
-        authorization = validate_workflow_authorization(self.state, self.target, self.workflow_id)
+
+        return validate_workflow_authorization(self.state, self.target, self.workflow_id)
+
+    def _load(self) -> None:
+        """Load state for a locked mutation, recovering only a truly ownerless call."""
+        if not self._process_lock_held:
+            raise WorkflowError("Workflow state recovery requires the workflow process lock.")
+        authorization = self._read_state()
         external = authorization["claude_aily"]
         if external.get("active_call"):
             external["budget_unknown"] = True
@@ -1234,6 +1343,10 @@ class Orchestrator:
         return clean_markdown(proposal)
 
     def start(self) -> dict:
+        with self._workflow_lock():
+            return self._start_locked()
+
+    def _start_locked(self) -> dict:
         if not self.task or not self.task.strip():
             raise WorkflowError("A non-empty task is required to start a workflow.")
         if self.workflow_dir.exists() or self.workflow_dir.is_symlink():
@@ -1290,6 +1403,10 @@ class Orchestrator:
         return self.run_pending()
 
     def approve(self) -> dict:
+        with self._workflow_lock():
+            return self._approve_locked()
+
+    def _approve_locked(self) -> dict:
         self._load()
         if self.state.get("status") != "awaiting_approval":
             raise WorkflowError("This workflow is not waiting for implementation approval.")
@@ -1304,6 +1421,10 @@ class Orchestrator:
         return self.run_pending()
 
     def revise(self, feedback: str) -> dict:
+        with self._workflow_lock():
+            return self._revise_locked(feedback)
+
+    def _revise_locked(self, feedback: str) -> dict:
         self._load()
         if self.state.get("status") != "awaiting_approval":
             raise WorkflowError("This workflow is not waiting for proposal feedback.")
@@ -1344,6 +1465,10 @@ class Orchestrator:
         return self.state.get("project_guidance") or _project_guidance(self.target, self.state["task"])
 
     def reject(self, reason: str) -> dict:
+        with self._workflow_lock():
+            return self._reject_locked(reason)
+
+    def _reject_locked(self, reason: str) -> dict:
         self._load()
         if self.state.get("status") != "awaiting_approval":
             raise WorkflowError("This workflow is not waiting for a proposal decision.")
@@ -1354,6 +1479,10 @@ class Orchestrator:
         return self.state
 
     def resume(self) -> dict:
+        with self._workflow_lock():
+            return self._resume_locked()
+
+    def _resume_locked(self) -> dict:
         self._load()
         if self.state.get("status") == "awaiting_approval":
             return self.state
@@ -1371,7 +1500,7 @@ class Orchestrator:
         return self.run_pending()
 
     def status(self) -> dict:
-        self._load()
+        self._read_state()
         return self.state
 
     def _run_codex(self, prompt: str, *, sandbox: str) -> str:
@@ -1422,6 +1551,8 @@ class Orchestrator:
         *,
         metadata: dict | None = None,
     ) -> tuple[str, dict]:
+        if not self._process_lock_held:
+            raise WorkflowError("Claude review requires the workflow process lock.")
         authorization = validate_workflow_authorization(self.state, self.target, self.workflow_id)
         external = authorization["claude_aily"]
         if external["budget_unknown"]:
@@ -2460,6 +2591,8 @@ class Orchestrator:
         self._save()
 
     def run_pending(self) -> dict:
+        if not self._process_lock_held:
+            raise WorkflowError("Workflow execution requires the workflow process lock.")
         while self.state.get("status") == "running":
             stage = self.state["stage"]
             try:
@@ -2919,6 +3052,13 @@ class Orchestrator:
 def recover_code_review(target: str | Path, workflow_id: str, *, apply: bool = False) -> dict:
     """Revalidate persisted part reports locally; never calls a provider."""
     runner = Orchestrator(target, workflow_id=workflow_id)
+    if apply:
+        with runner._workflow_lock():
+            return _recover_code_review(runner, workflow_id, apply=True)
+    return _recover_code_review(runner, workflow_id, apply=False)
+
+
+def _recover_code_review(runner: Orchestrator, workflow_id: str, *, apply: bool) -> dict:
     _safe_artifact(runner.state_path)
     try:
         original_bytes = runner.state_path.read_bytes()
@@ -3306,6 +3446,8 @@ def _print_summary(state: dict) -> None:
         ],
         "spent_usd": external_authorization.get("spent_usd"),
         "effective_budget_usd": external_authorization.get("budget_usd"),
+        "budget_unknown": external_authorization.get("budget_unknown"),
+        "active_call": external_authorization.get("active_call"),
         "authorized_code_review_calls": external_authorization.get("max_code_reviews"),
         "review_campaign_status": state.get("review_campaign", {}).get("status"),
         "code_review_feedback": (

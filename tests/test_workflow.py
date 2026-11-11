@@ -1111,7 +1111,8 @@ class WorkflowTests(unittest.TestCase):
         external = runner.state["authorization"]["claude_aily"]
         external.pop("code_review_policy")
         external["max_code_reviews"] = 1
-        runner._save()
+        with runner._workflow_lock():
+            runner._save()
         with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "12000"}):
             with self.assertRaisesRegex(orchestrator.WorkflowError, "requires .* Claude calls.*authorizes 1"):
                 runner.approve()
@@ -1451,7 +1452,8 @@ class WorkflowTests(unittest.TestCase):
         runner.state["authorization"]["claude_aily"]["active_call"] = {
             "stage": "code_review", "started_at": "unknown", "cap_usd": 0.9,
         }
-        runner._save()
+        with runner._workflow_lock():
+            runner._save()
 
         resumed = orchestrator.Orchestrator(
             self.target, workflow_id="active-review-call", process_runner=codex, claude_runner=claude,
@@ -1632,31 +1634,32 @@ class WorkflowTests(unittest.TestCase):
             process_runner=codex, claude_runner=claude,
         )
         runner.start()
-        header, sections, metadata = runner._plan_review_prompt(2)
-        incomplete = dict(sections)
-        incomplete.pop("Current proposal")
-        with self.assertRaisesRegex(orchestrator.WorkflowError, "missing mandatory sections"):
-            runner._call_claude(header, "plan_review_2", incomplete, metadata=metadata)
-        self.assertEqual(len(claude.prompts), 1)
-        self.assertEqual(runner.state["claude_contexts"][-1]["call_state"], "validation_failed")
+        with runner._workflow_lock():
+            header, sections, metadata = runner._plan_review_prompt(2)
+            incomplete = dict(sections)
+            incomplete.pop("Current proposal")
+            with self.assertRaisesRegex(orchestrator.WorkflowError, "missing mandatory sections"):
+                runner._call_claude(header, "plan_review_2", incomplete, metadata=metadata)
+            self.assertEqual(len(claude.prompts), 1)
+            self.assertEqual(runner.state["claude_contexts"][-1]["call_state"], "validation_failed")
 
-        nul_context = dict(sections)
-        nul_context["Assignment"] += "\x00hidden"
-        with self.assertRaisesRegex(orchestrator.WorkflowError, "contains a NUL byte"):
-            runner._call_claude(header, "plan_review_2", nul_context, metadata=metadata)
-        self.assertEqual(runner.state["claude_contexts"][-1]["call_state"], "validation_failed")
+            nul_context = dict(sections)
+            nul_context["Assignment"] += "\x00hidden"
+            with self.assertRaisesRegex(orchestrator.WorkflowError, "contains a NUL byte"):
+                runner._call_claude(header, "plan_review_2", nul_context, metadata=metadata)
+            self.assertEqual(runner.state["claude_contexts"][-1]["call_state"], "validation_failed")
 
-        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "80"}):
-            with self.assertRaisesRegex(orchestrator.WorkflowError, "no paid call was made"):
-                runner._call_claude(header, "plan_review_2", sections, metadata=metadata)
-        self.assertEqual(len(claude.prompts), 1)
-        self.assertEqual(len(runner.state["claude_contexts"]), 4)
-        self.assertEqual(
-            [item["call_state"] for item in runner.state["claude_contexts"]],
-            ["completed", "validation_failed", "validation_failed", "validation_failed"],
-        )
-        self.assertEqual(runner.state["authorization"]["claude_aily"]["budget_unknown"], False)
-        self.assertIsNone(runner.state["authorization"]["claude_aily"]["active_call"])
+            with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "80"}):
+                with self.assertRaisesRegex(orchestrator.WorkflowError, "no paid call was made"):
+                    runner._call_claude(header, "plan_review_2", sections, metadata=metadata)
+            self.assertEqual(len(claude.prompts), 1)
+            self.assertEqual(len(runner.state["claude_contexts"]), 4)
+            self.assertEqual(
+                [item["call_state"] for item in runner.state["claude_contexts"]],
+                ["completed", "validation_failed", "validation_failed", "validation_failed"],
+            )
+            self.assertEqual(runner.state["authorization"]["claude_aily"]["budget_unknown"], False)
+            self.assertIsNone(runner.state["authorization"]["claude_aily"]["active_call"])
 
     def test_configured_higher_limit_is_used_for_exact_serialized_payload(self):
         codex = FakeCodex("# Proposal\nComplete.\n", self.refined())
@@ -1669,12 +1672,13 @@ class WorkflowTests(unittest.TestCase):
             process_runner=codex, claude_runner=claude,
         )
         runner.start()
-        header, sections, metadata = runner._plan_review_prompt(2)
-        sections["Assignment"] += "é" * 110_000
-        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "120000"}):
-            _report, manifest = runner._call_claude(
-                header, "plan_review_2", sections, metadata=metadata,
-            )
+        with runner._workflow_lock():
+            header, sections, metadata = runner._plan_review_prompt(2)
+            sections["Assignment"] += "é" * 110_000
+            with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "120000"}):
+                _report, manifest = runner._call_claude(
+                    header, "plan_review_2", sections, metadata=metadata,
+                )
         submitted = claude.prompts[-1]
         self.assertGreater(len(submitted), 100_000)
         self.assertEqual(manifest["characters"], len(submitted))
@@ -2015,12 +2019,13 @@ class WorkflowTests(unittest.TestCase):
             runner.approve()
 
         for version in (3, 4, 5):
-            runner._record_unvalidated_planning_output(
-                invalid_output,
-                orchestrator.WorkflowError("Repeated invalid output."),
-                stage="plan_refine_1",
-                proposal_version=version,
-            )
+            with runner._workflow_lock():
+                runner._record_unvalidated_planning_output(
+                    invalid_output,
+                    orchestrator.WorkflowError("Repeated invalid output."),
+                    stage="plan_refine_1",
+                    proposal_version=version,
+                )
         state = json.loads(runner.state_path.read_text(encoding="utf-8"))
         records = state["planning_validation_failures"]
         self.assertEqual(len(records), orchestrator.MAX_PLANNING_FAILURE_RECORDS)
