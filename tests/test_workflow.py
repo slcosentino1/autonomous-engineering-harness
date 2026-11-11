@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT / "harness"))
 import claude_reviewer  # noqa: E402
 import orchestrator  # noqa: E402
 from workflow import review as review_contracts  # noqa: E402
+from workflow import workspace as workspace_ops  # noqa: E402
 
 
 def git(root: Path, *args: str) -> str:
@@ -286,6 +287,69 @@ class ReviewContractExtractionTests(unittest.TestCase):
         self.assertEqual(review_contracts._review_partition_error(review_diff, parts), expected)
         with self.assertRaisesRegex(orchestrator.WorkflowError, expected.replace(".", r"\.")):
             orchestrator.Orchestrator._validate_review_partition(review_diff, parts)
+
+
+class WorkspaceModuleTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="workspace-module-tests-")
+        self.root = Path(self.temp.name)
+        self.target = make_target(self.root / "target")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_git_and_canonical_target_compatibility_surfaces(self):
+        canonical_target = self.target.resolve(strict=True)
+        self.assertEqual(workspace_ops.canonical_target(str(self.target)), canonical_target)
+        self.assertEqual(orchestrator.canonical_target(str(self.target)), canonical_target)
+        baseline = git(self.target, "rev-parse", "HEAD")
+        self.assertEqual(workspace_ops.git(self.target, "rev-parse", "HEAD").decode().strip(), baseline)
+        self.assertEqual(orchestrator.git(self.target, "rev-parse", "HEAD").decode().strip(), baseline)
+
+    def test_changed_and_protected_paths_match_compatibility_wrappers(self):
+        baseline = git(self.target, "rev-parse", "HEAD")
+        (self.target / "README.md").write_text("updated\n", encoding="utf-8")
+        (self.target / "src").mkdir()
+        (self.target / "src" / "new.py").write_text("value = 1\n", encoding="utf-8")
+        generated_lock = self.target / ".engineering" / "workflows" / ".workflow.lock"
+        generated_lock.parent.mkdir(parents=True)
+        generated_lock.write_text("", encoding="utf-8")
+
+        expected = workspace_ops.changed_paths(self.target, baseline)
+        self.assertEqual(orchestrator._changed_paths(self.target, baseline), expected)
+        self.assertNotIn(".engineering/workflows/.workflow.lock", expected[1])
+        self.assertEqual(
+            orchestrator._protected_paths(self.target, baseline),
+            workspace_ops.protected_paths(self.target, baseline),
+        )
+
+    def test_project_guidance_discovery_is_available_through_both_surfaces(self):
+        (self.target / "AGENTS.md").write_text("Follow repository guidance.\n", encoding="utf-8")
+        skill = self.target / ".agents" / "skills" / "sample" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text(
+            "---\nname: sample\ndescription: Sample project guidance.\n---\nUse the sample skill.\n",
+            encoding="utf-8",
+        )
+        expected = workspace_ops.project_guidance(self.target, "Make a local code change")
+        self.assertEqual(orchestrator._project_guidance(self.target, "Make a local code change"), expected)
+        self.assertEqual(expected["instructions"][0]["path"], "AGENTS.md")
+        self.assertEqual(expected["skills"][0]["name"], "sample")
+
+    def test_symlink_component_check_is_available_through_both_surfaces(self):
+        source = self.root / "outside.txt"
+        source.write_text("outside workspace\n", encoding="utf-8")
+        link = self.target / "src" / "external.txt"
+        link.parent.mkdir()
+        link.symlink_to(source)
+        self.assertTrue(workspace_ops.has_symlink_component(self.target, "src/external.txt"))
+        self.assertTrue(orchestrator._has_symlink_component(self.target, "src/external.txt"))
+
+    def test_workspace_errors_keep_workflow_error_compatibility(self):
+        with self.assertRaisesRegex(workspace_ops.WorkspaceError, "absolute repository path"):
+            workspace_ops.canonical_target("relative/path")
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "absolute repository path"):
+            orchestrator.canonical_target("relative/path")
 
 
 class WorkflowTests(unittest.TestCase):
