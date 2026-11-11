@@ -28,6 +28,7 @@ else:
     import fcntl
 
 import claude_reviewer
+from workflow import persistence as _persistence
 from workflow import workspace as _workspace
 from workflow.review import (
     PART_REVIEW_FIELDS,
@@ -154,6 +155,13 @@ def _workspace_error(call):
         raise WorkflowError(str(exc)) from exc
 
 
+def _persistence_call(call):
+    try:
+        return call()
+    except _persistence.PersistenceError as exc:
+        raise WorkflowError(str(exc)) from exc
+
+
 def _git_env() -> dict[str, str]:
     return _workspace.git_env()
 
@@ -176,6 +184,18 @@ def _protected_paths(target: Path, baseline: str) -> list[str]:
 
 def _project_guidance(target: Path, task: str) -> dict:
     return _workspace_error(lambda: _workspace.project_guidance(target, task, redactor=redact))
+
+
+def _safe_artifact(path: Path) -> None:
+    _persistence_call(lambda: _persistence.safe_artifact(path))
+
+
+def _atomic_text(path: Path, value: str) -> None:
+    _persistence_call(lambda: _persistence.atomic_text(path, value))
+
+
+def _write_json(path: Path, value: dict) -> None:
+    _persistence_call(lambda: _persistence.write_json(path, value))
 
 
 CLAUDE_CODE_REVIEW_GUIDANCE = """Independent review roles and duties
@@ -245,29 +265,6 @@ def _check_plain_directories(root: Path, relative: str, *, create: bool = False)
                 if current.is_symlink() or not current.is_dir():
                     raise WorkflowError(f"Workflow path contains a symlink or non-directory: {current}")
     return current
-
-
-def _safe_artifact(path: Path) -> None:
-    if path.is_symlink():
-        raise WorkflowError(f"Workflow artifact is a symlink: {path}")
-    if path.exists() and not path.is_file():
-        raise WorkflowError(f"Workflow artifact is not a regular file: {path}")
-
-
-def _atomic_text(path: Path, value: str) -> None:
-    _safe_artifact(path)
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
-            stream.write(value)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    finally:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
 
 
 def _lock_workflow_fd(fd: int) -> None:
@@ -763,7 +760,7 @@ class Orchestrator:
         authorization = self.state.get("authorization")
         if isinstance(authorization, dict):
             authorization["scope_sha256"] = authorization_scope_digest(authorization)
-        _atomic_text(self.state_path, json.dumps(self.state, indent=2, ensure_ascii=False) + "\n")
+        _write_json(self.state_path, self.state)
 
     def _record_unvalidated_planning_output(
         self, output: str, error: WorkflowError, *, stage: str, proposal_version: int,
@@ -804,7 +801,7 @@ class Orchestrator:
         """Read and validate persisted state without recovery or disk writes."""
         _safe_artifact(self.state_path)
         try:
-            self.state = json.loads(self.state_path.read_text(encoding="utf-8"))
+            self.state = _persistence.read_json(self.state_path)
         except (OSError, json.JSONDecodeError) as exc:
             raise WorkflowError(f"Workflow state is missing or invalid: {self.state_path}") from exc
         if self.state.get("workflow_id") != self.workflow_id or self.state.get("target") != str(self.target):
@@ -834,7 +831,7 @@ class Orchestrator:
     def _read_proposal(self) -> str:
         _safe_artifact(self.proposal_path)
         try:
-            proposal = self.proposal_path.read_text(encoding="utf-8")
+            proposal = _persistence.read_text(self.proposal_path)
         except OSError as exc:
             raise WorkflowError(f"Saved proposal is unavailable: {self.proposal_path}") from exc
         if not proposal.strip():
@@ -2519,8 +2516,7 @@ def recover_code_review(target: str | Path, workflow_id: str, *, apply: bool = F
 def _recover_code_review(runner: Orchestrator, workflow_id: str, *, apply: bool) -> dict:
     _safe_artifact(runner.state_path)
     try:
-        original_bytes = runner.state_path.read_bytes()
-        state = json.loads(original_bytes.decode("utf-8"))
+        original_bytes, state = _persistence.read_json_bytes(runner.state_path)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise WorkflowError(f"Workflow state is missing or invalid: {runner.state_path}") from exc
     if state.get("workflow_id") != workflow_id or state.get("target") != str(runner.target):
@@ -2832,11 +2828,10 @@ def _recover_code_review(runner: Orchestrator, workflow_id: str, *, apply: bool)
         for record in proposed_campaign.get("part_reviews", []) for call in record.get("calls", [])
     ))
 
-    if runner.state_path.read_bytes() != original_bytes:
+    if _persistence.read_bytes(runner.state_path) != original_bytes:
         raise WorkflowError("Workflow state changed during local recovery; no recovery changes were written.")
     proposed["updated_at"] = now()
-    encoded = json.dumps(proposed, indent=2, ensure_ascii=False) + "\n"
-    _atomic_text(runner.state_path, encoded)
+    _write_json(runner.state_path, proposed)
     result["applied"] = True
     result["campaign_completed"] = proposed_campaign.get("status") == "complete"
     result["workflow_status_preserved"] = proposed.get("status")

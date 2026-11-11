@@ -23,6 +23,7 @@ import claude_reviewer  # noqa: E402
 import orchestrator  # noqa: E402
 from workflow import review as review_contracts  # noqa: E402
 from workflow import workspace as workspace_ops  # noqa: E402
+from workflow import persistence as persistence_ops  # noqa: E402
 
 
 def git(root: Path, *args: str) -> str:
@@ -350,6 +351,91 @@ class WorkspaceModuleTests(unittest.TestCase):
             workspace_ops.canonical_target("relative/path")
         with self.assertRaisesRegex(orchestrator.WorkflowError, "absolute repository path"):
             orchestrator.canonical_target("relative/path")
+
+
+class PersistenceModuleTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="persistence-module-tests-")
+        self.root = Path(self.temp.name)
+        self.target = make_target(self.root / "target")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_json_serialization_and_legacy_state_round_trip(self):
+        legacy_state = {
+            "version": 1,
+            "workflow_id": "legacy-state",
+            "target": str(self.target.resolve()),
+            "status": "awaiting_approval",
+            "stage": "implementation_approval",
+        }
+        expected = json.dumps(legacy_state, indent=2, ensure_ascii=False) + "\n"
+        self.assertEqual(persistence_ops.serialize_json(legacy_state), expected)
+        path = self.root / "state.json"
+        path.write_text(expected, encoding="utf-8")
+        original_bytes, loaded = persistence_ops.read_json_bytes(path)
+        self.assertEqual(original_bytes, expected.encode("utf-8"))
+        self.assertEqual(loaded, legacy_state)
+        self.assertEqual(persistence_ops.read_json(path), legacy_state)
+
+    def test_atomic_text_replaces_existing_file_and_removes_temporary_file(self):
+        path = self.root / "state.json"
+        path.write_text("old state\n", encoding="utf-8")
+        with patch("workflow.persistence.os.replace", wraps=os.replace) as replace:
+            persistence_ops.atomic_text(path, '{"status": "new"}\n')
+        self.assertEqual(path.read_text(encoding="utf-8"), '{"status": "new"}\n')
+        replace.assert_called_once()
+        self.assertEqual(Path(replace.call_args.args[1]), path)
+        self.assertEqual(sorted(item.name for item in self.root.iterdir()), ["state.json", "target"])
+
+    def test_legacy_authorization_state_loads_without_rewriting_its_schema(self):
+        runner = orchestrator.Orchestrator(self.target, workflow_id="legacy-persisted-state")
+        authorization = orchestrator.new_workflow_authorization(runner.target, runner.workflow_id, 1.0, 1)
+        authorization["claude_aily"].pop("code_review_policy")
+        authorization["scope_sha256"] = orchestrator.authorization_scope_digest(authorization)
+        legacy_state = {
+            "version": 1,
+            "workflow_id": runner.workflow_id,
+            "target": str(runner.target),
+            "status": "awaiting_approval",
+            "stage": "implementation_approval",
+            "authorization": authorization,
+        }
+        runner.state_path.parent.mkdir(parents=True)
+        persistence_ops.atomic_text(runner.state_path, persistence_ops.serialize_json(legacy_state))
+        saved_bytes = runner.state_path.read_bytes()
+
+        loaded_authorization = runner._read_state()
+
+        self.assertEqual(loaded_authorization, authorization)
+        self.assertEqual(runner.state_path.read_bytes(), saved_bytes)
+        self.assertNotIn("codex_model", runner.state)
+        self.assertNotIn("code_review_policy", runner.state["authorization"]["claude_aily"])
+
+    def test_malformed_state_keeps_workflow_error_contract(self):
+        runner = orchestrator.Orchestrator(self.target, workflow_id="malformed-state")
+        runner.state_path.parent.mkdir(parents=True)
+        runner.state_path.write_text("{malformed", encoding="utf-8")
+        with self.assertRaisesRegex(
+                orchestrator.WorkflowError, "Workflow state is missing or invalid"):
+            runner._read_state()
+
+    def test_save_still_requires_workflow_lock_and_translates_write_failures(self):
+        runner = orchestrator.Orchestrator(self.target, workflow_id="persist-under-lock")
+        runner.workflow_dir.mkdir(parents=True)
+        runner.state = {"version": 1}
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "state writes require the workflow process lock"):
+            runner._save()
+        self.assertFalse(runner.state_path.exists())
+
+        with runner._workflow_lock():
+            with patch("workflow.persistence.os.replace", side_effect=OSError("disk full")):
+                with self.assertRaisesRegex(orchestrator.WorkflowError, "disk full"):
+                    orchestrator._atomic_text(runner.state_path, "state\n")
+            with patch("workflow.persistence.os.replace", side_effect=OSError("disk full")):
+                with self.assertRaisesRegex(orchestrator.WorkflowError, "disk full"):
+                    runner._save()
 
 
 class WorkflowTests(unittest.TestCase):
