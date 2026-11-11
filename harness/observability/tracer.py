@@ -67,6 +67,8 @@ class Tracer(Protocol):
 
     def span(self, *, name: str, metadata: dict) -> ContextManager[Any]: ...
 
+    def generation(self, *, name: str, metadata: dict) -> ContextManager[Any]: ...
+
     def flush(self) -> None: ...
 
 
@@ -82,6 +84,9 @@ class NoOpTracer:
         return nullcontext(NoOpSpan())
 
     def span(self, *, name: str, metadata: dict) -> ContextManager[Any]:
+        return nullcontext(NoOpSpan())
+
+    def generation(self, *, name: str, metadata: dict) -> ContextManager[Any]:
         return nullcontext(NoOpSpan())
 
     def flush(self) -> None:

@@ -1027,7 +1027,7 @@ class Orchestrator:
                 session_id=workflow_ref,
                 metadata={
                     "command": command,
-                    "workflow_ref": workflow_ref,
+                    "session_id": workflow_ref,
                     "initial_stage": initial_stage,
                 },
             ))
@@ -1038,9 +1038,25 @@ class Orchestrator:
             self._trace_started_at = None
             print("Tracing warning: could not initialize tracing; continuing without it.", file=sys.stderr)
 
-    def _trace_span(self, name: str, metadata: dict):
+    def _trace_span(self, name: str, metadata: dict, *, as_type: str = "span"):
         tracer = self._tracer or NoOpTracer()
-        return isolated_context(lambda: tracer.span(name=name, metadata=metadata))
+        details = dict(metadata)
+        review_operations = {
+            "review.campaign": "review_campaign",
+            "review.part.provider_call": "review_part",
+            "review.integration.provider_call": "review_integration",
+        }
+        if name in review_operations:
+            details.setdefault("operation", review_operations[name])
+        if isinstance(self.state, dict):
+            stage = self.state.get("stage")
+            if isinstance(stage, str) and stage in TRACE_STAGES:
+                details.setdefault("stage", stage)
+        workflow_id = getattr(self, "workflow_id", None)
+        if isinstance(workflow_id, str):
+            details.setdefault("session_id", safe_workflow_reference(workflow_id))
+        factory = getattr(tracer, "generation", tracer.span) if as_type == "generation" else tracer.span
+        return isolated_context(lambda: factory(name=name, metadata=details))
 
     def _finish_execution_trace(self, error: BaseException | None) -> None:
         context = self._active_trace_context
@@ -1076,10 +1092,12 @@ class Orchestrator:
         return self.state
 
     def _run_codex(self, prompt: str, *, sandbox: str) -> str:
-        metadata = {"provider": "Codex", "operation": "codex_execution", "sandbox": sandbox}
+        metadata = {"provider": "codex", "operation": "codex_execution", "sandbox": sandbox}
+        if isinstance(self.state.get("stage"), str):
+            metadata["stage"] = self.state["stage"]
         if self.model:
             metadata["model"] = self.model
-        with self._trace_span("provider.codex", metadata):
+        with self._trace_span("provider.codex", metadata, as_type="generation"):
             return self._run_codex_impl(prompt, sandbox=sandbox)
 
     def _run_codex_impl(self, prompt: str, *, sandbox: str) -> str:
@@ -1131,8 +1149,9 @@ class Orchestrator:
         metadata: dict | None = None,
     ) -> tuple[str, dict]:
         operation_metadata = {
-            "provider": "Claude_Aily",
+            "provider": "claude",
             "operation": "plan_review" if stage.startswith("plan_review_") else "code_review",
+            "stage": stage,
         }
         if stage.startswith("plan_review_"):
             operation_metadata["iteration"] = int(stage[-1])
@@ -1147,11 +1166,19 @@ class Orchestrator:
                 match = re.fullmatch(r"part-(\d+)", str(metadata.get("part_id", "")))
                 if match:
                     operation_metadata["review_part_index"] = int(match.group(1))
-        with self._trace_span("provider.claude_review", operation_metadata) as span:
-            report, manifest = self._call_claude_impl(header, stage, sections, metadata=metadata)
+        with self._trace_span("provider.claude_review", operation_metadata, as_type="generation") as span:
+            try:
+                report, manifest = self._call_claude_impl(header, stage, sections, metadata=metadata)
+            except Exception as exc:
+                cost = getattr(exc, "cost_usd", None)
+                if cost is None:
+                    cost = getattr(getattr(exc, "__cause__", None), "cost_usd", None)
+                if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0:
+                    span.update(cost_usd=float(cost))
+                raise
             cost = manifest.get("cost_usd") if isinstance(manifest, dict) else None
             if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0:
-                span.update(reported_cost_usd=float(cost))
+                span.update(cost_usd=float(cost))
             attempt = manifest.get("campaign_call_number") if isinstance(manifest, dict) else None
             if isinstance(attempt, int) and not isinstance(attempt, bool) and attempt > 0:
                 span.update(attempt=attempt)
