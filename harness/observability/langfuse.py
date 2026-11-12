@@ -104,9 +104,8 @@ class BufferedLangfuseTracer:
     def _emit_event(self, client: Any, event: _BufferedEvent) -> None:
         metadata = dict(event.metadata)
         if event.finished is not None:
-            # SDK 4.18 has no public start_time argument for spans. Since export
-            # happens after the workflow unlocks, monotonic duration is the reliable
-            # elapsed-time value; do not manufacture native timestamps here.
+            # Export happens after workflow unlock; preserve the measured elapsed
+            # time as metadata instead of deriving it from export-time timestamps.
             metadata["duration_ms"] = max(0, round((event.finished - event.started) * 1000))
         if event.status is not None:
             metadata["status"] = event.status

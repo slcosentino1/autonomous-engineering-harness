@@ -1,2 +1,3 @@
 # Optional dependency for --trace / HARNESS_TRACING_ENABLED=true.
-langfuse==4.18.0
+# SDK v5 is the current GA line for Langfuse v4 projects.
+langfuse==5.2.0

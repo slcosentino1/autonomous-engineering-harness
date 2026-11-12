@@ -4,12 +4,12 @@ A small Python workflow that plans an assignment, waits for approval, implements
 
 ## Requirements
 
-- Python 3.10 or newer
+- Python 3.11 or newer
 - Codex CLI (`codex`)
 - Aily CLI (`aily`) for Claude plan and code reviews
 - A Git target repository
 
-The harness core uses only the Python standard library and has no `requirements.txt`. Optional Langfuse tracing uses the pinned SDK in [`requirements-tracing.txt`](requirements-tracing.txt).
+The harness core uses only the Python standard library and has no `requirements.txt`. Optional Langfuse tracing uses the pinned SDK in [`requirements-tracing.txt`](requirements-tracing.txt). The harness and tracing SDK require Python 3.11 or newer. The SDK supports Langfuse Cloud or self-hosted Langfuse v4.59.0 or newer; if the project is on an older self-hosted server, upgrade the server before installing this tracing SDK.
 
 The harness runs under the Python interpreter used to invoke `orchestrator.py`; it does not create or switch environments. For a persistent environment, create and activate a virtual environment in the harness checkout:
 
@@ -63,7 +63,7 @@ The descriptions shown in Langfuse Input and Output are generated from these saf
 
 The authorization saved at `start` records whether tracing is enabled, its fixed metadata scope, and a hash of the authorized Langfuse endpoint. It never stores credentials. Approval, revision, and resume reuse that saved setting and endpoint; older workflows without an observability scope remain tracing-disabled. Trace data is buffered locally while the workflow lock is held and exported only after the operation releases the lock. Langfuse initialization, export, and shutdown failures do not affect workflow results.
 
-Elapsed `duration_ms` values come from the harness monotonic clock and cover root executions, stages, provider calls, and review parts. Langfuse SDK 4.18.0's public observation API does not accept an explicit `start_time` for spans or generations; it only allows an explicit end time after a span has been created. Since this adapter buffers observations until after execution, native Langfuse latency cannot reflect the original elapsed time without using unsupported internals. Use `duration_ms` as the authoritative duration. Aily-reported Claude cost is also attached as native generation `cost_details.total`; token usage and model names are omitted when the provider does not report them.
+Elapsed `duration_ms` values come from the harness monotonic clock and cover root executions, stages, provider calls, and review parts. The adapter buffers observations until after execution and records elapsed duration as metadata; `duration_ms` is the authoritative duration. Aily-reported Claude cost is also attached as native generation `cost_details.total`; token usage and model names are omitted when the provider does not report them.
 
 The workflow prints its ID and proposal path. Review the proposal, then explicitly approve it:
 
