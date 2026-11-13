@@ -625,6 +625,118 @@ class WorkspaceModuleTests(unittest.TestCase):
             orchestrator.canonical_target("relative/path")
 
 
+class RepositoryFingerprintTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="repository-fingerprint-tests-")
+        self.root = Path(self.temp.name)
+        self.target = make_target(self.root / "target")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def fingerprint(self):
+        return workspace_ops.repository_fingerprint(self.target)
+
+    def test_clean_fingerprint_and_repeated_execution_are_deterministic(self):
+        first = self.fingerprint()
+        second = self.fingerprint()
+
+        self.assertEqual(first["working_tree_sha256"], second["working_tree_sha256"])
+        self.assertEqual(first["commit_sha"], git(self.target, "rev-parse", "HEAD"))
+        self.assertTrue(first["working_tree_clean"])
+        self.assertFalse(first["staged_changes"])
+        self.assertFalse(first["unstaged_changes"])
+        self.assertFalse(first["untracked_files"])
+        self.assertEqual(first["tracked_path_count"], 1)
+
+    def test_fingerprinting_does_not_refresh_or_write_the_git_index(self):
+        tracked_file = self.target / "README.md"
+        metadata = tracked_file.stat()
+        os.utime(tracked_file, ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 5_000_000_000))
+        index_path = self.target / ".git" / "index"
+        index_before = (index_path.read_bytes(), index_path.stat().st_mtime_ns)
+
+        result = self.fingerprint()
+
+        index_after = (index_path.read_bytes(), index_path.stat().st_mtime_ns)
+        self.assertEqual(index_after, index_before)
+        self.assertTrue(result["working_tree_clean"])
+
+    def test_modified_tracked_file_and_different_content_change_fingerprint(self):
+        baseline = self.fingerprint()["working_tree_sha256"]
+        (self.target / "README.md").write_text("changed content\n", encoding="utf-8")
+
+        changed = self.fingerprint()
+        self.assertNotEqual(changed["working_tree_sha256"], baseline)
+        self.assertFalse(changed["working_tree_clean"])
+        self.assertTrue(changed["unstaged_changes"])
+
+    def test_staged_and_mixed_staged_unstaged_modifications_are_detected(self):
+        (self.target / "README.md").write_text("staged content\n", encoding="utf-8")
+        git(self.target, "add", "README.md")
+        staged = self.fingerprint()
+        self.assertTrue(staged["staged_changes"])
+        self.assertFalse(staged["unstaged_changes"])
+
+        (self.target / "README.md").write_text("later worktree content\n", encoding="utf-8")
+        mixed = self.fingerprint()
+        self.assertTrue(mixed["staged_changes"])
+        self.assertTrue(mixed["unstaged_changes"])
+        self.assertNotEqual(staged["working_tree_sha256"], mixed["working_tree_sha256"])
+
+    def test_untracked_and_deleted_files_are_detected(self):
+        (self.target / "new.py").write_text("value = 1\n", encoding="utf-8")
+        untracked = self.fingerprint()
+        self.assertTrue(untracked["untracked_files"])
+        self.assertEqual(untracked["untracked_path_count"], 1)
+        self.assertNotEqual(untracked["working_tree_sha256"], self.fingerprint_after_removal("new.py"))
+
+        (self.target / "README.md").unlink()
+        deleted = self.fingerprint()
+        self.assertFalse(deleted["working_tree_clean"])
+        self.assertTrue(deleted["unstaged_changes"])
+        self.assertEqual(deleted["tracked_path_count"], 1)
+
+    def fingerprint_after_removal(self, relative: str) -> str:
+        path = self.target / relative
+        content = path.read_bytes()
+        path.unlink()
+        value = self.fingerprint()["working_tree_sha256"]
+        path.write_bytes(content)
+        return value
+
+    def test_ignored_untracked_sensitive_and_workflow_artifact_exclusions(self):
+        (self.target / ".gitignore").write_text("ignored-cache\n", encoding="utf-8")
+        git(self.target, "add", ".gitignore")
+        git(self.target, "commit", "-q", "-m", "ignore generated cache")
+        baseline = self.fingerprint()["working_tree_sha256"]
+        (self.target / "ignored-cache").write_text("ignored\n", encoding="utf-8")
+        (self.target / ".engineering" / "workflows" / "sample").mkdir(parents=True)
+        (self.target / ".engineering" / "workflows" / "sample" / "state.json").write_text("{}\n")
+        excluded = self.fingerprint()
+        self.assertEqual(excluded["working_tree_sha256"], baseline)
+        self.assertTrue(excluded["working_tree_clean"])
+        self.assertFalse(excluded["untracked_files"])
+
+        (self.target / ".env").write_text("secret value\n", encoding="utf-8")
+        with_sensitive = self.fingerprint()
+        self.assertEqual(with_sensitive["working_tree_sha256"], baseline)
+        self.assertFalse(with_sensitive["working_tree_clean"])
+        self.assertTrue(with_sensitive["untracked_files"])
+        self.assertEqual(with_sensitive["untracked_path_count"], 0)
+        self.assertEqual(with_sensitive["excluded_sensitive_path_count"], 1)
+
+    def test_untracked_and_tracked_file_content_fingerprints_differ(self):
+        first = self.fingerprint()["working_tree_sha256"]
+        (self.target / "extra.txt").write_text("alpha\n", encoding="utf-8")
+        alpha = self.fingerprint()["working_tree_sha256"]
+        (self.target / "extra.txt").write_text("bravo\n", encoding="utf-8")
+        bravo = self.fingerprint()["working_tree_sha256"]
+
+        self.assertNotEqual(first, alpha)
+        self.assertNotEqual(alpha, bravo)
+
+
 class PersistenceModuleTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="persistence-module-tests-")
@@ -3596,6 +3708,191 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual([item["proposal_version"] for item in records], [3, 4, 5])
         self.assertTrue(state["planning_validation_failure_history_truncated"])
         self.assertTrue(all(item["approval_eligible"] is False for item in records))
+
+
+class WorkflowExecutionFingerprintTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="workflow-fingerprint-tests-")
+        self.target = make_target(Path(self.temp.name) / "target")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    @staticmethod
+    def refined():
+        return (
+            "# Refined proposal\n\n## Scope\nImplement the requested behavior.\n\n"
+            "## Claude finding dispositions\n- No actionable findings.\n\nSecond plan review needed: no\n"
+        )
+
+    def make_runner(self, workflow_id: str, *, on_implementation=None):
+        codex = FakeCodex(
+            "# Proposal\nImplement the requested behavior.\n", self.refined(), "Implementation summary.\n",
+        )
+        codex.on_call = lambda index, command, kwargs: (
+            on_implementation(index, command, kwargs) if on_implementation is not None and index == 2 else None
+        )
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05),
+            response_factory=lambda _prompt, _budget, _executable: claude_reviewer.ReviewResult(
+                "Decision: APPROVED\nNo acceptance-blocking findings.", 0.05,
+            ),
+        )
+        runner = orchestrator.Orchestrator(
+            self.target, task="Implement the requested behavior", budget_usd=1.0,
+            workflow_id=workflow_id, process_runner=codex, claude_runner=claude,
+        )
+        return runner, codex, claude
+
+    def test_initial_harness_and_target_fingerprints_are_persisted_before_artifacts(self):
+        (self.target / "README.md").write_text("pre-existing user change\n", encoding="utf-8")
+        expected_target = workspace_ops.repository_fingerprint(self.target)
+        runner, codex, _claude = self.make_runner("initial-fingerprints")
+        observed_before_provider = []
+        codex.on_call = lambda index, _command, _kwargs: observed_before_provider.append(
+            json.loads(runner.state_path.read_text(encoding="utf-8"))["execution_fingerprint"]["initial"]
+        ) if index == 0 else None
+
+        state = runner.start()
+
+        initial = state["execution_fingerprint"]["initial"]
+        self.assertEqual(initial["target"]["status"], "captured")
+        self.assertEqual(initial["target"]["working_tree_sha256"], expected_target["working_tree_sha256"])
+        self.assertFalse(initial["target"]["working_tree_clean"])
+        self.assertEqual(initial["harness"]["status"], "captured")
+        self.assertEqual(
+            initial["harness"]["repository_root"], str(Path(orchestrator.__file__).resolve().parents[1]),
+        )
+        persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["execution_fingerprint"]["initial"], initial)
+        self.assertEqual(observed_before_provider[0], initial)
+
+    def test_final_fingerprint_and_summary_keep_preexisting_changes_unattributed(self):
+        (self.target / "README.md").write_text("pre-existing user change\n", encoding="utf-8")
+
+        def implement(_index, _command, _kwargs):
+            generated = self.target / "src" / "generated.py"
+            generated.parent.mkdir(parents=True, exist_ok=True)
+            generated.write_text("value = 42\n", encoding="utf-8")
+
+        runner, _codex, _claude = self.make_runner("final-fingerprints", on_implementation=implement)
+        runner.start()
+        state = orchestrator.Orchestrator(
+            self.target, workflow_id="final-fingerprints", process_runner=runner.process_runner,
+            claude_runner=runner.claude_runner,
+        ).approve()
+
+        final = state["execution_fingerprint"]["final"]
+        self.assertEqual(state["status"], "complete")
+        self.assertEqual(final["target"]["status"], "captured")
+        self.assertEqual(final["target"]["commit_sha"], git(self.target, "rev-parse", "HEAD"))
+        summary = final["change_summary"]
+        self.assertEqual(summary["status"], "captured")
+        self.assertEqual(summary["counts_by_attribution"]["preexisting_or_overlapping"], 1)
+        self.assertEqual(summary["counts_by_attribution"]["changed_after_initial_capture"], 1)
+        self.assertIn("README.md", [
+            item["path"] for item in summary["examples_by_attribution"]["preexisting_or_overlapping"]
+        ])
+        self.assertIn("src/generated.py", [
+            item["path"] for item in summary["examples_by_attribution"]["changed_after_initial_capture"]
+        ])
+        self.assertIn("concurrent edits cannot be excluded", summary["attribution_limit"])
+        delivery = (runner.workflow_dir / "delivery.md").read_text(encoding="utf-8")
+        self.assertIn("Initial harness: commit", delivery)
+        self.assertIn("Initial target: commit", delivery)
+        self.assertIn("Final target: commit", delivery)
+        self.assertIn("preexisting or overlapping", delivery)
+        self.assertIn("concurrent edits cannot be excluded", delivery)
+
+    def test_resume_preserves_initial_fingerprints_without_recalculating_them(self):
+        runner, _codex, _claude = self.make_runner("fingerprint-resume")
+        initial_state = runner.start()
+        original_initial = copy.deepcopy(initial_state["execution_fingerprint"]["initial"])
+        (self.target / "README.md").write_text("changed after workflow start\n", encoding="utf-8")
+
+        resumed = orchestrator.Orchestrator(self.target, workflow_id="fingerprint-resume").resume()
+
+        self.assertEqual(resumed["execution_fingerprint"]["initial"], original_initial)
+        self.assertIsNone(resumed["execution_fingerprint"].get("final"))
+
+    def test_fingerprint_errors_are_recorded_without_blocking_start(self):
+        runner, _codex, _claude = self.make_runner("fingerprint-error")
+        with patch.object(workspace_ops, "repository_fingerprint", side_effect=workspace_ops.WorkspaceError("hidden")):
+            state = runner.start()
+
+        initial = state["execution_fingerprint"]["initial"]
+        self.assertEqual(state["status"], "awaiting_approval")
+        for repository in ("harness", "target"):
+            self.assertEqual(initial[repository]["status"], "unavailable")
+            self.assertEqual(initial[repository]["error_category"], "WorkspaceError")
+            self.assertNotIn("hidden", json.dumps(initial[repository]))
+
+    def test_final_fingerprint_failure_does_not_discard_completed_evidence(self):
+        def implement(_index, _command, _kwargs):
+            generated = self.target / "generated.py"
+            generated.write_text("value = 1\n", encoding="utf-8")
+
+        runner, _codex, _claude = self.make_runner("final-fingerprint-error", on_implementation=implement)
+        runner.start()
+        with patch.object(workspace_ops, "repository_fingerprint", side_effect=workspace_ops.WorkspaceError("hidden")):
+            state = orchestrator.Orchestrator(
+                self.target, workflow_id="final-fingerprint-error", process_runner=runner.process_runner,
+                claude_runner=runner.claude_runner,
+            ).approve()
+
+        self.assertEqual(state["status"], "complete")
+        self.assertEqual(state["implementation_summary"], "Implementation summary.")
+        self.assertEqual(state["execution_fingerprint"]["final"]["target"]["status"], "unavailable")
+        self.assertTrue((runner.workflow_dir / "delivery.md").is_file())
+        persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["status"], "complete")
+        self.assertEqual(persisted["implementation_summary"], "Implementation summary.")
+
+    def test_rejected_and_recovery_required_workflows_capture_final_target(self):
+        rejected_runner, _codex, _claude = self.make_runner("rejected-final-fingerprint")
+        rejected_runner.start()
+        rejected = rejected_runner.reject("Out of scope")
+        self.assertEqual(rejected["status"], "rejected")
+        self.assertEqual(rejected["execution_fingerprint"]["final"]["target"]["status"], "captured")
+
+        recovery_runner, _codex, _claude = self.make_runner("recovery-final-fingerprint")
+        recovery_runner.start()
+        with recovery_runner._workflow_lock():
+            recovery_runner._read_state()
+            recovery_runner._require_recovery(None, "simulated interrupted operation")
+        recovery_state = json.loads(recovery_runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(recovery_state["status"], "recovery_required")
+        self.assertEqual(
+            recovery_state["execution_fingerprint"]["final"]["target"]["status"], "captured",
+        )
+
+    def test_failed_workflow_captures_final_target_fingerprint(self):
+        def failing_codex(_command, **_kwargs):
+            raise RuntimeError("simulated command failure")
+
+        runner = orchestrator.Orchestrator(
+            self.target, task="Fail safely", workflow_id="failed-final-fingerprint",
+            process_runner=failing_codex, claude_runner=FakeClaude(),
+        )
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "Workflow stopped at planning"):
+            runner.start()
+
+        state = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["execution_fingerprint"]["final"]["target"]["status"], "captured")
+
+    def test_legacy_state_without_fingerprints_remains_resumable(self):
+        runner, _codex, _claude = self.make_runner("legacy-no-fingerprints")
+        runner.start()
+        with runner._workflow_lock():
+            runner._read_state()
+            runner.state.pop("execution_fingerprint", None)
+            runner._save()
+
+        resumed = orchestrator.Orchestrator(self.target, workflow_id="legacy-no-fingerprints").resume()
+
+        self.assertEqual(resumed["status"], "awaiting_approval")
+        self.assertNotIn("execution_fingerprint", resumed)
 
 
 if __name__ == "__main__":

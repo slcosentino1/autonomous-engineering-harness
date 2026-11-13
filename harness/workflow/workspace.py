@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shlex
+import stat
 import subprocess
 from pathlib import Path
 from typing import Callable
@@ -18,6 +20,9 @@ WORKFLOW_ROOT = ".engineering/workflows"
 
 
 WORKFLOW_LOCK_NAME_RE = re.compile(r"^\.[A-Za-z0-9][A-Za-z0-9._-]{0,79}\.lock$")
+FINGERPRINT_VERSION = 1
+FINGERPRINT_ALGORITHM = "sha256-length-prefixed-head-index-worktree-v1"
+FINGERPRINT_EXCLUDED_INTERNAL_PATHS = [".git at any depth", f"{WORKFLOW_ROOT}/**"]
 
 
 SENSITIVE_NAMES = {
@@ -34,11 +39,15 @@ def git_env() -> dict[str, str]:
 
 def git(
     target: Path, *args: str, check: bool = True, redactor: Callable[[str], str] | None = None,
+    read_only: bool = False,
 ) -> bytes:
+    env = git_env()
+    if read_only:
+        env["GIT_OPTIONAL_LOCKS"] = "0"
     result = subprocess.run(
         ["git", "-c", "core.pager=cat", "-c", "maintenance.auto=false", "-C", str(target), *args],
         cwd=target,
-        env=git_env(),
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
@@ -49,6 +58,267 @@ def git(
             detail = redactor(detail)
         raise WorkspaceError(f"Git command failed ({' '.join(shlex.quote(part) for part in args)}): {detail}")
     return result.stdout
+
+
+def _fingerprint_git(
+    target: Path, *args: str, redactor: Callable[[str], str] | None = None,
+) -> bytes:
+    return git(target, *args, redactor=redactor, read_only=True)
+
+
+def _fingerprint_internal_path(path: bytes) -> bool:
+    parts = path.split(b"/")
+    return b".git" in parts or path == WORKFLOW_ROOT.encode() or path.startswith(WORKFLOW_ROOT.encode() + b"/")
+
+
+def _fingerprint_sensitive_path(path: bytes) -> bool:
+    relative = os.fsdecode(path)
+    name = Path(relative).name.lower()
+    return is_sensitive(relative) or name.startswith(".env.")
+
+
+def fingerprint_path_is_sensitive(path: str | bytes) -> bool:
+    """Return whether a relative repository path is excluded from content hashing."""
+    return _fingerprint_sensitive_path(os.fsencode(path) if isinstance(path, str) else path)
+
+
+def _fingerprint_field(digest, name: bytes, value: bytes) -> None:
+    digest.update(len(name).to_bytes(2, "big"))
+    digest.update(name)
+    digest.update(len(value).to_bytes(8, "big"))
+    digest.update(value)
+
+
+def _parse_ls_tree(output: bytes) -> dict[bytes, list[tuple[bytes, bytes, bytes]]]:
+    entries: dict[bytes, list[tuple[bytes, bytes, bytes]]] = {}
+    for record in output.split(b"\0"):
+        if not record:
+            continue
+        header, separator, path = record.partition(b"\t")
+        fields = header.split(b" ")
+        if not separator or len(fields) != 3:
+            raise WorkspaceError("Git returned an invalid tree record during fingerprinting.")
+        mode, object_type, object_id = fields
+        entries.setdefault(path, []).append((mode, object_type, object_id))
+    return entries
+
+
+def _parse_index(output: bytes) -> dict[bytes, list[tuple[bytes, bytes, bytes]]]:
+    entries: dict[bytes, list[tuple[bytes, bytes, bytes]]] = {}
+    for record in output.split(b"\0"):
+        if not record:
+            continue
+        header, separator, path = record.partition(b"\t")
+        fields = header.split(b" ")
+        if not separator or len(fields) != 3:
+            raise WorkspaceError("Git returned an invalid index record during fingerprinting.")
+        mode, object_id, stage = fields
+        entries.setdefault(path, []).append((mode, object_id, stage))
+    return entries
+
+
+def _status_flags(output: bytes) -> tuple[bool, bool, bool, int]:
+    staged = False
+    unstaged = False
+    untracked = 0
+    for record in output.split(b"\0"):
+        if not record:
+            continue
+        if len(record) < 4 or record[2:3] != b" ":
+            raise WorkspaceError("Git returned an invalid status record during fingerprinting.")
+        path = record[3:]
+        if _fingerprint_internal_path(path):
+            continue
+        status = record[:2]
+        if status == b"??":
+            untracked += 1
+        else:
+            staged = staged or status[0:1] != b" "
+            unstaged = unstaged or status[1:2] != b" "
+    return staged, unstaged, untracked > 0, untracked
+
+
+def _hash_worktree_path(
+    root: Path,
+    path: bytes,
+    index_entries: list[tuple[bytes, bytes, bytes]],
+    *,
+    redactor=None,
+    depth: int = 0,
+) -> tuple[bytes, bytes, bytes, bytes]:
+    full_path = root / os.fsdecode(path)
+    parent = root
+    for component in Path(os.fsdecode(path)).parts[:-1]:
+        parent = parent / component
+        try:
+            parent_mode = parent.lstat().st_mode
+        except FileNotFoundError:
+            break
+        if stat.S_ISLNK(parent_mode):
+            raise WorkspaceError("A repository path traverses a symbolic link during fingerprinting.")
+    try:
+        metadata = full_path.lstat()
+    except FileNotFoundError:
+        return b"missing", b"", b"0", b""
+    mode = stat.S_IMODE(metadata.st_mode)
+    mode_bytes = format(mode, "04o").encode("ascii")
+    if stat.S_ISLNK(metadata.st_mode):
+        link_target = os.fsencode(os.readlink(full_path))
+        return b"symlink", mode_bytes, str(len(link_target)).encode("ascii"), hashlib.sha256(link_target).digest()
+    if stat.S_ISREG(metadata.st_mode):
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(full_path, flags)
+        except OSError as exc:
+            raise WorkspaceError("A repository file could not be read for fingerprinting.") from exc
+        file_hash = hashlib.sha256()
+        size = 0
+        try:
+            before = os.fstat(descriptor)
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                file_hash.update(chunk)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        if (before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns
+                or before.st_ctime_ns != after.st_ctime_ns or size != after.st_size):
+            raise WorkspaceError("A repository file changed while its fingerprint was being calculated.")
+        return b"file", mode_bytes, str(size).encode("ascii"), file_hash.digest()
+    if stat.S_ISDIR(metadata.st_mode) and any(entry[0] == b"160000" for entry in index_entries):
+        if depth >= 16:
+            raise WorkspaceError("Nested submodules exceed the fingerprint recursion limit.")
+        submodule = repository_fingerprint(full_path, redactor=redactor, _depth=depth + 1)
+        details = (
+            f"{submodule['commit_sha']}:{submodule['working_tree_sha256']}:{submodule['working_tree_clean']}"
+        ).encode("ascii")
+        return b"submodule", mode_bytes, b"0", hashlib.sha256(details).digest()
+    if stat.S_ISDIR(metadata.st_mode):
+        return b"directory", mode_bytes, b"0", b""
+    if stat.S_ISFIFO(metadata.st_mode):
+        kind = b"fifo"
+    elif stat.S_ISSOCK(metadata.st_mode):
+        kind = b"socket"
+    elif stat.S_ISCHR(metadata.st_mode):
+        kind = b"character_device"
+    elif stat.S_ISBLK(metadata.st_mode):
+        kind = b"block_device"
+    else:
+        kind = b"special"
+    return kind, mode_bytes, b"0", b""
+
+
+def repository_fingerprint(
+    root: Path, *, redactor: Callable[[str], str] | None = None, expected_commit: str | None = None,
+    _depth: int = 0,
+) -> dict:
+    """Fingerprint HEAD, index entries, and relevant current file contents without modifying the repository."""
+    root = Path(root).resolve(strict=True)
+    top_level = _fingerprint_git(root, "rev-parse", "--show-toplevel", redactor=redactor).decode(
+        "utf-8", "strict",
+    ).strip()
+    canonical_root = Path(top_level).resolve(strict=True)
+    if canonical_root != root:
+        raise WorkspaceError("Fingerprint root must be the canonical Git repository root.")
+    commit_sha = _fingerprint_git(root, "rev-parse", "HEAD", redactor=redactor).decode("ascii", "strict").strip()
+    if expected_commit is not None and commit_sha != expected_commit:
+        raise WorkspaceError("Repository HEAD changed while the initial fingerprint was being captured.")
+
+    head_entries = _parse_ls_tree(_fingerprint_git(
+        root, "ls-tree", "-r", "-z", "--full-tree", "HEAD", redactor=redactor,
+    ))
+    index_listing = _fingerprint_git(root, "ls-files", "--stage", "-z", redactor=redactor)
+    index_entries = _parse_index(index_listing)
+    untracked_paths = {
+        path for path in _fingerprint_git(
+            root, "ls-files", "--others", "--exclude-standard", "-z", redactor=redactor,
+        )
+        .split(b"\0") if path
+    }
+    status = _fingerprint_git(
+        root, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames",
+        "--ignore-submodules=none", redactor=redactor,
+    )
+    staged_changes, unstaged_changes, has_untracked_status, _untracked_status_count = _status_flags(status)
+    relevant_status = []
+    for record in status.split(b"\0"):
+        if not record:
+            continue
+        path = record[3:]
+        if not _fingerprint_internal_path(path):
+            relevant_status.append(record)
+    working_tree_clean = not relevant_status
+
+    all_paths = set(head_entries) | set(index_entries) | untracked_paths
+    relevant_paths = sorted(
+        path for path in all_paths
+        if not _fingerprint_internal_path(path) and not _fingerprint_sensitive_path(path)
+    )
+    digest = hashlib.sha256()
+    digest.update(b"workflow-repository-fingerprint-v1\0")
+    _fingerprint_field(digest, b"commit", commit_sha.encode("ascii"))
+    for path in relevant_paths:
+        _fingerprint_field(digest, b"path", path)
+        head_records = sorted(head_entries.get(path, []))
+        _fingerprint_field(digest, b"head_count", str(len(head_records)).encode("ascii"))
+        for mode, object_type, object_id in head_records:
+            _fingerprint_field(digest, b"head_mode", mode)
+            _fingerprint_field(digest, b"head_type", object_type)
+            _fingerprint_field(digest, b"head_object", object_id)
+        index_records = sorted(index_entries.get(path, []))
+        _fingerprint_field(digest, b"index_count", str(len(index_records)).encode("ascii"))
+        for mode, object_id, stage in index_records:
+            _fingerprint_field(digest, b"index_mode", mode)
+            _fingerprint_field(digest, b"index_object", object_id)
+            _fingerprint_field(digest, b"index_stage", stage)
+        _fingerprint_field(digest, b"untracked", b"1" if path in untracked_paths else b"0")
+        kind, mode, size, content_sha256 = _hash_worktree_path(
+            root, path, index_records, redactor=redactor, depth=_depth,
+        )
+        _fingerprint_field(digest, b"worktree_kind", kind)
+        _fingerprint_field(digest, b"worktree_mode", mode)
+        _fingerprint_field(digest, b"worktree_size", size)
+        _fingerprint_field(digest, b"worktree_content_sha256", content_sha256)
+
+    commit_after = _fingerprint_git(root, "rev-parse", "HEAD", redactor=redactor).decode("ascii", "strict").strip()
+    index_after = _fingerprint_git(root, "ls-files", "--stage", "-z", redactor=redactor)
+    untracked_after = _fingerprint_git(
+        root, "ls-files", "--others", "--exclude-standard", "-z", redactor=redactor,
+    )
+    status_after = _fingerprint_git(
+        root, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames",
+        "--ignore-submodules=none", redactor=redactor,
+    )
+    if commit_after != commit_sha or index_after != index_listing or status_after != status:
+        raise WorkspaceError("Git repository metadata changed during fingerprint calculation.")
+    if {
+        path for path in untracked_after.split(b"\0") if path
+    } != untracked_paths:
+        raise WorkspaceError("Untracked repository files changed during fingerprint calculation.")
+
+    return {
+        "version": FINGERPRINT_VERSION,
+        "algorithm": FINGERPRINT_ALGORITHM,
+        "repository_root": str(canonical_root),
+        "commit_sha": commit_sha,
+        "working_tree_sha256": digest.hexdigest(),
+        "working_tree_clean": working_tree_clean,
+        "staged_changes": staged_changes,
+        "unstaged_changes": unstaged_changes,
+        "untracked_files": has_untracked_status,
+        "tracked_path_count": len({
+            path for path in relevant_paths if path in head_entries or path in index_entries
+        }),
+        "untracked_path_count": len({path for path in relevant_paths if path in untracked_paths}),
+        "excluded_sensitive_path_count": len({path for path in all_paths if _fingerprint_sensitive_path(path)}),
+        "excluded_internal_paths": FINGERPRINT_EXCLUDED_INTERNAL_PATHS.copy(),
+        "excluded_sensitive_paths": "known sensitive path components and .env.* basenames",
+        "ignored_untracked_files_excluded": True,
+        "tracked_ignored_files_included": True,
+    }
 
 
 def canonical_target(value: str, *, redactor: Callable[[str], str] | None = None) -> Path:

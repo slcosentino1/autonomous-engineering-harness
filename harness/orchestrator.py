@@ -82,6 +82,7 @@ MAX_AUTHORIZED_CODE_REVIEW_CALLS = 64
 MAX_PLANNING_FAILURE_OUTPUT_CHARS = 50_000
 MAX_PLANNING_FAILURE_RECORDS = 3
 MAX_OPERATION_HISTORY = 100
+MAX_EXECUTION_CHANGE_EXAMPLES = 10
 TRACE_STAGES = frozenset({
     "planning", "plan_review_1", "plan_review_2", "plan_refine_1", "plan_refine_2",
     "human_revision", "implementation", "code_review", "correction", "complete",
@@ -1260,6 +1261,97 @@ class Orchestrator:
             if path != WORKFLOW_ROOT and not path.startswith(WORKFLOW_ROOT + "/")
         ]
 
+    def _fingerprint_repository(self, repository: Path, *, expected_commit: str | None = None) -> dict:
+        try:
+            fingerprint = _workspace.repository_fingerprint(
+                repository, redactor=redact, expected_commit=expected_commit,
+            )
+        except Exception as exc:
+            return {
+                "status": "unavailable",
+                "error_category": type(exc).__name__,
+                "error": "Fingerprint calculation failed; repository state is unavailable.",
+            }
+        return {"status": "captured", "captured_at": now(), **fingerprint}
+
+    def _capture_initial_fingerprints(self, baseline_commit: str) -> dict:
+        harness_root = Path(__file__).resolve().parents[1]
+        return {
+            "captured_at": now(),
+            "harness": self._fingerprint_repository(harness_root),
+            "target": self._fingerprint_repository(self.target, expected_commit=baseline_commit),
+        }
+
+    def _execution_change_summary(self, initial_target: dict | None) -> dict:
+        if not isinstance(initial_target, dict) or initial_target.get("status") != "captured":
+            return {
+                "status": "unavailable",
+                "reason": "The initial target fingerprint was not captured; change attribution is unavailable.",
+            }
+        try:
+            inventory = self._target_change_inventory()
+        except Exception as exc:
+            return {
+                "status": "unavailable",
+                "error_category": type(exc).__name__,
+                "reason": "The target change inventory could not be calculated.",
+            }
+
+        counts = {"added": 0, "modified": 0, "deleted": 0, "untracked": 0, "type_changed": 0}
+        attributed_counts = {"preexisting_or_overlapping": 0, "changed_after_initial_capture": 0}
+        examples: dict[str, list[dict[str, str]]] = {
+            "preexisting_or_overlapping": [], "changed_after_initial_capture": [],
+        }
+        truncated = {key: False for key in examples}
+        for item in inventory:
+            change = item.get("change", "modified")
+            counts[change] = counts.get(change, 0) + 1
+            category = (
+                "preexisting_or_overlapping" if item.get("preexisting") == "yes"
+                else "changed_after_initial_capture"
+            )
+            attributed_counts[category] += 1
+            path = item.get("path", "")
+            encoded_path = path.encode("utf-8", "surrogateescape")
+            if _workspace.fingerprint_path_is_sensitive(encoded_path):
+                continue
+            if len(examples[category]) >= MAX_EXECUTION_CHANGE_EXAMPLES:
+                truncated[category] = True
+                continue
+            safe_path = encoded_path.decode("utf-8", "replace")
+            safe_path = "".join(character if character.isprintable() else "?" for character in safe_path)
+            safe_path = redact(safe_path).replace("`", "'")[:240]
+            examples[category].append({"path": safe_path, "change": change})
+
+        return {
+            "status": "captured",
+            "counts_by_change": counts,
+            "counts_by_attribution": attributed_counts,
+            "examples_by_attribution": examples,
+            "examples_truncated": truncated,
+            "attribution_limit": (
+                "Paths clean at initialization and changed afterward are not proof of agent authorship; "
+                "concurrent edits cannot be excluded. Paths already changed at initialization are classified "
+                "as preexisting or overlapping."
+            ),
+        }
+
+    def _capture_final_target_fingerprint(self) -> None:
+        execution = self.state.setdefault("execution_fingerprint", {})
+        if not isinstance(execution, dict):
+            execution = {}
+            self.state["execution_fingerprint"] = execution
+        initial = execution.get("initial") if isinstance(execution.get("initial"), dict) else {}
+        execution["version"] = _workspace.FINGERPRINT_VERSION
+        execution["algorithm"] = _workspace.FINGERPRINT_ALGORITHM
+        execution["excluded_internal_paths"] = _workspace.FINGERPRINT_EXCLUDED_INTERNAL_PATHS.copy()
+        execution["excluded_sensitive_paths"] = "known sensitive path components and .env.* basenames"
+        execution["final"] = {
+            "captured_at": now(),
+            "target": self._fingerprint_repository(self.target),
+            "change_summary": self._execution_change_summary(initial.get("target")),
+        }
+
     def _require_recovery(self, operation: dict | None, reason: str) -> None:
         if operation is not None and operation.get("status") == "started":
             operation["status"] = "interrupted"
@@ -1313,6 +1405,7 @@ class Orchestrator:
         self.state["recovery"] = recovery
         self.state["status"] = "recovery_required"
         self.state["error"] = redact(reason)
+        self._capture_final_target_fingerprint()
         self._save()
 
     def _resolve_recovery(
@@ -1569,6 +1662,7 @@ class Orchestrator:
             external["active_call"] = None
             self.state["error"] = "A prior Claude call ended without a recorded result; further paid reviews are stopped."
             self.state["status"] = "failed"
+            self._capture_final_target_fingerprint()
             self._save()
 
     def _read_proposal(self) -> str:
@@ -1598,6 +1692,7 @@ class Orchestrator:
         if budget != budget.quantize(Decimal("0.01")):
             raise WorkflowError("--budget-usd must use at most two decimal places.")
         baseline = git(self.target, "rev-parse", "HEAD").decode("ascii", "strict").strip()
+        initial_fingerprints = self._capture_initial_fingerprints(baseline)
         self.workflow_dir = _check_plain_directories(self.target, WORKFLOW_ROOT, create=True) / self.workflow_id
         if self.workflow_dir.exists() or self.workflow_dir.is_symlink():
             raise WorkflowError(f"Workflow already exists: {self.workflow_id}")
@@ -1616,6 +1711,13 @@ class Orchestrator:
             "stage": "planning",
             "codex_model": self.model,
             "baseline_commit": baseline,
+            "execution_fingerprint": {
+                "version": _workspace.FINGERPRINT_VERSION,
+                "algorithm": _workspace.FINGERPRINT_ALGORITHM,
+                "excluded_internal_paths": _workspace.FINGERPRINT_EXCLUDED_INTERNAL_PATHS.copy(),
+                "excluded_sensitive_paths": "known sensitive path components and .env.* basenames",
+                "initial": initial_fingerprints,
+            },
             "preexisting_paths": _protected_paths(self.target, baseline),
             "project_guidance": _project_guidance(self.target, self.task.strip()),
             "proposal_version": 0,
@@ -1719,6 +1821,7 @@ class Orchestrator:
         self.state["status"] = "rejected"
         self.state["rejection_reason"] = reason.strip() or "Rejected by the user."
         self.state["completed_at"] = now()
+        self._capture_final_target_fingerprint()
         self._save()
         return self.state
 
@@ -2623,6 +2726,7 @@ class Orchestrator:
                 return
         self.state["status"] = "failed"
         self.state["error"] = redact(str(exc))
+        self._capture_final_target_fingerprint()
         self._save()
 
     def run_pending(self) -> dict:
@@ -2856,6 +2960,7 @@ class Orchestrator:
                 elif stage == "complete":
                     self.state["status"] = "complete"
                     self.state["completed_at"] = now()
+                    self._capture_final_target_fingerprint()
                     _atomic_text(self.delivery_path, self._delivery_report())
                     self._save()
                 else:
@@ -3006,6 +3111,96 @@ class Orchestrator:
             f"Invalidated plan-review attempts: {len(reviews) - len(valid_reviews)}.",
             "",
         ]
+        execution_fingerprint = self.state.get("execution_fingerprint", {})
+        if not isinstance(execution_fingerprint, dict):
+            execution_fingerprint = {}
+        initial_fingerprints = execution_fingerprint.get("initial", {})
+        if not isinstance(initial_fingerprints, dict):
+            initial_fingerprints = {}
+        initial_harness = initial_fingerprints.get("harness", {})
+        initial_target = initial_fingerprints.get("target", {})
+        if not isinstance(initial_harness, dict):
+            initial_harness = {}
+        if not isinstance(initial_target, dict):
+            initial_target = {}
+        final_fingerprints = execution_fingerprint.get("final", {}) if isinstance(
+            execution_fingerprint, dict,
+        ) else {}
+        if not isinstance(final_fingerprints, dict):
+            final_fingerprints = {}
+        final_target = final_fingerprints.get("target", {})
+        if not isinstance(final_target, dict):
+            final_target = {}
+
+        def fingerprint_value(record: dict, key: str) -> str:
+            if record.get("status") != "captured":
+                return "unavailable"
+            value = record.get(key)
+            return value if isinstance(value, str) and value else "unavailable"
+
+        sections.extend([
+            "## Execution fingerprints",
+            "",
+            f"- Algorithm: `{execution_fingerprint.get('algorithm', 'unavailable')}`.",
+            f"- Initial harness: commit `{fingerprint_value(initial_harness, 'commit_sha')}`; working tree SHA-256 "
+            f"`{fingerprint_value(initial_harness, 'working_tree_sha256')}`.",
+            f"- Initial target: commit `{fingerprint_value(initial_target, 'commit_sha')}`; working tree SHA-256 "
+            f"`{fingerprint_value(initial_target, 'working_tree_sha256')}`.",
+            f"- Target dirty at initialization: "
+            f"{'yes' if initial_target.get('status') == 'captured' and not initial_target.get('working_tree_clean') else 'no' if initial_target.get('status') == 'captured' else 'unknown'}.",
+            f"- Final target: commit `{fingerprint_value(final_target, 'commit_sha')}`; working tree SHA-256 "
+            f"`{fingerprint_value(final_target, 'working_tree_sha256')}`; "
+            f"clean={'yes' if final_target.get('status') == 'captured' and final_target.get('working_tree_clean') else 'no' if final_target.get('status') == 'captured' else 'unknown'}.",
+        ])
+        change_summary = final_fingerprints.get("change_summary", {})
+        if not isinstance(change_summary, dict):
+            change_summary = {}
+        if change_summary.get("status") == "captured":
+            change_counts = change_summary.get("counts_by_change", {})
+            attribution_counts = change_summary.get("counts_by_attribution", {})
+            if not isinstance(change_counts, dict):
+                change_counts = {}
+            if not isinstance(attribution_counts, dict):
+                attribution_counts = {}
+            examples_by_attribution = change_summary.get("examples_by_attribution", {})
+            examples_truncated = change_summary.get("examples_truncated", {})
+            if not isinstance(examples_by_attribution, dict):
+                examples_by_attribution = {}
+            if not isinstance(examples_truncated, dict):
+                examples_truncated = {}
+            sections.extend([
+                "- Changes relative to the starting baseline: " + ", ".join(
+                    f"{name} {change_counts.get(name, 0)}"
+                    for name in ("added", "modified", "deleted", "untracked", "type_changed")
+                ) + ".",
+                "- Path attribution: "
+                f"{attribution_counts.get('preexisting_or_overlapping', 0)} preexisting or overlapping; "
+                f"{attribution_counts.get('changed_after_initial_capture', 0)} changed after initial capture.",
+                "- Attribution limit: " + change_summary.get(
+                    "attribution_limit", "Concurrent edits cannot be excluded.",
+                ),
+            ])
+            for category, label in (
+                ("preexisting_or_overlapping", "Preexisting or overlapping path examples"),
+                ("changed_after_initial_capture", "Changed after initial capture path examples"),
+            ):
+                examples = examples_by_attribution.get(category, [])
+                if not isinstance(examples, list):
+                    examples = []
+                if examples:
+                    sections.append(f"- {label}: " + ", ".join(
+                        f"`{item['path']}` ({item['change']})" for item in examples
+                        if isinstance(item, dict) and isinstance(item.get("path"), str)
+                    ) + ("; more omitted" if examples_truncated.get(category) else "") + ".")
+        else:
+            sections.append("- Change summary: " + change_summary.get(
+                "reason", "unavailable",
+            ))
+        sections.extend([
+            "- Fingerprint scope excludes `.git/**`, `.engineering/workflows/**`, ignored untracked files, and "
+            "known sensitive paths; tracked ignored files remain included.",
+            "",
+        ])
         for record in reviews:
             validity = "valid" if record.get("valid") is True else "invalidated"
             sections.extend([f"### Attempt {record.get('attempt', record.get('iteration'))} ({validity})", "",
