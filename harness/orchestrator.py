@@ -1330,9 +1330,10 @@ class Orchestrator:
             "examples_by_attribution": examples,
             "examples_truncated": truncated,
             "attribution_limit": (
-                "Paths clean at initialization and changed afterward are not proof of agent authorship; "
-                "concurrent edits cannot be excluded. Paths already changed at initialization are classified "
-                "as preexisting or overlapping."
+                "Paths present in the final baseline comparison but absent from the starting pre-existing "
+                "inventory are not proof of agent authorship or when they changed; concurrent edits cannot be "
+                "excluded. Transient changes absent from the final snapshot are not recorded. Paths already "
+                "changed at initialization are classified as preexisting or overlapping."
             ),
         }
 
@@ -3175,14 +3176,15 @@ class Orchestrator:
                 ) + ".",
                 "- Path attribution: "
                 f"{attribution_counts.get('preexisting_or_overlapping', 0)} preexisting or overlapping; "
-                f"{attribution_counts.get('changed_after_initial_capture', 0)} changed after initial capture.",
+                f"{attribution_counts.get('changed_after_initial_capture', 0)} final-state paths not marked "
+                "preexisting at initialization.",
                 "- Attribution limit: " + change_summary.get(
                     "attribution_limit", "Concurrent edits cannot be excluded.",
                 ),
             ])
             for category, label in (
                 ("preexisting_or_overlapping", "Preexisting or overlapping path examples"),
-                ("changed_after_initial_capture", "Changed after initial capture path examples"),
+                ("changed_after_initial_capture", "Final-state paths not marked preexisting at initialization"),
             ):
                 examples = examples_by_attribution.get(category, [])
                 if not isinstance(examples, list):

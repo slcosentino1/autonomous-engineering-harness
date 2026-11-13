@@ -118,6 +118,7 @@ def _parse_index(output: bytes) -> dict[bytes, list[tuple[bytes, bytes, bytes]]]
 
 
 def _status_flags(output: bytes) -> tuple[bool, bool, bool, int]:
+    """Return Git status across non-internal paths, including sensitive paths."""
     staged = False
     unstaged = False
     untracked = 0
@@ -198,6 +199,7 @@ def _hash_worktree_path(
         return b"submodule", mode_bytes, b"0", hashlib.sha256(details).digest()
     if stat.S_ISDIR(metadata.st_mode):
         return b"directory", mode_bytes, b"0", b""
+    # Git does not store these objects' contents; record only their kind and mode, never open them.
     if stat.S_ISFIFO(metadata.st_mode):
         kind = b"fifo"
     elif stat.S_ISSOCK(metadata.st_mode):
@@ -215,7 +217,12 @@ def repository_fingerprint(
     root: Path, *, redactor: Callable[[str], str] | None = None, expected_commit: str | None = None,
     _depth: int = 0,
 ) -> dict:
-    """Fingerprint HEAD, index entries, and relevant current file contents without modifying the repository."""
+    """Capture the v1 Git identity, scoped status, and relevant file contents without repository writes.
+
+    The v1 content digest deliberately includes the complete HEAD commit ID even though sensitive paths are
+    omitted from per-path content fields. Git status indicators and the excluded-path count also cover sensitive
+    paths; they reveal presence/status only, not their names or contents.
+    """
     root = Path(root).resolve(strict=True)
     top_level = _fingerprint_git(root, "rev-parse", "--show-toplevel", redactor=redactor).decode(
         "utf-8", "strict",
@@ -242,6 +249,7 @@ def repository_fingerprint(
         root, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames",
         "--ignore-submodules=none", redactor=redactor,
     )
+    # Status is repository-wide apart from generated workflow internals; sensitive paths affect these flags.
     staged_changes, unstaged_changes, has_untracked_status, _untracked_status_count = _status_flags(status)
     relevant_status = []
     for record in status.split(b"\0"):
@@ -259,6 +267,7 @@ def repository_fingerprint(
     )
     digest = hashlib.sha256()
     digest.update(b"workflow-repository-fingerprint-v1\0")
+    # Keep the full Git commit identity in v1; it covers committed sensitive paths as part of HEAD.
     _fingerprint_field(digest, b"commit", commit_sha.encode("ascii"))
     for path in relevant_paths:
         _fingerprint_field(digest, b"path", path)
@@ -313,7 +322,11 @@ def repository_fingerprint(
             path for path in relevant_paths if path in head_entries or path in index_entries
         }),
         "untracked_path_count": len({path for path in relevant_paths if path in untracked_paths}),
-        "excluded_sensitive_path_count": len({path for path in all_paths if _fingerprint_sensitive_path(path)}),
+        # A count discloses only how many excluded paths exist, not their names or contents.
+        "excluded_sensitive_path_count": len({
+            path for path in all_paths
+            if not _fingerprint_internal_path(path) and _fingerprint_sensitive_path(path)
+        }),
         "excluded_internal_paths": FINGERPRINT_EXCLUDED_INTERNAL_PATHS.copy(),
         "excluded_sensitive_paths": "known sensitive path components and .env.* basenames",
         "ignored_untracked_files_excluded": True,

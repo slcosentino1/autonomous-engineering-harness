@@ -713,10 +713,12 @@ class RepositoryFingerprintTests(unittest.TestCase):
         (self.target / "ignored-cache").write_text("ignored\n", encoding="utf-8")
         (self.target / ".engineering" / "workflows" / "sample").mkdir(parents=True)
         (self.target / ".engineering" / "workflows" / "sample" / "state.json").write_text("{}\n")
+        (self.target / ".engineering" / "workflows" / "sample" / ".env").write_text("workflow secret\n")
         excluded = self.fingerprint()
         self.assertEqual(excluded["working_tree_sha256"], baseline)
         self.assertTrue(excluded["working_tree_clean"])
         self.assertFalse(excluded["untracked_files"])
+        self.assertEqual(excluded["excluded_sensitive_path_count"], 0)
 
         (self.target / ".env").write_text("secret value\n", encoding="utf-8")
         with_sensitive = self.fingerprint()
@@ -725,6 +727,61 @@ class RepositoryFingerprintTests(unittest.TestCase):
         self.assertTrue(with_sensitive["untracked_files"])
         self.assertEqual(with_sensitive["untracked_path_count"], 0)
         self.assertEqual(with_sensitive["excluded_sensitive_path_count"], 1)
+        self.assertNotIn("secret value", json.dumps(with_sensitive))
+        (self.target / ".env").write_text("different secret value\n", encoding="utf-8")
+        changed_secret = self.fingerprint()
+        self.assertEqual(changed_secret["working_tree_sha256"], baseline)
+        self.assertEqual(changed_secret["excluded_sensitive_path_count"], 1)
+
+    def test_sensitive_worktree_changes_are_omitted_but_git_status_is_reported(self):
+        secret = self.target / ".env"
+        secret.write_text("secret v1\n", encoding="utf-8")
+        git(self.target, "add", ".env")
+        git(self.target, "commit", "-q", "-m", "add sensitive file")
+        clean = self.fingerprint()
+        self.assertTrue(clean["working_tree_clean"])
+        self.assertEqual(clean["excluded_sensitive_path_count"], 1)
+
+        secret.write_text("secret v2\n", encoding="utf-8")
+        unstaged = self.fingerprint()
+        self.assertEqual(unstaged["working_tree_sha256"], clean["working_tree_sha256"])
+        self.assertFalse(unstaged["working_tree_clean"])
+        self.assertFalse(unstaged["staged_changes"])
+        self.assertTrue(unstaged["unstaged_changes"])
+        self.assertFalse(unstaged["untracked_files"])
+        self.assertEqual(unstaged["excluded_sensitive_path_count"], 1)
+        self.assertNotIn("secret v2", json.dumps(unstaged))
+
+        git(self.target, "add", ".env")
+        staged = self.fingerprint()
+        self.assertEqual(staged["working_tree_sha256"], clean["working_tree_sha256"])
+        self.assertFalse(staged["working_tree_clean"])
+        self.assertTrue(staged["staged_changes"])
+        self.assertFalse(staged["unstaged_changes"])
+        self.assertEqual(staged["excluded_sensitive_path_count"], 1)
+
+        git(self.target, "commit", "-q", "-m", "update sensitive file")
+        committed = self.fingerprint()
+        self.assertNotEqual(committed["commit_sha"], clean["commit_sha"])
+        self.assertNotEqual(committed["working_tree_sha256"], clean["working_tree_sha256"])
+        self.assertTrue(committed["working_tree_clean"])
+        self.assertEqual(committed["excluded_sensitive_path_count"], 1)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO creation is unavailable")
+    def test_fifo_fallback_is_metadata_only_and_git_omits_it_from_repository_inventory(self):
+        baseline = self.fingerprint()["working_tree_sha256"]
+        fifo = self.target / "untracked.pipe"
+        os.mkfifo(fifo)
+
+        result = self.fingerprint()
+        kind, _mode, size, content_hash = workspace_ops._hash_worktree_path(self.target, b"untracked.pipe", [])
+
+        self.assertEqual(result["working_tree_sha256"], baseline)
+        self.assertTrue(result["working_tree_clean"])
+        self.assertFalse(result["untracked_files"])
+        self.assertEqual(kind, b"fifo")
+        self.assertEqual(size, b"0")
+        self.assertEqual(content_hash, b"")
 
     def test_untracked_and_tracked_file_content_fingerprints_differ(self):
         first = self.fingerprint()["working_tree_sha256"]
@@ -3803,6 +3860,21 @@ class WorkflowExecutionFingerprintTests(unittest.TestCase):
         self.assertIn("Final target: commit", delivery)
         self.assertIn("preexisting or overlapping", delivery)
         self.assertIn("concurrent edits cannot be excluded", delivery)
+
+    def test_final_snapshot_does_not_claim_transient_changes_as_operation_history(self):
+        runner, _codex, _claude = self.make_runner("transient-fingerprint-change")
+        started = runner.start()
+        transient = self.target / "created-and-removed.py"
+        transient.write_text("temporary\n", encoding="utf-8")
+        transient.unlink()
+
+        rejected = runner.reject("Stop after the snapshot check")
+
+        initial_target = started["execution_fingerprint"]["initial"]["target"]
+        final = rejected["execution_fingerprint"]["final"]
+        self.assertEqual(final["target"]["working_tree_sha256"], initial_target["working_tree_sha256"])
+        self.assertTrue(all(value == 0 for value in final["change_summary"]["counts_by_change"].values()))
+        self.assertIn("Transient changes absent from the final snapshot are not recorded", final["change_summary"]["attribution_limit"])
 
     def test_resume_preserves_initial_fingerprints_without_recalculating_them(self):
         runner, _codex, _claude = self.make_runner("fingerprint-resume")
