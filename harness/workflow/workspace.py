@@ -8,6 +8,7 @@ import re
 import shlex
 import stat
 import subprocess
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Callable
 
@@ -372,6 +373,41 @@ def protected_paths(
 ) -> list[str]:
     tracked, untracked = changed_paths(target, baseline, redactor=redactor)
     return sorted(set(tracked + untracked))
+
+
+def target_change_inventory(
+    target: Path,
+    baseline: str | None,
+    preexisting_paths: Iterable[str],
+    *,
+    redactor: Callable[[str], str] | None = None,
+) -> list[dict[str, str]]:
+    """Classify target repository changes relative to a saved Git baseline."""
+    if not isinstance(baseline, str) or not baseline:
+        return []
+    changes: dict[str, str] = {}
+    raw = git(
+        target, "diff", "--name-status", "-z", "--no-renames", baseline, "--", redactor=redactor,
+    )
+    fields = raw.decode("utf-8", "surrogateescape").split("\0")
+    for index in range(0, len(fields) - 1, 2):
+        status, path = fields[index:index + 2]
+        if path:
+            changes[path] = {
+                "D": "deleted", "A": "added", "M": "modified", "T": "type_changed",
+            }.get(status[:1], "modified")
+    raw_untracked = git(
+        target, "ls-files", "--others", "--exclude-standard", "-z", "--", redactor=redactor,
+    )
+    for path in raw_untracked.decode("utf-8", "surrogateescape").split("\0"):
+        if path:
+            changes.setdefault(path, "untracked")
+    preexisting = set(preexisting_paths)
+    return [
+        {"path": path, "change": changes[path], "preexisting": "yes" if path in preexisting else "no"}
+        for path in sorted(changes)
+        if path != WORKFLOW_ROOT and not path.startswith(WORKFLOW_ROOT + "/")
+    ]
 
 
 def read_instruction_files(target: Path) -> list[dict[str, str]]:

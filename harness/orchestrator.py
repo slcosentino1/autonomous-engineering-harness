@@ -34,13 +34,25 @@ from tools.read_documentation_url import canonicalize_documentation_url, authori
 from observability.tracer import (
     NoOpTracer,
     isolated_context,
-    observability_scope,
     safe_workflow_reference,
-    valid_observability_scope,
 )
+from workflow import authorization as _authorization
 from workflow import cli as _cli
 from workflow import persistence as _persistence
 from workflow import workspace as _workspace
+from workflow.delivery import render_delivery_report
+from workflow.codex_evidence import (
+    MAX_CODEX_TOOL_NAMES,
+    _CODEX_JSONL_EVENT_TYPES,
+    _CODEX_NON_TOOL_ITEM_TYPES,
+    _CODEX_TOOL_ITEM_TYPES,
+    _CODEX_USAGE_FIELDS,
+    _codex_jsonl_evidence,
+    _codex_langfuse_metadata,
+    _codex_stream_evidence,
+    _json_line_message,
+    _output_bytes,
+)
 from workflow.review import (
     PART_REVIEW_FIELDS,
     PART_REVIEW_SECTIONS,
@@ -75,10 +87,10 @@ from workflow.workspace import (
 
 WORKFLOW_ROOT = _workspace.WORKFLOW_ROOT
 WORKFLOW_LOCK_NAME_RE = _workspace.WORKFLOW_LOCK_NAME_RE
-MAX_PLAN_REVIEWS = 2
+MAX_PLAN_REVIEWS = _authorization.MAX_PLAN_REVIEWS
 DEFAULT_CLAUDE_BUDGET_USD = _cli.DEFAULT_CLAUDE_BUDGET_USD
-DEFAULT_MAX_CODE_REVIEW_CALLS = _cli.DEFAULT_MAX_CODE_REVIEW_CALLS
-MAX_AUTHORIZED_CODE_REVIEW_CALLS = 64
+DEFAULT_MAX_CODE_REVIEW_CALLS = _authorization.DEFAULT_MAX_CODE_REVIEW_CALLS
+MAX_AUTHORIZED_CODE_REVIEW_CALLS = _authorization.MAX_AUTHORIZED_CODE_REVIEW_CALLS
 MAX_PLANNING_FAILURE_OUTPUT_CHARS = 50_000
 MAX_PLANNING_FAILURE_RECORDS = 3
 MAX_OPERATION_HISTORY = 100
@@ -131,30 +143,10 @@ Classify decisions as must implement, should implement, future production consid
 questions or ambiguities, and external dependencies. Use only the categories that apply. Keep the proposal at the
 level of detail needed to explain the reasoning; do not make it longer or more sophisticated for its own sake."""
 CLAUDE_MAX_PAYLOAD_ENV = claude_reviewer.MAX_REVIEW_PAYLOAD_ENV
-WORKSPACE_OPERATIONS = [
-    "read_create_edit_rename_delete_assignment_files_in_target",
-    "run_development_commands_builds_tests_linters_and_static_analysis",
-    "install_manifest_declared_dependencies_using_repository_package_manager",
-    "run_codex_planning_implementation_and_correction",
-    "save_workflow_state_logs_proposals_reports_and_artifacts",
-]
-CODEX_STAGES = ["planning", "implementation", "correction"]
-CLAUDE_DATA_SCOPE = [
-    "assignment",
-    "implementation_proposal",
-    "implementation_and_validation_summary",
-    "relevant_redacted_code_changes",
-]
-RESTRICTED_OPERATIONS = [
-    "access_outside_target_workspace",
-    "disclose_secrets",
-    "commit",
-    "push",
-    "merge",
-    "deploy",
-    "publish",
-    "change_shared_infrastructure",
-]
+WORKSPACE_OPERATIONS = _authorization.WORKSPACE_OPERATIONS
+CODEX_STAGES = _authorization.CODEX_STAGES
+CLAUDE_DATA_SCOPE = _authorization.CLAUDE_DATA_SCOPE
+RESTRICTED_OPERATIONS = _authorization.RESTRICTED_OPERATIONS
 OS_METADATA_NAMES = {
     ".ds_store", "thumbs.db", "ehthumbs.db", "desktop.ini", ".directory", ".appledouble",
 }
@@ -559,265 +551,6 @@ def _sha256_text(value: str) -> str | None:
         return None
 
 
-def _json_line_message(stdout: str) -> str:
-    messages: list[str] = []
-    for line in stdout.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        item = event.get("item") if isinstance(event, dict) else None
-        if isinstance(item, dict) and item.get("type") == "agent_message" and isinstance(item.get("text"), str):
-            messages.append(item["text"])
-        elif isinstance(event, dict) and event.get("type") == "message" and isinstance(event.get("message"), str):
-            messages.append(event["message"])
-    return messages[-1].strip() if messages else ""
-
-
-_CODEX_JSONL_EVENT_TYPES = frozenset({
-    "thread.started", "turn.started", "turn.completed", "turn.failed", "item.started", "item.completed",
-})
-_CODEX_TOOL_ITEM_TYPES = frozenset({
-    "command_execution", "mcp_tool_call", "web_search", "image_view", "image_generation",
-    "collab_tool_call", "code_interpreter_call",
-})
-_CODEX_NON_TOOL_ITEM_TYPES = frozenset({"agent_message", "reasoning", "plan", "plan_update"})
-_CODEX_USAGE_FIELDS = frozenset({
-    "input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens",
-})
-MAX_CODEX_TOOL_NAMES = 50
-
-
-def _output_bytes(value: bytes | str | None) -> tuple[bytes | None, str]:
-    if isinstance(value, bytes):
-        return value, "bytes"
-    if isinstance(value, str):
-        return value.encode("utf-8"), "utf8_encoded_text"
-    return None, "unavailable"
-
-
-def _codex_jsonl_evidence(stdout: bytes | None) -> dict:
-    evidence = {
-        "jsonl_event_coverage": "unavailable" if stdout is None else "empty",
-        "jsonl_event_count": 0,
-        "jsonl_parse_error_count": 0,
-        "jsonl_unrecognized_event_count": 0,
-        "codex_cli_event_counts": {},
-        "codex_cli_turn_status": "not_reported",
-        "tool_invocations": [],
-        "tool_event_coverage": "unavailable" if stdout is None else "no_tool_events",
-        "reported_usage": None,
-        "usage_source": "not_reported",
-        "reported_model": None,
-        "reported_model_source": "not_reported",
-    }
-    if stdout is None or not stdout:
-        return evidence
-
-    event_counts: dict[str, int] = {}
-    tools: dict[str, dict[str, int]] = {}
-    parse_errors = 0
-    unrecognized_events = 0
-    turn_status = "not_reported"
-    reported_usage: dict[str, int] | None = None
-    reported_model: str | None = None
-    event_count = 0
-    tool_names_seen: dict[str, set[str]] = {}
-
-    for line in stdout.splitlines():
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            parse_errors += 1
-            continue
-        if not isinstance(event, dict) or not isinstance(event.get("type"), str):
-            parse_errors += 1
-            continue
-        event_type = event["type"]
-        event_count += 1
-        if event_type not in _CODEX_JSONL_EVENT_TYPES:
-            unrecognized_events += 1
-            continue
-        event_counts[event_type] = event_counts.get(event_type, 0) + 1
-        if event_type == "turn.completed":
-            turn_status = "completed"
-            usage = event.get("usage")
-            if isinstance(usage, dict):
-                safe_usage = {
-                    key: value for key, value in usage.items()
-                    if key in _CODEX_USAGE_FIELDS and type(value) is int and value >= 0
-                }
-                if safe_usage:
-                    reported_usage = safe_usage
-        elif event_type == "turn.failed":
-            turn_status = "failed"
-        model = event.get("model")
-        if isinstance(model, str) and re.fullmatch(r"[A-Za-z0-9._:/+-]{1,128}", model):
-            reported_model = model
-        if event_type not in {"item.started", "item.completed"}:
-            continue
-        item = event.get("item")
-        item_type = item.get("type") if isinstance(item, dict) else None
-        if not isinstance(item_type, str):
-            continue
-        if item_type in _CODEX_NON_TOOL_ITEM_TYPES:
-            continue
-        if item_type not in _CODEX_TOOL_ITEM_TYPES:
-            unrecognized_events += 1
-            continue
-        counts = tools.setdefault(item_type, {
-            "started_events": 0, "completed_events": 0, "success_reported_events": 0,
-            "failure_reported_events": 0, "outcome_unreported_events": 0,
-            "tool_names": [], "tool_names_truncated": False,
-        })
-        if item_type == "mcp_tool_call":
-            tool_name = item.get("tool_name", item.get("tool"))
-            if isinstance(tool_name, str) and re.fullmatch(r"[A-Za-z0-9_.:/+-]{1,128}", tool_name):
-                seen = tool_names_seen.setdefault(item_type, set())
-                if tool_name not in seen:
-                    if len(seen) < MAX_CODEX_TOOL_NAMES:
-                        seen.add(tool_name)
-                        counts["tool_names"].append(tool_name)
-                    else:
-                        counts["tool_names_truncated"] = True
-        if event_type == "item.started":
-            counts["started_events"] += 1
-            continue
-        counts["completed_events"] += 1
-        status = item.get("status")
-        exit_code = item.get("exit_code")
-        if isinstance(exit_code, int) and not isinstance(exit_code, bool):
-            outcome = "success" if exit_code == 0 else "failure"
-        elif isinstance(status, str) and status.lower() in {"success", "succeeded"}:
-            outcome = "success"
-        elif isinstance(status, str) and status.lower() in {"failed", "failure", "error", "cancelled"}:
-            outcome = "failure"
-        else:
-            outcome = "unreported"
-        counts[f"{outcome}_reported_events" if outcome != "unreported" else "outcome_unreported_events"] += 1
-
-    evidence.update({
-        "jsonl_event_coverage": "partial" if parse_errors else ("parsed" if event_count else "empty"),
-        "jsonl_event_count": event_count,
-        "jsonl_parse_error_count": parse_errors,
-        "jsonl_unrecognized_event_count": unrecognized_events,
-        "codex_cli_event_counts": event_counts,
-        "codex_cli_turn_status": turn_status,
-        "tool_invocations": [
-            {"item_type": name, **tools[name]} for name in sorted(tools)
-        ],
-        "tool_event_coverage": (
-            "partial" if parse_errors else "captured" if tools else "no_tool_events"
-        ),
-        "reported_usage": reported_usage,
-        "usage_source": "codex_jsonl_turn_completed" if reported_usage is not None else "not_reported",
-        "reported_model": reported_model,
-        "reported_model_source": "codex_jsonl_event" if reported_model is not None else "not_reported",
-    })
-    return evidence
-
-
-def _codex_stream_evidence(
-    stdout: bytes | None,
-    stderr: bytes | None,
-    *,
-    stdout_status: str,
-    stderr_status: str,
-    stdout_truncated: bool | None,
-    stderr_truncated: bool | None,
-) -> dict:
-    evidence = {
-        "stdout_sha256": hashlib.sha256(stdout).hexdigest() if stdout is not None else None,
-        "stdout_bytes": len(stdout) if stdout is not None else None,
-        "stdout_capture_status": stdout_status,
-        "stdout_truncated": stdout_truncated,
-        "stderr_sha256": hashlib.sha256(stderr).hexdigest() if stderr is not None else None,
-        "stderr_bytes": len(stderr) if stderr is not None else None,
-        "stderr_capture_status": stderr_status,
-        "stderr_truncated": stderr_truncated,
-        **_codex_jsonl_evidence(stdout),
-    }
-    return evidence
-
-
-def _codex_langfuse_metadata(
-    operation: dict, *, status: str | None = None, finished_at: str | None = None,
-) -> dict:
-    """Build a bounded, content-free view of persisted Codex operation evidence."""
-    metadata = {
-        "operation": "codex_execution",
-        "operation_id": operation.get("operation_id"),
-        "stage": operation.get("stage"),
-        "attempt": operation.get("attempt"),
-        "invocation_at": operation.get("invocation_at"),
-        "finished_at": finished_at if finished_at is not None else operation.get("finished_at"),
-        "status": status if status is not None else operation.get("status"),
-        "exit_code": operation.get("exit_code"),
-        "error_category": operation.get("error_category"),
-        "duration_ms": operation.get("duration_ms"),
-        "codex_duration_ms": operation.get("duration_ms"),
-        "input_sha256": operation.get("input_sha256"),
-        "input_bytes": operation.get("input_bytes"),
-        "input_characters": operation.get("input_characters"),
-        "output_sha256": operation.get("stdout_sha256"),
-        "output_bytes": operation.get("stdout_bytes"),
-        "output_capture_status": operation.get("stdout_capture_status"),
-        "output_hash_representation": operation.get("stdout_capture_representation"),
-        "stderr_sha256": operation.get("stderr_sha256"),
-        "stderr_bytes": operation.get("stderr_bytes"),
-        "stderr_capture_status": operation.get("stderr_capture_status"),
-        "stderr_hash_representation": operation.get("stderr_capture_representation"),
-        "final_message_sha256": operation.get("last_message_file_sha256"),
-        "final_message_bytes": operation.get("last_message_file_bytes"),
-        "final_message_capture_status": operation.get("last_message_file_status"),
-        "model": operation.get("model"),
-        "model_source": operation.get("model_source"),
-        "reported_model": operation.get("reported_model"),
-        "reported_model_source": operation.get("reported_model_source"),
-        "cli_version": operation.get("cli_version"),
-        "cli_version_source": operation.get("cli_version_source"),
-        "jsonl_event_coverage": operation.get("jsonl_event_coverage"),
-        "usage_source": operation.get("usage_source"),
-    }
-    tools = operation.get("tool_invocations")
-    if isinstance(tools, list):
-        item_types = sorted({
-            item["item_type"] for item in tools
-            if isinstance(item, dict) and isinstance(item.get("item_type"), str)
-        })
-        names = []
-        for item in tools:
-            if not isinstance(item, dict):
-                continue
-            for name in item.get("tool_names", []):
-                if isinstance(name, str) and name not in names:
-                    names.append(name)
-        metadata.update({
-            "tool_item_types": item_types,
-            "tool_names": names,
-            "tool_names_truncated": "true" if any(
-                isinstance(item, dict) and item.get("tool_names_truncated") is True for item in tools
-            ) else "false",
-        })
-        for field, output_field in (
-            ("started_events", "tool_invocation_count"),
-            ("completed_events", "tool_completed_count"),
-            ("success_reported_events", "tool_success_count"),
-            ("failure_reported_events", "tool_failure_count"),
-            ("outcome_unreported_events", "tool_outcome_unreported_count"),
-        ):
-            metadata[output_field] = sum(
-                item.get(field, 0) for item in tools
-                if isinstance(item, dict) and type(item.get(field, 0)) is int and item.get(field, 0) >= 0
-            )
-    usage = operation.get("reported_usage")
-    if isinstance(usage, dict):
-        metadata.update({key: value for key, value in usage.items() if key in _CODEX_USAGE_FIELDS})
-    return {key: value for key, value in metadata.items() if value is not None}
-
-
 def build_codex_command(
     executable: str, target: Path, sandbox: str, output_path: Path, model: str | None = None,
     *, read_only_authorized_urls: list[str] | None = None,
@@ -924,111 +657,23 @@ def new_workflow_authorization(
     max_code_review_calls: int = DEFAULT_MAX_CODE_REVIEW_CALLS,
     tracing_enabled: bool = False,
 ) -> dict:
-    """Create the single persistent authorization attached to a new workflow."""
-    if (isinstance(max_code_review_calls, bool) or not isinstance(max_code_review_calls, int)
-            or not 1 <= max_code_review_calls <= MAX_AUTHORIZED_CODE_REVIEW_CALLS):
-        raise WorkflowError(
-            f"Code review call authorization must be between 1 and {MAX_AUTHORIZED_CODE_REVIEW_CALLS}."
+    try:
+        return _authorization.new_workflow_authorization(
+            target, workflow_id, budget_usd, max_code_review_calls, tracing_enabled,
         )
-    authorization = {
-        "version": 1,
-        "authorization_id": uuid.uuid4().hex,
-        "created_at": now(),
-        "target": str(target),
-        "workflow_id": workflow_id,
-        "workspace_operations": WORKSPACE_OPERATIONS.copy(),
-        "codex_stages": CODEX_STAGES.copy(),
-        "claude_aily": {
-            "provider": "Claude through Aily",
-            "permitted_data": CLAUDE_DATA_SCOPE.copy(),
-            "max_plan_reviews": MAX_PLAN_REVIEWS,
-            "max_code_reviews": max_code_review_calls,
-            "code_review_policy": {
-                "mode": "adaptive_multi_part",
-                "max_calls": max_code_review_calls,
-            },
-            "budget_usd": float(budget_usd),
-            "spent_usd": 0.0,
-            "budget_unknown": False,
-            "active_call": None,
-        },
-        "observability": observability_scope(tracing_enabled),
-        "restricted_operations": RESTRICTED_OPERATIONS.copy(),
-    }
-    authorization["scope_sha256"] = authorization_scope_digest(authorization)
-    return authorization
+    except _authorization.AuthorizationError as exc:
+        raise WorkflowError(str(exc)) from exc
 
 
 def authorization_scope_digest(authorization: dict) -> str:
-    """Hash authorization and spend state so scope or budget edits are detected on resume."""
-    terms = {key: value for key, value in authorization.items() if key != "scope_sha256"}
-    encoded = json.dumps(terms, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return _authorization.authorization_scope_digest(authorization)
 
 
 def validate_workflow_authorization(state: dict, target: Path, workflow_id: str) -> dict:
-    """Reject missing, mismatched, or broadened saved authorization."""
-    authorization = state.get("authorization")
-    if not isinstance(authorization, dict) or authorization.get("version") != 1:
-        raise WorkflowError("Workflow has no supported persistent authorization; start a newly authorized workflow.")
-    if authorization.get("target") != str(target) or authorization.get("workflow_id") != workflow_id:
-        raise WorkflowError("Saved authorization belongs to a different target or workflow.")
-    if not isinstance(authorization.get("authorization_id"), str) or not authorization["authorization_id"]:
-        raise WorkflowError("Saved workflow authorization has no ID.")
-    if authorization.get("workspace_operations") != WORKSPACE_OPERATIONS:
-        raise WorkflowError("Saved workspace authorization is missing, changed, or broader than the supported scope.")
-    if authorization.get("codex_stages") != CODEX_STAGES:
-        raise WorkflowError("Saved Codex authorization is missing, changed, or broader than the supported stages.")
-    if authorization.get("restricted_operations") != RESTRICTED_OPERATIONS:
-        raise WorkflowError("Saved protected-operation boundaries are missing or changed.")
-    observability = authorization.get("observability")
-    if observability is not None:
-        enabled = observability.get("enabled") if isinstance(observability, dict) else None
-        endpoint_hash = observability.get("langfuse_base_url_sha256") if isinstance(observability, dict) else None
-        valid_endpoint_hash = (
-            isinstance(endpoint_hash, str) and re.fullmatch(r"[a-f0-9]{64}", endpoint_hash)
-            if enabled is True else endpoint_hash is None
-        )
-        if (not isinstance(observability, dict)
-                or set(observability) != {"version", "enabled", "permitted_data", "langfuse_base_url_sha256"}
-                or not valid_observability_scope(observability)
-                or type(enabled) is not bool
-                or not valid_endpoint_hash):
-            raise WorkflowError("Saved observability scope is invalid or changed.")
-    external = authorization.get("claude_aily")
-    if not isinstance(external, dict):
-        raise WorkflowError("Saved Claude/Aily authorization is missing.")
-    code_review_limit = external.get("max_code_reviews")
-    policy = external.get("code_review_policy")
-    legacy_single_review = (
-        policy is None and isinstance(code_review_limit, int)
-        and not isinstance(code_review_limit, bool) and code_review_limit == 1
-    )
-    configured_review_policy = (
-        isinstance(policy, dict)
-        and policy.get("mode") == "adaptive_multi_part"
-        and policy.get("max_calls") == code_review_limit
-        and isinstance(code_review_limit, int)
-        and not isinstance(code_review_limit, bool)
-        and 1 <= code_review_limit <= MAX_AUTHORIZED_CODE_REVIEW_CALLS
-    )
-    if (external.get("provider") != "Claude through Aily"
-            or external.get("permitted_data") != CLAUDE_DATA_SCOPE
-            or external.get("max_plan_reviews") != MAX_PLAN_REVIEWS
-            or not (legacy_single_review or configured_review_policy)):
-        raise WorkflowError("Saved Claude/Aily scope or review limit is missing or changed.")
     try:
-        budget = Decimal(str(external.get("budget_usd")))
-        spent = Decimal(str(external.get("spent_usd")))
-    except Exception as exc:
-        raise WorkflowError("Saved Claude/Aily budget is invalid.") from exc
-    if (not budget.is_finite() or budget < Decimal("0.01")
-            or budget != budget.quantize(Decimal("0.01"))
-            or not spent.is_finite() or spent < 0):
-        raise WorkflowError("Saved Claude/Aily budget or spending is invalid.")
-    if authorization.get("scope_sha256") != authorization_scope_digest(authorization):
-        raise WorkflowError("Saved workflow authorization changed after initialization.")
-    return authorization
+        return _authorization.validate_workflow_authorization(state, target, workflow_id)
+    except _authorization.AuthorizationError as exc:
+        raise WorkflowError(str(exc)) from exc
 
 
 class Orchestrator:
@@ -1238,28 +883,12 @@ class Orchestrator:
         self._active_codex_persisted_status = operation.get("status")
 
     def _target_change_inventory(self) -> list[dict[str, str]]:
-        baseline = self.state.get("baseline_commit")
-        if not isinstance(baseline, str) or not baseline:
-            return []
-        changes: dict[str, str] = {}
-        raw = git(self.target, "diff", "--name-status", "-z", "--no-renames", baseline, "--")
-        fields = raw.decode("utf-8", "surrogateescape").split("\0")
-        for index in range(0, len(fields) - 1, 2):
-            status, path = fields[index:index + 2]
-            if path:
-                changes[path] = {
-                    "D": "deleted", "A": "added", "M": "modified", "T": "type_changed",
-                }.get(status[:1], "modified")
-        raw_untracked = git(self.target, "ls-files", "--others", "--exclude-standard", "-z", "--")
-        for path in raw_untracked.decode("utf-8", "surrogateescape").split("\0"):
-            if path:
-                changes.setdefault(path, "untracked")
-        preexisting = set(self.state.get("preexisting_paths", []))
-        return [
-            {"path": path, "change": changes[path], "preexisting": "yes" if path in preexisting else "no"}
-            for path in sorted(changes)
-            if path != WORKFLOW_ROOT and not path.startswith(WORKFLOW_ROOT + "/")
-        ]
+        return _workspace_error(lambda: _workspace.target_change_inventory(
+            self.target,
+            self.state.get("baseline_commit"),
+            self.state.get("preexisting_paths", []),
+            redactor=redact,
+        ))
 
     def _fingerprint_repository(self, repository: Path, *, expected_commit: str | None = None) -> dict:
         try:
@@ -3089,219 +2718,22 @@ class Orchestrator:
         return clean_markdown(proposal), review_again, dispositions
 
     def _delivery_report(self) -> str:
-        reviews = self.state.get("plan_reviews", [])
-        valid_reviews = self._valid_plan_reviews()
-        external_authorization = self.state["authorization"]["claude_aily"]
-        sections = [
-            "# Workflow delivery",
-            "",
-            f"- Workflow: `{self.workflow_id}`",
-            f"- Target: `{self.target}`",
-            f"- Completed: {self.state.get('completed_at', now())}",
-            f"- Codex model: {self.state.get('codex_model') or 'Codex CLI default'}",
-            f"- Claude spend recorded: ${external_authorization['spent_usd']:.4f} / ${external_authorization['budget_usd']:.2f}",
-            f"- Spend metadata complete: {'no' if external_authorization['budget_unknown'] else 'yes'}",
-            "",
-            "## Implementation",
-            "",
-            self.state.get("implementation_summary") or "No implementation summary was recorded.",
-            "",
-            "## Plan review",
-            "",
-            f"Claude plan-review iterations: {len(valid_reviews)} valid of {external_authorization['max_plan_reviews']} maximum.",
-            f"Invalidated plan-review attempts: {len(reviews) - len(valid_reviews)}.",
-            "",
-        ]
-        execution_fingerprint = self.state.get("execution_fingerprint", {})
-        if not isinstance(execution_fingerprint, dict):
-            execution_fingerprint = {}
-        initial_fingerprints = execution_fingerprint.get("initial", {})
-        if not isinstance(initial_fingerprints, dict):
-            initial_fingerprints = {}
-        initial_harness = initial_fingerprints.get("harness", {})
-        initial_target = initial_fingerprints.get("target", {})
-        if not isinstance(initial_harness, dict):
-            initial_harness = {}
-        if not isinstance(initial_target, dict):
-            initial_target = {}
-        final_fingerprints = execution_fingerprint.get("final", {}) if isinstance(
-            execution_fingerprint, dict,
-        ) else {}
-        if not isinstance(final_fingerprints, dict):
-            final_fingerprints = {}
-        final_target = final_fingerprints.get("target", {})
-        if not isinstance(final_target, dict):
-            final_target = {}
-
-        def fingerprint_value(record: dict, key: str) -> str:
-            if record.get("status") != "captured":
-                return "unavailable"
-            value = record.get(key)
-            return value if isinstance(value, str) and value else "unavailable"
-
-        sections.extend([
-            "## Execution fingerprints",
-            "",
-            f"- Algorithm: `{execution_fingerprint.get('algorithm', 'unavailable')}`.",
-            f"- Initial harness: commit `{fingerprint_value(initial_harness, 'commit_sha')}`; working tree SHA-256 "
-            f"`{fingerprint_value(initial_harness, 'working_tree_sha256')}`.",
-            f"- Initial target: commit `{fingerprint_value(initial_target, 'commit_sha')}`; working tree SHA-256 "
-            f"`{fingerprint_value(initial_target, 'working_tree_sha256')}`.",
-            f"- Target dirty at initialization: "
-            f"{'yes' if initial_target.get('status') == 'captured' and not initial_target.get('working_tree_clean') else 'no' if initial_target.get('status') == 'captured' else 'unknown'}.",
-            f"- Final target: commit `{fingerprint_value(final_target, 'commit_sha')}`; working tree SHA-256 "
-            f"`{fingerprint_value(final_target, 'working_tree_sha256')}`; "
-            f"clean={'yes' if final_target.get('status') == 'captured' and final_target.get('working_tree_clean') else 'no' if final_target.get('status') == 'captured' else 'unknown'}.",
-        ])
-        change_summary = final_fingerprints.get("change_summary", {})
-        if not isinstance(change_summary, dict):
-            change_summary = {}
-        if change_summary.get("status") == "captured":
-            change_counts = change_summary.get("counts_by_change", {})
-            attribution_counts = change_summary.get("counts_by_attribution", {})
-            if not isinstance(change_counts, dict):
-                change_counts = {}
-            if not isinstance(attribution_counts, dict):
-                attribution_counts = {}
-            examples_by_attribution = change_summary.get("examples_by_attribution", {})
-            examples_truncated = change_summary.get("examples_truncated", {})
-            if not isinstance(examples_by_attribution, dict):
-                examples_by_attribution = {}
-            if not isinstance(examples_truncated, dict):
-                examples_truncated = {}
-            sections.extend([
-                "- Changes relative to the starting baseline: " + ", ".join(
-                    f"{name} {change_counts.get(name, 0)}"
-                    for name in ("added", "modified", "deleted", "untracked", "type_changed")
-                ) + ".",
-                "- Path attribution: "
-                f"{attribution_counts.get('preexisting_or_overlapping', 0)} preexisting or overlapping; "
-                f"{attribution_counts.get('changed_after_initial_capture', 0)} final-state paths not marked "
-                "preexisting at initialization.",
-                "- Attribution limit: " + change_summary.get(
-                    "attribution_limit", "Concurrent edits cannot be excluded.",
-                ),
-            ])
-            for category, label in (
-                ("preexisting_or_overlapping", "Preexisting or overlapping path examples"),
-                ("changed_after_initial_capture", "Final-state paths not marked preexisting at initialization"),
-            ):
-                examples = examples_by_attribution.get(category, [])
-                if not isinstance(examples, list):
-                    examples = []
-                if examples:
-                    sections.append(f"- {label}: " + ", ".join(
-                        f"`{item['path']}` ({item['change']})" for item in examples
-                        if isinstance(item, dict) and isinstance(item.get("path"), str)
-                    ) + ("; more omitted" if examples_truncated.get(category) else "") + ".")
-        else:
-            sections.append("- Change summary: " + change_summary.get(
-                "reason", "unavailable",
-            ))
-        sections.extend([
-            "- Fingerprint scope excludes `.git/**`, `.engineering/workflows/**`, ignored untracked files, and "
-            "known sensitive paths; tracked ignored files remain included.",
-            "",
-        ])
-        for record in reviews:
-            validity = "valid" if record.get("valid") is True else "invalidated"
-            sections.extend([f"### Attempt {record.get('attempt', record.get('iteration'))} ({validity})", "",
-                             record.get("invalidated_reason", ""), "", record["report"], ""])
-        decisions = self.state.get("plan_review_decisions", [])
-        for decision in decisions:
-            sections.extend([
-                f"### Codex dispositions after iteration {decision['iteration']}", "",
-                decision["dispositions"], "",
-            ])
-        sections.extend([
-            "## Claude context audit",
-            "",
-        ])
-        for context in self.state.get("claude_contexts", []):
-            sections.append(
-                f"- `{context.get('stage')}` iteration {context.get('iteration')} proposal version "
-                f"{context.get('proposal_version')}: {context.get('characters')} characters, "
-                f"{context.get('utf8_bytes', 'unknown')} UTF-8 bytes against a "
-                f"{context.get('payload_limit_characters', 'unknown')}-character limit; "
-                f"call_state={context.get('call_state')}; "
-                f"part={context.get('part_id', 'n/a')}; "
-                f"SHA-256 `{context.get('prompt_sha256')}`; complete={context.get('complete')}; "
-                f"sections: {', '.join(item['name'] for item in context.get('sections', []))}."
-            )
-        if not self.state.get("claude_contexts"):
-            sections.append("No Claude context was submitted.")
-        sections.extend(["", "## Code review file coverage", ""])
-        included_files = self.state.get("review_included_files", [])
-        excluded_files = self.state.get("review_exclusions", [])
-        sections.append(f"Included changed files: {len(included_files)}.")
-        sections.extend(f"- `{item}`" for item in included_files)
-        sections.append(f"Excluded changed files: {len(excluded_files)}.")
-        sections.extend(f"- `{item.get('path')}` — {item.get('reason')}" for item in excluded_files)
-        if not included_files and not excluded_files:
-            sections.append("No code-review file coverage was recorded.")
         campaign = self.state.get("review_campaign")
-        sections.extend(["", "## Code review campaign", ""])
+        structured_review_feedback = ""
         if campaign:
             feedback_reports = _validated_campaign_reports(campaign)
             if feedback_reports:
-                sections.extend([
-                    "## Structured code-review feedback", "", render_review_feedback(feedback_reports), "",
-                ])
-            invocation_count = sum(
-                call.get("call_state") != "validation_failed"
-                for record in campaign.get("part_reviews", []) for call in record.get("calls", [])
-            ) + sum(
-                call.get("call_state") != "validation_failed"
-                for call in campaign.get("integration_review", {}).get("calls", [])
-            )
-            sections.extend([
-                f"- Campaign `{campaign.get('campaign_id')}`; strategy `{campaign.get('strategy')}`; "
-                f"status `{campaign.get('status')}`.",
-                f"- Parts: {len(campaign.get('parts', []))}; Claude invocation attempts: {invocation_count}; "
-                f"authorized call maximum: {campaign.get('authorized_call_limit')}.",
-                f"- Shared context SHA-256: `{campaign.get('shared_context_sha256')}`; per-call payload limit: "
-                f"{campaign.get('payload_limit_characters')} characters.",
-                f"- Files reviewed: {len(campaign.get('files_reviewed', []))}.",
-            ])
-            sections.extend(f"  - `{path}`" for path in campaign.get("files_reviewed", []))
-            sections.append(f"- Files not reviewed: {len(campaign.get('files_not_reviewed', []))}.")
-            sections.extend(
-                f"  - `{item.get('path')}` — {item.get('reason')}"
-                for item in campaign.get("files_not_reviewed", [])
-            )
-            sections.append(
-                f"- Integration review: {campaign.get('integration_review', {}).get('status')}."
-            )
-            for record in campaign.get("part_reviews", []):
-                sections.extend([
-                    f"### {record.get('part_id')} — {record.get('status')}", "",
-                    record.get("report") or "No report recorded.", "",
-                ])
-            integration_report = campaign.get("integration_review", {}).get("report")
-            if integration_report:
-                sections.extend(["### Integration report", "", integration_report, ""])
-        else:
-            sections.append("No code review campaign was recorded.")
-        sections.extend([
-            "## Code review",
-            "",
-            self.state.get("code_review") or "No code review report was recorded.",
-            "",
-            "## Corrections and validation",
-            "",
-            self.state.get("correction_summary") or "No correction summary was recorded.",
-            "",
-            "## Review limits",
-            "",
-            f"Claude context payload limit: {CLAUDE_MAX_PAYLOAD_ENV} (default "
-            f"{claude_reviewer.DEFAULT_MAX_REVIEW_PAYLOAD_CHARS:,} characters). Required sections are validated; "
-            "oversized contexts stop before a paid call. Prompt and section hashes are recorded in state.json.",
-            "",
-            "## Approved proposal",
-            "",
-            self.state.get("proposal") or "",
-        ])
-        return "\n".join(sections).rstrip() + "\n"
+                structured_review_feedback = render_review_feedback(feedback_reports)
+        return render_delivery_report(
+            self.state,
+            workflow_id=self.workflow_id,
+            target=self.target,
+            fallback_completed_at=now(),
+            valid_plan_review_count=len(self._valid_plan_reviews()),
+            structured_review_feedback=structured_review_feedback,
+            claude_max_payload_env=CLAUDE_MAX_PAYLOAD_ENV,
+            default_claude_payload_chars=claude_reviewer.DEFAULT_MAX_REVIEW_PAYLOAD_CHARS,
+        )
 
 
 def recover_code_review(target: str | Path, workflow_id: str, *, apply: bool = False) -> dict:

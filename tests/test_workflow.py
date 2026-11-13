@@ -624,6 +624,49 @@ class WorkspaceModuleTests(unittest.TestCase):
         with self.assertRaisesRegex(orchestrator.WorkflowError, "absolute repository path"):
             orchestrator.canonical_target("relative/path")
 
+    def test_target_change_inventory_classifies_baseline_changes_and_filters_workflows(self):
+        modified = self.target / "modified.py"
+        deleted = self.target / "deleted.py"
+        modified.write_text("baseline\n", encoding="utf-8")
+        deleted.write_text("baseline\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.target), "add", "modified.py", "deleted.py"], check=True)
+        subprocess.run(["git", "-C", str(self.target), "commit", "-q", "-m", "inventory baseline"], check=True)
+        baseline = git(self.target, "rev-parse", "HEAD")
+
+        modified.write_text("changed after baseline\n", encoding="utf-8")
+        deleted.unlink()
+        added = self.target / "added.py"
+        added.write_text("staged addition\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.target), "add", "added.py"], check=True)
+        (self.target / "untracked.py").write_text("untracked\n", encoding="utf-8")
+        artifact = self.target / ".engineering" / "workflows" / "sample" / "state.json"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_text("{}\n", encoding="utf-8")
+
+        inventory = workspace_ops.target_change_inventory(
+            self.target,
+            baseline,
+            ["modified.py", "untracked.py"],
+        )
+        by_path = {item["path"]: item for item in inventory}
+
+        self.assertEqual(by_path, {
+            "added.py": {"path": "added.py", "change": "added", "preexisting": "no"},
+            "deleted.py": {"path": "deleted.py", "change": "deleted", "preexisting": "no"},
+            "modified.py": {"path": "modified.py", "change": "modified", "preexisting": "yes"},
+            "untracked.py": {"path": "untracked.py", "change": "untracked", "preexisting": "yes"},
+        })
+        self.assertNotIn(".engineering/workflows/sample/state.json", by_path)
+
+        runner = object.__new__(orchestrator.Orchestrator)
+        runner.target = self.target
+        runner.state = {"baseline_commit": baseline, "preexisting_paths": ["modified.py", "untracked.py"]}
+        self.assertEqual(runner._target_change_inventory(), inventory)
+
+    def test_target_change_inventory_is_empty_without_a_valid_baseline(self):
+        self.assertEqual(workspace_ops.target_change_inventory(self.target, None, []), [])
+        self.assertEqual(workspace_ops.target_change_inventory(self.target, "", []), [])
+
 
 class RepositoryFingerprintTests(unittest.TestCase):
     def setUp(self):

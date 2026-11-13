@@ -10,11 +10,11 @@ from typing import Callable
 
 import claude_reviewer
 from observability.tracer import tracing_enabled_from_environment
+from workflow.authorization import DEFAULT_MAX_CODE_REVIEW_CALLS
 from workflow.review import _validated_campaign_reports, render_review_feedback
 
 
 DEFAULT_CLAUDE_BUDGET_USD = 2.00
-DEFAULT_MAX_CODE_REVIEW_CALLS = 16
 CODEX_EXECUTABLE = "codex"
 
 
