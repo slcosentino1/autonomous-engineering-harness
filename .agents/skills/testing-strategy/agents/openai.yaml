@@ -1,0 +1,3 @@
+interface:
+  display_name: "Testing Strategy"
+  short_description: "Choose focused tests for behavior at risk"

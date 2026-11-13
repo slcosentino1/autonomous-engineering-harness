@@ -24,12 +24,13 @@ WORKSPACE_OPERATIONS = [
     "save_workflow_state_logs_proposals_reports_and_artifacts",
 ]
 CODEX_STAGES = ["planning", "implementation", "correction"]
-CLAUDE_DATA_SCOPE = [
+LEGACY_CLAUDE_DATA_SCOPE = [
     "assignment",
     "implementation_proposal",
     "implementation_and_validation_summary",
     "relevant_redacted_code_changes",
 ]
+CLAUDE_DATA_SCOPE = [*LEGACY_CLAUDE_DATA_SCOPE, "relevant_skill_instructions"]
 RESTRICTED_OPERATIONS = [
     "access_outside_target_workspace",
     "disclose_secrets",
@@ -144,7 +145,7 @@ def validate_workflow_authorization(state: dict, target: Path, workflow_id: str)
         and 1 <= code_review_limit <= MAX_AUTHORIZED_CODE_REVIEW_CALLS
     )
     if (external.get("provider") != "Claude through Aily"
-            or external.get("permitted_data") != CLAUDE_DATA_SCOPE
+            or external.get("permitted_data") not in (LEGACY_CLAUDE_DATA_SCOPE, CLAUDE_DATA_SCOPE)
             or external.get("max_plan_reviews") != MAX_PLAN_REVIEWS
             or not (legacy_single_review or configured_review_policy)):
         raise AuthorizationError("Saved Claude/Aily scope or review limit is missing or changed.")

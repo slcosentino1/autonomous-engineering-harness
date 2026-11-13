@@ -39,6 +39,7 @@ from observability.tracer import (
 from workflow import authorization as _authorization
 from workflow import cli as _cli
 from workflow import persistence as _persistence
+from workflow import skills as _skills
 from workflow import workspace as _workspace
 from workflow.delivery import render_delivery_report
 from workflow.codex_evidence import (
@@ -329,7 +330,9 @@ def _file_inventory_section(files: list[str], label: str = "Files") -> str:
     )
 
 
-def _guidance_for_codex(guidance: dict) -> str:
+def _guidance_for_codex(guidance: dict, *, stage: str | None = None, context: str = "") -> str:
+    if stage is not None:
+        guidance = _skills.select_skills(guidance, stage, context)
     files = guidance.get("files") or []
     sections = ["Target repository context:", _file_inventory_section(files)]
     locations = guidance.get("skill_locations_checked") or []
@@ -344,8 +347,7 @@ def _guidance_for_codex(guidance: dict) -> str:
     skills = guidance.get("skills") or []
     if skills:
         sections.append(
-            "Discovered skill instructions (assess each for relevance; use relevant skills, and record any omitted "
-            "with a reason):"
+            "Stage-selected skill instructions (apply the relevant guidance without expanding the assignment):"
         )
         for skill in skills:
             sections.append(
@@ -360,7 +362,11 @@ def _guidance_for_codex(guidance: dict) -> str:
     return "\n\n".join(sections)
 
 
-def _guidance_for_claude(guidance: dict) -> str:
+def _guidance_for_claude(
+    guidance: dict, *, stage: str | None = None, context: str = "", include_skill_content: bool = True,
+) -> str:
+    if stage is not None:
+        guidance = _skills.select_skills(guidance, stage, context)
     files = guidance.get("files") or []
     instructions = guidance.get("instructions") or []
     lines = [_file_inventory_section(files, label="Repository files")]
@@ -369,16 +375,21 @@ def _guidance_for_claude(guidance: dict) -> str:
     lines.append("Skill locations checked: " + (", ".join(locations) if locations else "none"))
     skills = guidance.get("skills") or []
     if skills:
-        lines.append("Relevant skills and application:")
+        lines.append("Relevant skill instructions:")
         for skill in skills:
-            if skill["name"] == "api-engineer":
-                application = (
-                    "establish the API contract from the assignment, align verification with behavior at risk, "
-                    "and avoid unnecessary Postman setup when no existing collection or workspace is present"
-                )
+            label = f"{skill['name']} ({skill.get('source', 'unknown')}; {skill.get('path', 'path unavailable')})"
+            content = skill.get("content")
+            if include_skill_content and isinstance(content, str) and content.strip():
+                lines.append(f"--- {label} ---\n{content}")
             else:
-                application = skill.get("description") or "Follow the skill's instructions where relevant."
-            lines.append(f"- {skill['name']} ({skill['source']}): {application}.")
+                if skill["name"] == "api-engineer":
+                    description = (
+                        "Establish the API contract from the assignment, align verification with behavior at risk, "
+                        "and avoid unnecessary Postman setup when no existing collection or workspace is present."
+                    )
+                else:
+                    description = skill.get("description") or "Skill content unavailable."
+                lines.append(f"--- {label} ---\n{description}")
     else:
         lines.append("Relevant skills: none found in project skill locations.")
     return "\n".join(lines)
@@ -1440,6 +1451,10 @@ class Orchestrator:
     def _guidance(self) -> dict:
         return self.state.get("project_guidance") or _project_guidance(self.target, self.state["task"])
 
+    def _claude_skill_content_authorized(self) -> bool:
+        permitted = self.state.get("authorization", {}).get("claude_aily", {}).get("permitted_data", [])
+        return isinstance(permitted, list) and "relevant_skill_instructions" in permitted
+
     def reject(self, reason: str) -> dict:
         return self._execute_locked(lambda: self._reject_locked(reason))
 
@@ -1967,7 +1982,9 @@ class Orchestrator:
         external = authorization["claude_aily"]
         if external["budget_unknown"]:
             raise WorkflowError("Claude review stopped because a previous call has no recorded cost.")
-        if external["permitted_data"] != CLAUDE_DATA_SCOPE:
+        if external["permitted_data"] not in (
+            _authorization.LEGACY_CLAUDE_DATA_SCOPE, CLAUDE_DATA_SCOPE,
+        ):
             raise WorkflowError("This Claude/Aily request is outside the workflow's persisted data authorization.")
         if stage.startswith("plan_review_") and len(self._valid_plan_reviews()) >= external["max_plan_reviews"]:
             raise WorkflowError("The authorized Claude plan-review limit is exhausted.")
@@ -2219,10 +2236,21 @@ class Orchestrator:
             "Repository context": self._repository_context_for_claude(
                 guidance, list(review_diff.included_paths),
             ),
-            "Relevant skills": _guidance_for_claude(guidance),
+            "Relevant skills": _guidance_for_claude(
+                guidance,
+                stage="code_review",
+                context="\n".join((
+                    self.state.get("task", ""), self.state.get("proposal", ""),
+                    self.state.get("implementation_summary", ""), *review_diff.included_paths,
+                )),
+                include_skill_content=self._claude_skill_content_authorized(),
+            ),
             "Repository/module map and dependencies": "\n".join(module_lines),
             "Independent reviewer role": CLAUDE_CODE_REVIEW_GUIDANCE,
-            "Engineering Judgment & Proportional Design": PLANNING_PRINCIPLES,
+            "Engineering Judgment & Proportional Design": (
+                "Use the stage-selected skills and independent review rubric. Assess proportionality against the "
+                "assignment; do not elevate style preferences or hypothetical concerns into findings."
+            ),
         }
 
 
@@ -2371,6 +2399,9 @@ class Orchestrator:
             try:
                 if stage == "planning":
                     guidance = self._guidance()
+                    skill_guidance = _guidance_for_codex(
+                        guidance, stage=stage, context=self.state["task"],
+                    )
                     prompt = (
                         "Understand the assignment and this repository. Use the applicable instruction and skill "
                         "content supplied below; inspect relevant target files. Do not merely list skills: apply "
@@ -2382,7 +2413,7 @@ class Orchestrator:
                         "Return a concise, readable Markdown implementation proposal with scope, approach, risks, "
                         "a requirements-to-design mapping, relevant skills and how they were applied, and concrete "
                         "validation commands. Do not modify files or run tests.\n\n"
-                        f"{_guidance_for_codex(guidance)}\n\n"
+                        f"{skill_guidance}\n\n"
                         f"{PLANNING_PRINCIPLES}\n\nTarget: {self.target}\n\nAssignment:\n{self.state['task']}"
                     )
                     proposal = clean_markdown(self._run_codex(prompt, sandbox="read-only"))
@@ -2430,6 +2461,10 @@ class Orchestrator:
                         raise WorkflowError(f"No valid Claude plan review exists for iteration {iteration}.")
                     report = review["report"]
                     guidance = self._guidance()
+                    skill_guidance = _guidance_for_codex(
+                        guidance, stage=stage,
+                        context="\n".join((self.state["task"], self.state["proposal"], report)),
+                    )
                     prompt = (
                         "Evaluate every distinct finding in this valid Claude plan-review report. For each, explicitly "
                         "mark incorporated, rejected, or deferred and give a reason. Incorporate valid in-scope "
@@ -2442,7 +2477,7 @@ class Orchestrator:
                         "Proportional Design. Add one final "
                         "line exactly in this form: `Second plan review needed: yes` or `...: no`. Use yes only when "
                         "a material plan change needs a second independent plan review.\n\n"
-                        f"{PLANNING_PRINCIPLES}\n\n{_guidance_for_codex(guidance)}\n\n"
+                        f"{PLANNING_PRINCIPLES}\n\n{skill_guidance}\n\n"
                         f"Assignment:\n{self.state['task']}\n\nCurrent proposal (version "
                         f"{self.state.get('proposal_version', 1)}):\n{self.state['proposal']}\n\n"
                         f"Claude review (iteration {iteration}, proposal version {review.get('proposal_version')}):\n{report}"
@@ -2472,6 +2507,10 @@ class Orchestrator:
                     self._save()
                 elif stage == "human_revision":
                     guidance = self._guidance()
+                    skill_guidance = _guidance_for_codex(
+                        guidance, stage=stage,
+                        context="\n".join((self.state["task"], self.state["proposal"], self.state["human_feedback"])),
+                    )
                     prompt = (
                         "Revise the saved proposal to address the user's explicit feedback. Keep the original "
                         "assignment and unrelated decisions intact. Apply Engineering Judgment & Proportional Design. "
@@ -2479,7 +2518,7 @@ class Orchestrator:
                         "proposal; if there are no applicable skills, state that. Distinguish must implement, should "
                         "implement, future production considerations, and out of scope. Return the complete proposal "
                         "in readable Markdown; do not implement code.\n\n"
-                        f"{PLANNING_PRINCIPLES}\n\n{_guidance_for_codex(guidance)}\n\n"
+                        f"{PLANNING_PRINCIPLES}\n\n{skill_guidance}\n\n"
                         f"Assignment:\n{self.state['task']}\n\nCurrent proposal (version "
                         f"{self.state.get('proposal_version', 1)}):\n{self.state['proposal']}\n\n"
                         f"Prior review attempts:\n{self._review_history_for_prompt()}\n\n"
@@ -2502,6 +2541,10 @@ class Orchestrator:
                         self._save()
                         break
                     guidance = self._guidance()
+                    skill_guidance = _guidance_for_codex(
+                        guidance, stage=stage,
+                        context="\n".join((self.state["task"], self.state["proposal"])),
+                    )
                     prompt = (
                         "Implement the approved proposal in this repository. Follow repository instructions. "
                         "Apply the relevant skill instructions supplied below; do not merely list skills. "
@@ -2514,7 +2557,7 @@ class Orchestrator:
                         "Do not delete unrelated existing files. Follow Engineering Judgment & Proportional Design "
                         "and do not invent product behavior. Return a concise summary with files changed, "
                         "commands actually run, results, and known limitations.\n\n"
-                        f"{PLANNING_PRINCIPLES}\n\n{_guidance_for_codex(guidance)}\n\n"
+                        f"{PLANNING_PRINCIPLES}\n\n{skill_guidance}\n\n"
                         f"Assignment:\n{self.state['task']}\n\nApproved proposal:\n{self.state['proposal']}"
                     )
                     self.state["implementation_summary"] = self._run_codex(prompt, sandbox="workspace-write")
@@ -2567,18 +2610,29 @@ class Orchestrator:
                         self.state["stage"] = "correction"
                     self._save()
                 elif stage == "correction":
+                    guidance = self._guidance()
                     campaign = self.state.get("review_campaign") or {}
                     individual_reports = "\n\n".join(
                         f"### {record.get('part_id')}\n{record.get('report', '')}"
                         for record in campaign.get("part_reviews", []) if record.get("report")
                     ) or "No separate individual reports were recorded."
+                    skill_guidance = _guidance_for_codex(
+                        guidance, stage=stage,
+                        context="\n".join((
+                            self.state["task"], self.state["proposal"], self.state["code_review"], individual_reports,
+                        )),
+                    )
                     prompt = (
-                        "Evaluate the independent Claude code review. Fix valid in-scope defects, reject incorrect "
-                        "recommendations with a brief reason, and assess every distinct finding from individual part "
-                        "reports as well as the consolidated integration report. Optional improvements are not "
-                        "mandatory. Rerun tests/checks affected by any fixes. Do not "
-                        "make unrelated changes or repeat the review. Return a concise correction and validation "
-                        "summary.\n\n"
+                        "Evaluate the independent Claude code review. Treat its findings as the complete correction "
+                        "assignment. Fix valid in-scope defects and reject incorrect recommendations with a brief "
+                        "reason. Assess every distinct finding from individual part reports and the consolidated "
+                        "integration report. Optional improvements are not mandatory. Modify only files necessary to "
+                        "address valid findings; preserve behavior outside those findings. Do not perform unrelated "
+                        "refactoring, cleanup, or scope expansion. Add or update focused tests when needed and rerun "
+                        "checks affected by the fixes. Do not repeat the review. Return a concise correction and "
+                        "validation summary.\n\n"
+                        f"{PLANNING_PRINCIPLES}\n\n"
+                        f"{skill_guidance}\n\n"
                         f"Assignment:\n{self.state['task']}\n\nApproved proposal:\n{self.state['proposal']}\n\n"
                         f"Claude code review:\n{self.state['code_review']}\n\n"
                         f"Individual Claude part reports:\n{individual_reports}\n\n"
@@ -2675,7 +2729,12 @@ class Orchestrator:
                 "existing assignment and workflow budget."
             ),
             "Engineering Judgment & Proportional Design": PLANNING_PRINCIPLES,
-            "Relevant skills": _guidance_for_claude(guidance),
+            "Relevant skills": _guidance_for_claude(
+                guidance,
+                stage="plan_review",
+                context="\n".join((self.state.get("task", ""), self.state.get("proposal", ""))),
+                include_skill_content=self._claude_skill_content_authorized(),
+            ),
             "Review duties": (
                 "Answer both questions explicitly: (1) Does the proposal satisfy every explicit assignment requirement? "
                 "(2) Is each architectural component and abstraction justified by those requirements? Prefer the "

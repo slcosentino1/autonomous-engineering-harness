@@ -18,6 +18,7 @@ class WorkspaceError(RuntimeError):
 
 
 WORKFLOW_ROOT = ".engineering/workflows"
+HARNESS_SKILLS_ROOT = Path(__file__).resolve().parents[2] / ".agents" / "skills"
 
 
 WORKFLOW_LOCK_NAME_RE = re.compile(r"^\.[A-Za-z0-9][A-Za-z0-9._-]{0,79}\.lock$")
@@ -447,13 +448,37 @@ def skill_metadata(path: Path, content: str) -> tuple[str, str]:
     return name, description
 
 
+def _skill_content(path: Path, content: str) -> str:
+    """Include locally referenced skill guides so agents need no out-of-target reads."""
+    sections = [content]
+    skill_root = path.parent.resolve()
+    references = re.findall(r"\]\((references/[^)#]+)(?:#[^)]*)?\)", content)
+    seen: set[Path] = set()
+    for relative in references:
+        candidate = path.parent / relative
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(skill_root)
+            if candidate.is_symlink() or not resolved.is_file() or resolved in seen:
+                continue
+            seen.add(resolved)
+            reference_content = resolved.read_text(encoding="utf-8")
+        except (OSError, UnicodeError, ValueError):
+            continue
+        sections.append(f"--- Referenced skill guide: {relative} ---\n{reference_content}")
+    return "\n\n".join(sections)
+
+
 def project_skills(target: Path, task: str) -> list[dict[str, str]]:
-    """Read project skills and the installed API engineering skill when it applies."""
+    """Read target and bundled harness skills plus the supported API plugin skill."""
     candidates: list[tuple[Path, str]] = []
     for root in (target / ".agents" / "skills", target / ".codex" / "skills"):
         if root.is_dir():
             candidates.extend((path, "project") for path in root.rglob("SKILL.md")
                               if path.is_file() and not path.is_symlink())
+    if HARNESS_SKILLS_ROOT.is_dir():
+        candidates.extend((path, "harness") for path in HARNESS_SKILLS_ROOT.rglob("SKILL.md")
+                          if path.is_file() and not path.is_symlink())
 
     if re.search(r"\b(api|rest|endpoint)\b", task, re.IGNORECASE):
         codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
@@ -467,8 +492,7 @@ def project_skills(target: Path, task: str) -> list[dict[str, str]]:
                           if path.is_file() and not path.is_symlink())
 
     seen: set[Path] = set()
-    project_skill_names: set[str] = set()
-    installed_skill_names: set[str] = set()
+    seen_names: set[str] = set()
     skills: list[dict[str, str]] = []
     for path, source in candidates:
         resolved = path.resolve()
@@ -480,20 +504,17 @@ def project_skills(target: Path, task: str) -> list[dict[str, str]]:
         except (OSError, UnicodeError):
             continue
         name, description = skill_metadata(path, content)
-        if source != "project" and name != "api-engineer":
+        if source == "installed Codex plugin" and name != "api-engineer":
             continue
-        if source == "project":
-            project_skill_names.add(name)
-        elif name in project_skill_names or name in installed_skill_names:
+        if name in seen_names:
             continue
-        else:
-            installed_skill_names.add(name)
+        seen_names.add(name)
         skills.append({
             "name": name,
             "path": str(path),
             "source": source,
             "description": description,
-            "content": content,
+            "content": _skill_content(path, content),
         })
     return skills
 
@@ -518,6 +539,7 @@ def project_guidance(
         "skill_locations_checked": [
             str(target / ".agents" / "skills"),
             str(target / ".codex" / "skills"),
+            str(HARNESS_SKILLS_ROOT),
             str(codex_home / ".agents" / "skills"),
             str(codex_home / "skills"),
             str(codex_home / ".tmp" / "marketplaces" / "*" / "skills"),

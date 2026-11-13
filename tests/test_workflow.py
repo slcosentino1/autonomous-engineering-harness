@@ -2358,7 +2358,7 @@ class WorkflowTests(unittest.TestCase):
             workflow_id="multipart-review", process_runner=codex, claude_runner=claude,
         )
         runner.start()
-        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "15000"}):
+        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "24000"}):
             state = orchestrator.Orchestrator(
                 self.target, workflow_id="multipart-review", process_runner=codex,
                 claude_runner=claude,
@@ -2399,8 +2399,8 @@ class WorkflowTests(unittest.TestCase):
             state["review_campaign_call_count"],
             state["authorization"]["claude_aily"]["max_code_reviews"],
         )
-        self.assertTrue(all(item["characters"] <= 15000 for item in code_calls))
-        self.assertTrue(all(item["payload_limit_characters"] == 15000 for item in code_calls))
+        self.assertTrue(all(item["characters"] <= 24000 for item in code_calls))
+        self.assertTrue(all(item["payload_limit_characters"] == 24000 for item in code_calls))
         self.assertEqual(
             {item["shared_context_sha256"] for item in code_calls},
             {campaign["shared_context_sha256"]},
@@ -2456,7 +2456,7 @@ class WorkflowTests(unittest.TestCase):
             process_runner=codex, claude_runner=claude,
         )
         runner.start()
-        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "13500"}):
+        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "14500"}):
             state = orchestrator.Orchestrator(
                 self.target, workflow_id="safe-file-split", process_runner=codex, claude_runner=claude,
             ).approve()
@@ -2801,7 +2801,7 @@ class WorkflowTests(unittest.TestCase):
         external["max_code_reviews"] = 1
         with runner._workflow_lock():
             runner._save()
-        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "12000"}):
+        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "13500"}):
             with self.assertRaisesRegex(orchestrator.WorkflowError, "requires .* Claude calls.*authorizes 1"):
                 runner.approve()
         saved = json.loads(runner.state_path.read_text(encoding="utf-8"))
@@ -2859,7 +2859,7 @@ class WorkflowTests(unittest.TestCase):
             process_runner=codex, claude_runner=claude,
         )
         runner.start()
-        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "13000"}):
+        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "15000"}):
             with self.assertRaisesRegex(orchestrator.WorkflowError, "cannot be split at a safe patch boundary"):
                 runner.approve()
         failed = json.loads(runner.state_path.read_text(encoding="utf-8"))
@@ -2918,6 +2918,32 @@ class WorkflowTests(unittest.TestCase):
             orchestrator._print_summary(state)
         self.assertIn("code_review_feedback", output.getvalue())
         self.assertIn("Original reviewer reports", output.getvalue())
+
+    def test_legacy_authorization_can_call_claude_without_skill_bodies(self):
+        codex = FakeCodex("# Proposal\nAdd the requested behavior.\n", self.refined())
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Decision: APPROVED\nThe proposal is adequate.", 0.05),
+            claude_reviewer.ReviewResult("Decision: APPROVED\nNo material plan concerns.", 0.05),
+        )
+        runner = orchestrator.Orchestrator(
+            self.target, task="Refactor a workflow module and add tests.", budget_usd=1.0,
+            workflow_id="legacy-skill-authorization", process_runner=codex, claude_runner=claude,
+        )
+        runner.start()
+
+        with runner._workflow_lock():
+            authorization = runner.state["authorization"]
+            authorization["claude_aily"]["permitted_data"] = (
+                orchestrator._authorization.LEGACY_CLAUDE_DATA_SCOPE.copy()
+            )
+            authorization["scope_sha256"] = orchestrator.authorization_scope_digest(authorization)
+            runner._save()
+            header, sections, metadata = runner._plan_review_prompt(2)
+            report, manifest = runner._call_claude(header, "plan_review_2", sections, metadata=metadata)
+
+        self.assertIn("No material plan concerns.", report)
+        self.assertTrue(manifest["complete"])
+        self.assertNotIn("Before changing a coordinator, orchestrator, or large module", claude.prompts[-1])
 
     def test_new_and_legacy_code_review_authorization_limits_are_distinct(self):
         new = orchestrator.new_workflow_authorization(self.target, "new-scope", 1.0, 9)
@@ -3451,7 +3477,7 @@ class WorkflowTests(unittest.TestCase):
         with runner._workflow_lock():
             header, sections, metadata = runner._plan_review_prompt(2)
             sections["Assignment"] += "é" * 110_000
-            with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "120000"}):
+            with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "125000"}):
                 _report, manifest = runner._call_claude(
                     header, "plan_review_2", sections, metadata=metadata,
                 )
@@ -3460,7 +3486,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(manifest["characters"], len(submitted))
         self.assertEqual(manifest["utf8_bytes"], len(submitted.encode("utf-8")))
         self.assertGreater(manifest["utf8_bytes"], manifest["characters"])
-        self.assertEqual(manifest["payload_limit_characters"], 120_000)
+        self.assertEqual(manifest["payload_limit_characters"], 125_000)
         self.assertEqual(manifest["prompt_sha256"], hashlib.sha256(submitted.encode("utf-8")).hexdigest())
 
     def test_validation_failure_can_resume_without_repeating_implementation(self):
@@ -3577,8 +3603,78 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("Establish the API contract first", codex.prompts[0])
         self.assertIn("Use snake_case field names.", codex.prompts[0])
         self.assertIn("api-engineer", claude.prompts[0])
-        self.assertEqual({item["name"] for item in state["project_guidance"]["skills"]},
-                         {"api-engineer", "project-api"})
+        self.assertIn("Establish the API contract first", claude.prompts[0])
+        self.assertIn("Use snake_case field names.", claude.prompts[0])
+        self.assertTrue({"api-engineer", "project-api"}.issubset(
+            {item["name"] for item in state["project_guidance"]["skills"]}
+        ))
+
+    def test_skill_guidance_reaches_each_provider_stage_and_persists_for_status(self):
+        (self.target / "AGENTS.md").write_text(
+            "Repository instruction sentinel: preserve workflow state ordering.\n", encoding="utf-8",
+        )
+        git(self.target, "add", "AGENTS.md")
+        git(self.target, "commit", "-q", "-m", "add repository instructions")
+        codex = FakeCodex(
+            "# Proposal\nRefactor the workflow coordinator into cohesive modules.\n",
+            self.refined(),
+            "Implemented the parser behavior.\n",
+            "Fixed the reported finding and reran the focused tests.\n",
+        )
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05),
+            response_factory=lambda *_args: claude_reviewer.ReviewResult(
+                "Decision: CHANGES_REQUESTED\nFinding: Handle empty input in the parser.", 0.05,
+            ),
+        )
+
+        def implement(index, _command, _kwargs):
+            if index == 2:
+                path = self.target / "src" / "parser.py"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("def parse(value):\n    return value\n", encoding="utf-8")
+
+        codex.on_call = implement
+        runner = orchestrator.Orchestrator(
+            self.target, task="Refactor the workflow orchestrator and add regression tests.",
+            budget_usd=1.0, workflow_id="skill-propagation", process_runner=codex, claude_runner=claude,
+        )
+        started = runner.start()
+        completed = orchestrator.Orchestrator(
+            self.target, workflow_id="skill-propagation", process_runner=codex, claude_runner=claude,
+        ).approve()
+
+        codex_markers = (
+            "Help choose an architecture that fits the actual problem.",
+            "Make the smallest cohesive change that satisfies the assignment",
+            "Test the behavior at risk; passing tests and line coverage alone do not establish correctness.",
+        )
+        for index in (0, 1, 2, 3):
+            for marker in codex_markers:
+                self.assertIn(marker, codex.prompts[index], (index, marker))
+        self.assertIn("Compare the actual change with the assignment and existing contracts.", codex.prompts[3])
+        self.assertIn("Repository instruction sentinel", codex.prompts[0])
+        self.assertIn("Repository instruction sentinel", codex.prompts[3])
+        self.assertIn("Engineering Judgment & Proportional Design", codex.prompts[0])
+        self.assertIn("Engineering Judgment & Proportional Design", codex.prompts[3])
+        self.assertIn("Treat its findings as the complete correction assignment", codex.prompts[3])
+        self.assertIn("Modify only files necessary", codex.prompts[3])
+        self.assertIn("Do not perform unrelated refactoring", codex.prompts[3])
+
+        self.assertIn("Help choose an architecture that fits the actual problem.", claude.prompts[0])
+        self.assertIn("Make the smallest cohesive change that satisfies the assignment", claude.prompts[0])
+        self.assertIn("Test the behavior at risk; passing tests and line coverage alone do not establish correctness.", claude.prompts[0])
+        self.assertIn("Compare the actual change with the assignment and existing contracts.", claude.prompts[1])
+        self.assertIn("Make the smallest cohesive change that satisfies the assignment", claude.prompts[1])
+        self.assertIn("Test the behavior at risk; passing tests and line coverage alone do not establish correctness.", claude.prompts[1])
+
+        self.assertEqual(completed["status"], "complete")
+        saved_guidance = started["project_guidance"]
+        self.assertTrue(any(skill["source"] == "harness" for skill in saved_guidance["skills"]))
+        reloaded = orchestrator.Orchestrator(
+            self.target, workflow_id="skill-propagation", process_runner=codex, claude_runner=claude,
+        ).status()
+        self.assertEqual(reloaded["project_guidance"], saved_guidance)
 
     def test_no_applicable_project_skill_is_recorded_without_inventing_one(self):
         codex_home = self.root / "empty-codex-home"
@@ -3590,9 +3686,10 @@ class WorkflowTests(unittest.TestCase):
                 process_runner=codex, claude_runner=claude,
             )
             state = runner.start()
-        self.assertEqual(state["project_guidance"]["skills"], [])
-        self.assertIn("Applicable skills: none found", codex.prompts[0])
-        self.assertIn("Relevant skills: none found", claude.prompts[0])
+        self.assertFalse(any(skill["source"] == "project" for skill in state["project_guidance"]["skills"]))
+        self.assertIn("Make the smallest cohesive change that satisfies the assignment", codex.prompts[0])
+        self.assertIn("Test the behavior at risk; passing tests and line coverage alone do not establish correctness.", claude.prompts[0])
+        self.assertNotIn("Help choose an architecture that fits the actual problem.", codex.prompts[0])
 
     def test_refinement_requires_explicit_disposition_for_findings(self):
         incomplete = (

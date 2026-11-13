@@ -34,3 +34,25 @@ Use this skill when a task creates a system, changes important boundaries, intro
 - Treat asynchronous messaging and separate read/write models as explicit consistency and operations choices, not automatic upgrades.
 - Do not design for every identified risk. Address risks that matter to the assignment and explain why lower-impact scenarios do not change the design.
 - If no formal architecture pattern is needed, say so and describe the small set of boundaries or conventions that are sufficient.
+
+## Changes to existing systems
+
+Before changing a coordinator, orchestrator, or large module:
+
+1. Trace the relevant workflow stage and current call path. List the responsibilities and state each method reads or changes; verify this from code rather than inferring it from filenames.
+2. Identify which component owns the requested behavior. Keep stage ordering, lifecycle transitions, persistence ordering, authorization, and recovery decisions in the coordinator when correctness depends on that ordering or shared state.
+3. Extract logic only when it has a cohesive responsibility, an independent reason to change, explicit inputs and outputs, and a useful test boundary. Keep a helper in its current module when it is inseparable from its owning stage or requires passing the whole coordinator or many callbacks.
+4. Map each proposed file change to an explicit requirement or demonstrated risk. Preserve compatibility contracts and existing failure behavior. Do not include adjacent cleanup or unrelated enhancements.
+5. Compare the smallest local change with extraction. A smaller line count is not evidence that a new module is better; extract when the boundary reduces coupling or clarifies ownership enough to justify its cost.
+
+For a modularization, document the methods and callers that move, their state and persistence dependencies, and the tests that cover their ordering and failure paths. Keep compatibility wrappers only where existing callers depend on them.
+
+### Examples
+
+- If a new workflow stage needs a state transition and must save it before invoking a provider, keep that decision in the coordinator. Extract only a pure prompt formatter or parser when it has a clear contract.
+- If several stages need the same Git inventory calculation, a workspace module can own it when it accepts explicit repository inputs and returns data without deciding workflow transitions.
+- Do not add repository inventory, security scanning, or reporting to an orchestrator merely because it is the easiest file to reach. First show that the requested behavior belongs to that workflow responsibility.
+
+## Boundaries
+
+This skill guides architecture and responsibility decisions. It does not authorize expanding an assignment, prescribe a directory structure, replace project instructions, or decide product behavior. For test selection and test doubles, follow `testing-strategy` when available. For implementation-level maintainability beyond boundaries, follow `software-engineering` when available.

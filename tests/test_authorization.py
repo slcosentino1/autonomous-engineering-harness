@@ -49,6 +49,7 @@ class AuthorizationModuleTests(unittest.TestCase):
         self.assertIs(validated, created)
         self.assertEqual(created, original)
         self.assertEqual(created["scope_sha256"], authorization.authorization_scope_digest(created))
+        self.assertIn("relevant_skill_instructions", created["claude_aily"]["permitted_data"])
 
     def test_modified_digest_and_broadened_scope_are_rejected(self):
         target = Path("/target")
@@ -100,6 +101,19 @@ class AuthorizationModuleTests(unittest.TestCase):
         self.assertIs(validated, legacy)
         self.assertNotIn("observability", validated)
         self.assertNotIn("code_review_policy", validated["claude_aily"])
+
+    def test_legacy_claude_scope_remains_valid_without_authorizing_skill_bodies(self):
+        target = Path("/target")
+        legacy = authorization.new_workflow_authorization(target, "legacy-skill-scope", 2.0)
+        legacy["claude_aily"]["permitted_data"] = authorization.LEGACY_CLAUDE_DATA_SCOPE.copy()
+        legacy["scope_sha256"] = authorization.authorization_scope_digest(legacy)
+
+        validated = authorization.validate_workflow_authorization(
+            {"authorization": legacy}, target, "legacy-skill-scope",
+        )
+
+        self.assertEqual(validated["claude_aily"]["permitted_data"], authorization.LEGACY_CLAUDE_DATA_SCOPE)
+        self.assertNotIn("relevant_skill_instructions", validated["claude_aily"]["permitted_data"])
 
     def test_legacy_observability_scope_version_remains_valid(self):
         target = Path("/target")
