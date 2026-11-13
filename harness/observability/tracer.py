@@ -10,8 +10,9 @@ from typing import Any, Callable, ContextManager, Protocol
 
 
 DEFAULT_LANGFUSE_BASE_URL = "https://cloud.langfuse.com"
-OBSERVABILITY_SCOPE_VERSION = 1
-OBSERVABILITY_PERMITTED_DATA = [
+LEGACY_OBSERVABILITY_SCOPE_VERSION = 1
+OBSERVABILITY_SCOPE_VERSION = 2
+OBSERVABILITY_PERMITTED_DATA_V1 = [
     "workflow_command_and_safe_workflow_reference",
     "workflow_stage_and_status",
     "operation_and_provider_names",
@@ -20,6 +21,13 @@ OBSERVABILITY_PERMITTED_DATA = [
     "review_part_index_and_count",
     "provider_cost_already_reported_by_harness",
     "sanitized_error_category",
+]
+OBSERVABILITY_PERMITTED_DATA = [
+    *OBSERVABILITY_PERMITTED_DATA_V1,
+    "codex_invocation_id_and_timestamps",
+    "codex_input_and_captured_output_hashes_and_sizes",
+    "codex_exit_status_and_cli_version_when_reported",
+    "codex_structured_tool_names_counts_and_reported_usage",
 ]
 
 
@@ -70,6 +78,21 @@ class Tracer(Protocol):
     def generation(self, *, name: str, metadata: dict) -> ContextManager[Any]: ...
 
     def flush(self) -> None: ...
+
+
+def valid_observability_scope(scope: Any) -> bool:
+    """Accept current scopes and the previous fixed scope without broadening it."""
+    if not isinstance(scope, dict):
+        return False
+    version = scope.get("version")
+    if type(version) is not int:
+        return False
+    permitted_by_version = {
+        LEGACY_OBSERVABILITY_SCOPE_VERSION: OBSERVABILITY_PERMITTED_DATA_V1,
+        OBSERVABILITY_SCOPE_VERSION: OBSERVABILITY_PERMITTED_DATA,
+    }
+    expected = permitted_by_version.get(version)
+    return expected is not None and scope.get("permitted_data") == expected
 
 
 class NoOpSpan:

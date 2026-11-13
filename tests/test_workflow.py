@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,6 +23,8 @@ sys.path.insert(0, str(ROOT / "harness"))
 
 import claude_reviewer  # noqa: E402
 import orchestrator  # noqa: E402
+from observability import langfuse as langfuse_adapter  # noqa: E402
+from observability.tracer import safe_workflow_reference  # noqa: E402
 from tools import read_documentation_url  # noqa: E402
 from workflow import review as review_contracts  # noqa: E402
 from workflow import workspace as workspace_ops  # noqa: E402
@@ -706,6 +708,480 @@ class PersistenceModuleTests(unittest.TestCase):
             with patch("workflow.persistence.os.replace", side_effect=OSError("disk full")):
                 with self.assertRaisesRegex(orchestrator.WorkflowError, "disk full"):
                     runner._save()
+
+
+class CodexInvocationEvidenceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="codex-evidence-")
+        self.root = Path(self.temp.name)
+        self.target = make_target(self.root / "target")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def invoke(self, *, stdout=b"", stderr=b"", message=b"Codex response\n", returncode=0,
+               model=None, process_error=None):
+        process = self.Process(stdout, stderr, message, returncode, process_error)
+        runner = orchestrator.Orchestrator(
+            self.target, task="Test invocation evidence", workflow_id="codex-evidence",
+            budget_usd=1.0, model=model, process_runner=process,
+        )
+        runner.workflow_dir.mkdir(parents=True, exist_ok=True)
+        runner.state = {
+            "version": 1,
+            "workflow_id": runner.workflow_id,
+            "target": str(runner.target),
+            "task": "Test invocation evidence",
+            "stage": "implementation",
+            "authorization": orchestrator.new_workflow_authorization(
+                runner.target, runner.workflow_id, 1.0,
+            ),
+            "operation_history": [],
+            "active_operation_id": None,
+        }
+        return runner, process
+
+    class Process:
+        def __init__(self, stdout, stderr, message, returncode, process_error):
+            self.stdout = stdout
+            self.stderr = stderr
+            self.message = message
+            self.returncode = returncode
+            self.process_error = process_error
+            self.input = None
+            self.command = None
+
+        def __call__(self, command, **kwargs):
+            self.command = command
+            self.input = kwargs["input"]
+            if self.process_error is not None:
+                if isinstance(self.process_error, subprocess.TimeoutExpired):
+                    raise subprocess.TimeoutExpired(
+                        command, self.process_error.timeout,
+                        output=self.process_error.output, stderr=self.process_error.stderr,
+                    )
+                raise self.process_error
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            if self.message is not None:
+                output_path.write_bytes(self.message)
+            return subprocess.CompletedProcess(command, self.returncode, self.stdout, self.stderr)
+
+    def run_locked(self, runner, prompt="unique-private-prompt"):
+        with runner._workflow_lock():
+            return runner._run_codex(prompt, sandbox="workspace-write")
+
+    @staticmethod
+    def export_trace(tracer):
+        class Client:
+            def __init__(self):
+                self.observations = []
+
+            def start_as_current_observation(self, **kwargs):
+                self.observations.append(kwargs)
+                return nullcontext()
+
+            def flush(self):
+                return None
+
+            def shutdown(self):
+                return None
+
+        client = Client()
+
+        class SDK:
+            @staticmethod
+            def Langfuse(**_kwargs):
+                return client
+
+            @staticmethod
+            def propagate_attributes(**_kwargs):
+                return nullcontext()
+
+        with patch.object(langfuse_adapter.importlib, "import_module", return_value=SDK()):
+            tracer.flush()
+        return client.observations
+
+    def test_hashes_exact_input_and_captured_stream_bytes_without_persisting_raw_streams(self):
+        stdout = (
+            b'{"type":"thread.started"}\n'
+            b'{"type":"item.started","item":{"type":"mcp_tool_call",'
+            b'"tool_name":"repo.search","arguments":{"token":"private-tool-argument"}}}\n'
+            b'{"type":"item.completed","item":{"type":"mcp_tool_call",'
+            b'"tool_name":"repo.search","status":"completed"}}\n'
+            b'{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":4},'
+            b'"model":"codex-test-model"}\n'
+        )
+        stderr = b"private-stderr-diagnostic"
+        message = "  Final response: café.  \n".encode("utf-8")
+        runner, process = self.invoke(stdout=stdout, stderr=stderr, message=message)
+
+        response = self.run_locked(runner)
+
+        operation = runner.state["operation_history"][-1]
+        state_text = runner.state_path.read_text(encoding="utf-8")
+        self.assertEqual(response, "Final response: café.")
+        self.assertEqual(operation["input_sha256"], hashlib.sha256(process.input).hexdigest())
+        self.assertEqual(operation["input_bytes"], len(process.input))
+        self.assertEqual(operation["input_characters"], len(process.input.decode("utf-8")))
+        self.assertNotIn("unique-private-prompt", state_text)
+        self.assertEqual(operation["stdout_sha256"], hashlib.sha256(stdout).hexdigest())
+        self.assertEqual(operation["stdout_bytes"], len(stdout))
+        self.assertEqual(operation["stderr_sha256"], hashlib.sha256(stderr).hexdigest())
+        self.assertEqual(operation["stderr_bytes"], len(stderr))
+        self.assertEqual(operation["last_message_file_sha256"], hashlib.sha256(message).hexdigest())
+        self.assertEqual(operation["last_message_file_bytes"], len(message))
+        self.assertEqual(operation["result_sha256"], hashlib.sha256(response.encode("utf-8")).hexdigest())
+        self.assertEqual(operation["reported_usage"], {"input_tokens": 12, "output_tokens": 4})
+        self.assertEqual(operation["usage_source"], "codex_jsonl_turn_completed")
+        self.assertEqual(operation["model"], "codex-test-model")
+        self.assertEqual(operation["model_source"], "codex_jsonl_event")
+        self.assertEqual(operation["tool_invocations"][0]["tool_names"], ["repo.search"])
+        self.assertEqual(operation["tool_invocations"][0]["started_events"], 1)
+        self.assertEqual(operation["tool_invocations"][0]["completed_events"], 1)
+        self.assertEqual(operation["tool_invocations"][0]["outcome_unreported_events"], 1)
+        self.assertNotIn(stdout.decode("utf-8"), state_text)
+        self.assertNotIn(stderr.decode("utf-8"), state_text)
+        self.assertNotIn("private-tool-argument", state_text)
+        self.assertNotIn("unique-private-prompt", state_text)
+        # The normalized final message is retained temporarily for safe resume recovery.
+        self.assertEqual(json.loads(state_text)["operation_history"][-1]["result_text"], response)
+        summary_output = StringIO()
+        with redirect_stdout(summary_output):
+            orchestrator._print_summary(runner.state)
+        summary = summary_output.getvalue()
+        self.assertIn(operation["stdout_sha256"], summary)
+        self.assertNotIn("private-tool-argument", summary)
+        self.assertNotIn("private-stderr-diagnostic", summary)
+        self.assertNotIn("unique-private-prompt", summary)
+        self.assertIsInstance(operation["duration_ms"], int)
+        self.assertEqual(operation["stdout_truncated"], False)
+        self.assertEqual(operation["stderr_capture_representation"], "bytes")
+
+    def test_missing_last_message_file_uses_only_explicit_jsonl_agent_message(self):
+        stdout = (
+            b'{"type":"item.completed","item":{"type":"reasoning","text":"private reasoning"}}\n'
+            b'{"type":"item.completed","item":{"type":"agent_message","text":"Visible result"}}\n'
+        )
+        runner, _process = self.invoke(stdout=stdout, message=None)
+
+        response = self.run_locked(runner)
+
+        operation = runner.state["operation_history"][-1]
+        state_text = runner.state_path.read_text(encoding="utf-8")
+        self.assertEqual(response, "Visible result")
+        self.assertEqual(operation["last_message_file_status"], "missing")
+        self.assertEqual(operation["result_text"], "Visible result")
+        self.assertNotIn("private reasoning", state_text)
+        self.assertNotIn(stdout.decode("utf-8"), state_text)
+
+    def test_missing_model_and_cli_metadata_remain_explicit(self):
+        runner, process = self.invoke(
+            stdout=b'{"type":"turn.completed","usage":{"total_tokens":0}}\n',
+            model=None,
+        )
+
+        self.run_locked(runner)
+
+        operation = runner.state["operation_history"][-1]
+        self.assertIsNone(operation["model"])
+        self.assertEqual(operation["model_source"], "not_reported")
+        self.assertIsNone(operation["reported_model"])
+        self.assertEqual(operation["cli_version_source"], "unavailable")
+        self.assertEqual(operation["usage_source"], "codex_jsonl_turn_completed")
+        self.assertEqual(operation["reported_usage"], {"total_tokens": 0})
+        self.assertNotIn("--model", process.command)
+
+    def test_text_capture_hashes_its_utf8_encoding_and_records_representation(self):
+        stdout = '{"type":"item.completed","item":{"type":"agent_message","text":"Ready"}}\n'
+        stderr = "diagnostic é"
+        runner, _process = self.invoke(stdout=stdout, stderr=stderr, message=None)
+
+        self.assertEqual(self.run_locked(runner), "Ready")
+
+        operation = runner.state["operation_history"][-1]
+        self.assertEqual(operation["stdout_sha256"], hashlib.sha256(stdout.encode("utf-8")).hexdigest())
+        self.assertEqual(operation["stdout_bytes"], len(stdout.encode("utf-8")))
+        self.assertEqual(operation["stdout_capture_representation"], "utf8_encoded_text")
+        self.assertEqual(operation["stderr_sha256"], hashlib.sha256(stderr.encode("utf-8")).hexdigest())
+        self.assertEqual(operation["stderr_capture_representation"], "utf8_encoded_text")
+
+    def test_configured_model_and_cli_reported_model_keep_distinct_sources(self):
+        runner, process = self.invoke(
+            stdout=b'{"type":"turn.completed","model":"resolved-model"}\n',
+            model="configured-model",
+        )
+
+        self.run_locked(runner)
+
+        operation = runner.state["operation_history"][-1]
+        self.assertEqual(process.command[process.command.index("--model") + 1], "configured-model")
+        self.assertEqual(operation["model"], "configured-model")
+        self.assertEqual(operation["model_source"], "workflow_configuration")
+        self.assertEqual(operation["reported_model"], "resolved-model")
+        self.assertEqual(operation["reported_model_source"], "codex_jsonl_event")
+
+    def test_empty_or_unavailable_stream_and_empty_final_message_are_recorded(self):
+        runner, _process = self.invoke(stdout=None, stderr=None, message=b"")
+
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "empty response"):
+            self.run_locked(runner)
+
+        operation = runner.state["operation_history"][-1]
+        self.assertEqual(operation["status"], "failed")
+        self.assertEqual(operation["stdout_capture_status"], "unavailable")
+        self.assertEqual(operation["stderr_capture_status"], "unavailable")
+        self.assertIsNone(operation["stdout_sha256"])
+        self.assertEqual(operation["last_message_file_status"], "empty")
+        self.assertEqual(operation["last_message_file_sha256"], hashlib.sha256(b"").hexdigest())
+        self.assertIsNone(operation["reported_usage"])
+        self.assertEqual(operation["usage_source"], "not_reported")
+
+    def test_nonzero_exit_records_streams_exit_status_and_failure(self):
+        stdout = b'{"type":"item.completed","item":{"type":"command_execution"}}\n'
+        stderr = b"Codex process failed"
+        runner, _process = self.invoke(stdout=stdout, stderr=stderr, message=None, returncode=7)
+
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "status 7"):
+            self.run_locked(runner)
+
+        operation = runner.state["operation_history"][-1]
+        self.assertEqual(operation["status"], "failed")
+        self.assertEqual(operation["exit_code"], 7)
+        self.assertEqual(operation["error_category"], "CodexExitError")
+        self.assertEqual(operation["stdout_sha256"], hashlib.sha256(stdout).hexdigest())
+        self.assertEqual(operation["stderr_sha256"], hashlib.sha256(stderr).hexdigest())
+        self.assertEqual(operation["last_message_file_status"], "missing")
+        self.assertIsNone(operation["result_text"])
+
+    def test_reported_failed_turn_is_not_marked_completed_when_process_exit_is_zero(self):
+        stdout = (
+            b'{"type":"turn.failed","error":{"message":"failed"}}\n'
+            b'{"type":"item.completed","item":{"type":"agent_message","text":"Partial response"}}\n'
+        )
+        runner, _process = self.invoke(stdout=stdout, message=b"Partial response")
+
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "reported a failed turn"):
+            self.run_locked(runner)
+
+        operation = runner.state["operation_history"][-1]
+        self.assertEqual(operation["status"], "failed")
+        self.assertEqual(operation["error_category"], "CodexReportedTurnFailure")
+        self.assertEqual(operation["codex_cli_turn_status"], "failed")
+        self.assertIsNone(operation["result_text"])
+
+    def test_timeout_records_partial_output_and_interruptions_leave_started_operation_for_recovery(self):
+        partial_stdout = b"partial-jsonl-event"
+        timeout = subprocess.TimeoutExpired("codex", 1, output=partial_stdout, stderr=b"partial-error")
+        runner, _process = self.invoke(process_error=timeout)
+
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "timed out"):
+            self.run_locked(runner)
+
+        operation = runner.state["operation_history"][-1]
+        self.assertEqual(operation["status"], "interrupted")
+        self.assertEqual(operation["stdout_capture_status"], "partial")
+        self.assertTrue(operation["stdout_truncated"])
+        self.assertEqual(operation["stdout_sha256"], hashlib.sha256(partial_stdout).hexdigest())
+        self.assertEqual(operation["stderr_capture_status"], "partial")
+
+        interrupted, _process = self.invoke(process_error=KeyboardInterrupt())
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_locked(interrupted)
+        interrupted_operation = interrupted.state["operation_history"][-1]
+        self.assertEqual(interrupted_operation["status"], "started")
+        self.assertEqual(interrupted_operation["launch_state"], "launching")
+        self.assertEqual(interrupted_operation["stdout_capture_status"], "not_captured")
+        self.assertEqual(interrupted_operation["tool_event_coverage"], "not_captured")
+
+    def test_process_exit_before_evidence_persistence_leaves_operation_unresolved(self):
+        runner, _process = self.invoke(stdout=b'{"type":"turn.completed"}\n')
+        finish = runner._finish_operation
+
+        def interrupt_before_save(operation_id, **kwargs):
+            if kwargs.get("status") == "completed":
+                raise KeyboardInterrupt()
+            finish(operation_id, **kwargs)
+
+        runner._finish_operation = interrupt_before_save
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_locked(runner)
+
+        operation = runner.state["operation_history"][-1]
+        self.assertEqual(operation["status"], "started")
+        self.assertEqual(operation["stdout_capture_status"], "not_captured")
+        self.assertIsNone(operation["stdout_sha256"])
+        self.assertIsNone(operation["result_sha256"])
+        self.assertIsNone(operation["result_text"])
+
+    def test_repeated_operations_keep_separate_evidence_and_bounded_tool_names(self):
+        runner, _first_process = self.invoke(stdout=b"first stream", message=b"First result")
+        self.run_locked(runner)
+        second_process = self.Process(b"second stream", b"", b"Second result", 0, None)
+        runner.process_runner = second_process
+        runner.state["stage"] = "correction"
+        with runner._workflow_lock():
+            self.assertEqual(runner._run_codex("second private prompt", sandbox="workspace-write"), "Second result")
+
+        first, second = runner.state["operation_history"]
+        self.assertNotEqual(first["operation_id"], second["operation_id"])
+        self.assertEqual(first["stdout_sha256"], hashlib.sha256(b"first stream").hexdigest())
+        self.assertEqual(second["stdout_sha256"], hashlib.sha256(b"second stream").hexdigest())
+        self.assertEqual(first["stage"], "implementation")
+        self.assertEqual(second["stage"], "correction")
+        self.assertIsNone(first["result_text"])
+        self.assertEqual(second["result_text"], "Second result")
+
+        events = b"\n".join(
+            json.dumps({
+                "type": "item.completed",
+                "item": {"type": "mcp_tool_call", "tool_name": f"tool-{index}", "status": "succeeded"},
+            }).encode("utf-8")
+            for index in range(orchestrator.MAX_CODEX_TOOL_NAMES + 1)
+        )
+        evidence = orchestrator._codex_jsonl_evidence(events)
+        tool = evidence["tool_invocations"][0]
+        self.assertEqual(len(tool["tool_names"]), orchestrator.MAX_CODEX_TOOL_NAMES)
+        self.assertTrue(tool["tool_names_truncated"])
+        self.assertEqual(tool["success_reported_events"], orchestrator.MAX_CODEX_TOOL_NAMES + 1)
+
+    def test_langfuse_codex_spans_correlate_to_persisted_operations_without_content(self):
+        first_stdout = (
+            b'{"type":"item.completed","item":{"type":"mcp_tool_call",'
+            b'"tool_name":"repo.search","status":"succeeded"}}\n'
+            b'{"type":"turn.completed","usage":{"input_tokens":14,"output_tokens":5},'
+            b'"model":"codex-reported-model"}\n'
+        )
+        runner, _first_process = self.invoke(stdout=first_stdout, message=b"Safe result")
+        tracer = langfuse_adapter.BufferedLangfuseTracer(
+            session_id="", public_key="public", secret_key="secret", base_url="https://langfuse.invalid",
+        )
+        runner._tracer = tracer
+        session_id = safe_workflow_reference(runner.workflow_id)
+        with tracer.execution(name="workflow.execution", session_id=session_id, metadata={"command": "approve"}):
+            self.assertEqual(self.run_locked(runner, "first private prompt"), "Safe result")
+            runner.state["stage"] = "correction"
+            second_process = self.Process(b"second", b"", b"Second result", 0, None)
+            runner.process_runner = second_process
+            with runner._workflow_lock():
+                self.assertEqual(runner._run_codex("second private prompt", sandbox="workspace-write"), "Second result")
+
+        observations = self.export_trace(tracer)
+        root, first_span, second_span = observations
+        self.assertEqual(root["metadata"]["session_id"], session_id)
+        self.assertEqual(first_span["name"], "provider.codex")
+        self.assertEqual(first_span["as_type"], "generation")
+        first_op, second_op = runner.state["operation_history"]
+        first_metadata = first_span["metadata"]
+        self.assertEqual(first_metadata["operation_id"], first_op["operation_id"])
+        self.assertEqual(first_metadata["stage"], "implementation")
+        self.assertEqual(first_metadata["status"], "completed")
+        self.assertEqual(first_metadata["exit_code"], 0)
+        self.assertEqual(first_metadata["input_sha256"], first_op["input_sha256"])
+        self.assertEqual(first_metadata["output_sha256"], hashlib.sha256(first_stdout).hexdigest())
+        self.assertEqual(first_metadata["output_bytes"], len(first_stdout))
+        self.assertEqual(first_metadata["output_capture_status"], "complete")
+        self.assertEqual(first_metadata["output_hash_representation"], "bytes")
+        self.assertEqual(first_span["model"], "codex-reported-model")
+        self.assertEqual(first_metadata["model_source"], "codex_jsonl_event")
+        self.assertEqual(first_metadata["reported_model_source"], "codex_jsonl_event")
+        self.assertEqual(first_metadata["tool_names"], ["repo.search"])
+        self.assertEqual(first_metadata["tool_invocation_count"], 0)
+        self.assertEqual(first_metadata["tool_completed_count"], 1)
+        self.assertEqual(first_metadata["input_tokens"], 14)
+        self.assertEqual(first_metadata["output_tokens"], 5)
+        self.assertEqual(first_metadata["usage_source"], "codex_jsonl_turn_completed")
+        self.assertIn("invocation_at", first_metadata)
+        self.assertIn("finished_at", first_metadata)
+        self.assertIn("duration_ms", first_metadata)
+        self.assertIn("codex_duration_ms", first_metadata)
+        self.assertNotIn("first private prompt", str(observations))
+        self.assertNotIn("Safe result", str(observations))
+        self.assertNotIn("arguments", str(observations))
+        self.assertNotIn("start_time", first_span)
+        self.assertNotIn("end_time", first_span)
+        self.assertNotIn("cost_details", first_span)
+        self.assertNotEqual(first_op["operation_id"], second_op["operation_id"])
+        self.assertEqual(second_span["metadata"]["operation_id"], second_op["operation_id"])
+        self.assertEqual(second_span["metadata"]["stage"], "correction")
+
+    def test_langfuse_finalizes_failed_and_interrupted_codex_spans_truthfully(self):
+        failed, _process = self.invoke(
+            stdout=b"failed output", stderr=b"diagnostic", message=None, returncode=4,
+        )
+        failed_tracer = langfuse_adapter.BufferedLangfuseTracer(
+            session_id="", public_key="public", secret_key="secret", base_url="https://langfuse.invalid",
+        )
+        failed._tracer = failed_tracer
+        try:
+            with failed_tracer.execution(
+                name="workflow.execution", session_id="failed-session", metadata={"command": "approve"},
+            ):
+                with failed._workflow_lock():
+                    failed._run_codex("private prompt", sandbox="workspace-write")
+        except orchestrator.WorkflowError:
+            pass
+        else:
+            self.fail("non-zero Codex status should remain a workflow failure")
+        failed_observations = self.export_trace(failed_tracer)
+        failed_span = failed_observations[1]["metadata"]
+        self.assertEqual(failed_span["status"], "failed")
+        self.assertEqual(failed_span["exit_code"], 4)
+        self.assertEqual(failed_span["error_category"], "CodexExitError")
+
+        interrupted, _process = self.invoke(process_error=KeyboardInterrupt())
+        interrupted_tracer = langfuse_adapter.BufferedLangfuseTracer(
+            session_id="", public_key="public", secret_key="secret", base_url="https://langfuse.invalid",
+        )
+        interrupted._tracer = interrupted_tracer
+        try:
+            with interrupted_tracer.execution(
+                name="workflow.execution", session_id="interrupted-session", metadata={"command": "approve"},
+            ):
+                self.run_locked(interrupted)
+        except KeyboardInterrupt:
+            pass
+        else:
+            self.fail("process interruption should propagate")
+        interrupted_observations = self.export_trace(interrupted_tracer)
+        interrupted_span = interrupted_observations[1]["metadata"]
+        self.assertEqual(interrupted_span["status"], "unknown")
+        self.assertEqual(interrupted_span["error_category"], "KeyboardInterrupt")
+        self.assertEqual(interrupted.state["operation_history"][-1]["status"], "started")
+
+    def test_langfuse_export_failure_does_not_change_codex_result(self):
+        runner, _process = self.invoke(stdout=b"safe stream", message=b"Success stays success")
+        tracer = langfuse_adapter.BufferedLangfuseTracer(
+            session_id="", public_key="public", secret_key="secret", base_url="https://langfuse.invalid",
+        )
+        runner._tracer = tracer
+        with tracer.execution(name="workflow.execution", session_id="safe-session", metadata={"command": "approve"}):
+            response = self.run_locked(runner)
+
+        class BrokenSDK:
+            @staticmethod
+            def Langfuse(**_kwargs):
+                raise RuntimeError("export offline")
+
+        with patch.object(langfuse_adapter.importlib, "import_module", return_value=BrokenSDK()), \
+             redirect_stderr(StringIO()):
+            tracer.flush()
+        self.assertEqual(response, "Success stays success")
+        self.assertEqual(runner.state["operation_history"][-1]["status"], "completed")
+
+    def test_legacy_operation_summary_remains_readable_without_new_evidence_fields(self):
+        output = StringIO()
+        with redirect_stdout(output):
+            orchestrator._print_summary({
+                "workflow_id": "legacy-workflow",
+                "operation_history": [{
+                    "operation_id": "legacy-operation", "operation_type": "codex",
+                    "stage": "implementation", "status": "completed",
+                }],
+            })
+
+        summary = json.loads(output.getvalue())
+        self.assertEqual(summary["recent_operations"][0]["operation_id"], "legacy-operation")
+        self.assertIsNone(summary["recent_operations"][0]["stdout_sha256"])
 
 
 class WorkflowTests(unittest.TestCase):

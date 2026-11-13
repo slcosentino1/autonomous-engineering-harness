@@ -18,6 +18,7 @@ if str(HARNESS) not in sys.path:
 import orchestrator
 from observability import langfuse
 from observability.tracer import (
+    OBSERVABILITY_PERMITTED_DATA_V1,
     NoOpTracer,
     base_url_digest,
     isolated_context,
@@ -578,6 +579,18 @@ class ObservabilityTests(unittest.TestCase):
                 metadata={"provider": "claude", "operation": "plan_review", "report": "PRIVATE_REPORT"},
             ):
                 pass
+            with tracer.generation(
+                name="provider.codex",
+                metadata={
+                    "provider": "codex", "operation": "codex_execution", "operation_id": "a" * 32,
+                    "invocation_at": "2026-11-13T10:20:30Z", "finished_at": "2026-11-13T10:20:31Z",
+                    "input_sha256": "b" * 64, "input_bytes": 120, "output_sha256": "c" * 64,
+                    "output_bytes": 240, "cli_version": "codex-cli 0.162.1", "cli_version_source": "codex --version",
+                    "tool_names": ["repo.search"], "tool_invocation_count": 2, "input_tokens": 15,
+                    "prompt": "PRIVATE_PROMPT", "arguments": "PRIVATE_TOOL_ARGUMENT", "reasoning": "PRIVATE_REASONING",
+                },
+            ):
+                pass
         client = FakeClient()
 
         class SDK:
@@ -593,15 +606,31 @@ class ObservabilityTests(unittest.TestCase):
         with patch.object(langfuse.importlib, "import_module", return_value=SDK()):
             tracer.flush()
         payload = repr(client.observations)
-        for secret in ("PRIVATE_PROMPT", "PRIVATE_SOURCE", "PRIVATE_SECRET", "PRIVATE_REPORT", "/private/workspace"):
+        for secret in (
+            "PRIVATE_PROMPT", "PRIVATE_SOURCE", "PRIVATE_SECRET", "PRIVATE_REPORT", "/private/workspace",
+            "PRIVATE_TOOL_ARGUMENT", "PRIVATE_REASONING",
+        ):
             self.assertNotIn(secret, payload)
-        self.assertEqual([event[0] for event in client.observations], ["workflow.execution", "provider.claude_review"])
-        root, review = client.observations
+        self.assertEqual(
+            [event[0] for event in client.observations],
+            ["workflow.execution", "provider.claude_review", "provider.codex"],
+        )
+        root, review, codex = client.observations
         harness_metadata_keys = {
             "command", "session_id", "initial_stage", "final_stage", "final_status",
             "execution_result", "duration_ms", "stage", "provider", "operation", "sandbox",
             "model", "iteration", "review_kind", "review_part_index", "review_part_count",
             "review_result", "cost_usd", "error_category", "retry_count", "attempt", "status",
+            "operation_id", "invocation_at", "finished_at", "input_sha256", "input_bytes",
+            "input_characters", "output_sha256", "output_bytes", "output_capture_status",
+            "output_hash_representation", "stderr_sha256", "stderr_bytes", "stderr_capture_status",
+            "stderr_hash_representation", "final_message_sha256", "final_message_bytes",
+            "final_message_capture_status", "exit_code", "model_source", "reported_model",
+            "reported_model_source", "cli_version", "cli_version_source", "usage_source",
+            "jsonl_event_coverage", "codex_duration_ms", "tool_item_types", "tool_names", "tool_invocation_count",
+            "tool_completed_count", "tool_success_count", "tool_failure_count",
+            "tool_outcome_unreported_count", "tool_names_truncated", "input_tokens",
+            "cached_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens",
         }
         for _name, _kind, metadata, _kwargs in client.observations:
             self.assertLessEqual(set(metadata), harness_metadata_keys)
@@ -610,6 +639,15 @@ class ObservabilityTests(unittest.TestCase):
         self.assertIn("Operation: plan_review", review[3]["input"])
         self.assertIn("Status: success", review[3]["output"])
         self.assertIs(type(review[2]["duration_ms"]), int)
+        self.assertEqual(codex[2]["operation_id"], "a" * 32)
+        self.assertEqual(codex[2]["output_sha256"], "c" * 64)
+        self.assertEqual(codex[2]["tool_names"], ["repo.search"])
+        self.assertEqual(codex[2]["input_tokens"], 15)
+        self.assertEqual(codex[2]["cli_version"], "codex-cli 0.162.1")
+        self.assertEqual(codex[2]["cli_version_source"], "codex --version")
+        self.assertIn("Input SHA-256", codex[3]["input"])
+        self.assertIn("Output SHA-256", codex[3]["output"])
+        self.assertNotIn("model", codex[3])
         self.assertTrue(client.flush_called)
         self.assertTrue(client.shutdown_called)
 
@@ -880,6 +918,34 @@ class ObservabilityTests(unittest.TestCase):
             orchestrator.validate_workflow_authorization(state, Path("/target"), "workflow"),
             authorization,
         )
+
+    def test_previous_version_observability_authorization_remains_valid_without_scope_expansion(self):
+        target = Path("/target")
+        authorization = orchestrator.new_workflow_authorization(
+            target, "older-traced-workflow", 2.0, tracing_enabled=True,
+        )
+        authorization["observability"]["version"] = 1
+        authorization["observability"]["permitted_data"] = OBSERVABILITY_PERMITTED_DATA_V1.copy()
+        authorization["scope_sha256"] = orchestrator.authorization_scope_digest(authorization)
+
+        validated = orchestrator.validate_workflow_authorization(
+            {"authorization": authorization}, target, "older-traced-workflow",
+        )
+
+        self.assertEqual(validated["observability"]["version"], 1)
+        tracer = langfuse.BufferedLangfuseTracer(
+            session_id="stable-session", public_key="public", secret_key="secret",
+            base_url="https://cloud.langfuse.com", scope_version=1,
+        )
+        with tracer.span(name="provider.codex", metadata={
+            "provider": "codex", "operation": "codex_execution", "operation_id": "a" * 32,
+            "input_sha256": "b" * 64, "status": "completed",
+        }):
+            pass
+        event = tracer._roots[0]
+        self.assertNotIn("operation_id", event.metadata)
+        self.assertNotIn("input_sha256", event.metadata)
+        self.assertEqual(event.metadata["provider"], "codex")
 
     def test_tracing_failures_do_not_hide_operation_errors(self):
         class BrokenContext:

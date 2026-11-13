@@ -32,12 +32,11 @@ else:
 import claude_reviewer
 from tools.read_documentation_url import canonicalize_documentation_url, authorized_url_sha256
 from observability.tracer import (
-    OBSERVABILITY_PERMITTED_DATA,
-    OBSERVABILITY_SCOPE_VERSION,
     NoOpTracer,
     isolated_context,
     observability_scope,
     safe_workflow_reference,
+    valid_observability_scope,
 )
 from workflow import cli as _cli
 from workflow import persistence as _persistence
@@ -574,6 +573,250 @@ def _json_line_message(stdout: str) -> str:
     return messages[-1].strip() if messages else ""
 
 
+_CODEX_JSONL_EVENT_TYPES = frozenset({
+    "thread.started", "turn.started", "turn.completed", "turn.failed", "item.started", "item.completed",
+})
+_CODEX_TOOL_ITEM_TYPES = frozenset({
+    "command_execution", "mcp_tool_call", "web_search", "image_view", "image_generation",
+    "collab_tool_call", "code_interpreter_call",
+})
+_CODEX_NON_TOOL_ITEM_TYPES = frozenset({"agent_message", "reasoning", "plan", "plan_update"})
+_CODEX_USAGE_FIELDS = frozenset({
+    "input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens",
+})
+MAX_CODEX_TOOL_NAMES = 50
+
+
+def _output_bytes(value: bytes | str | None) -> tuple[bytes | None, str]:
+    if isinstance(value, bytes):
+        return value, "bytes"
+    if isinstance(value, str):
+        return value.encode("utf-8"), "utf8_encoded_text"
+    return None, "unavailable"
+
+
+def _codex_jsonl_evidence(stdout: bytes | None) -> dict:
+    evidence = {
+        "jsonl_event_coverage": "unavailable" if stdout is None else "empty",
+        "jsonl_event_count": 0,
+        "jsonl_parse_error_count": 0,
+        "jsonl_unrecognized_event_count": 0,
+        "codex_cli_event_counts": {},
+        "codex_cli_turn_status": "not_reported",
+        "tool_invocations": [],
+        "tool_event_coverage": "unavailable" if stdout is None else "no_tool_events",
+        "reported_usage": None,
+        "usage_source": "not_reported",
+        "reported_model": None,
+        "reported_model_source": "not_reported",
+    }
+    if stdout is None or not stdout:
+        return evidence
+
+    event_counts: dict[str, int] = {}
+    tools: dict[str, dict[str, int]] = {}
+    parse_errors = 0
+    unrecognized_events = 0
+    turn_status = "not_reported"
+    reported_usage: dict[str, int] | None = None
+    reported_model: str | None = None
+    event_count = 0
+    tool_names_seen: dict[str, set[str]] = {}
+
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            parse_errors += 1
+            continue
+        if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+            parse_errors += 1
+            continue
+        event_type = event["type"]
+        event_count += 1
+        if event_type not in _CODEX_JSONL_EVENT_TYPES:
+            unrecognized_events += 1
+            continue
+        event_counts[event_type] = event_counts.get(event_type, 0) + 1
+        if event_type == "turn.completed":
+            turn_status = "completed"
+            usage = event.get("usage")
+            if isinstance(usage, dict):
+                safe_usage = {
+                    key: value for key, value in usage.items()
+                    if key in _CODEX_USAGE_FIELDS and type(value) is int and value >= 0
+                }
+                if safe_usage:
+                    reported_usage = safe_usage
+        elif event_type == "turn.failed":
+            turn_status = "failed"
+        model = event.get("model")
+        if isinstance(model, str) and re.fullmatch(r"[A-Za-z0-9._:/+-]{1,128}", model):
+            reported_model = model
+        if event_type not in {"item.started", "item.completed"}:
+            continue
+        item = event.get("item")
+        item_type = item.get("type") if isinstance(item, dict) else None
+        if not isinstance(item_type, str):
+            continue
+        if item_type in _CODEX_NON_TOOL_ITEM_TYPES:
+            continue
+        if item_type not in _CODEX_TOOL_ITEM_TYPES:
+            unrecognized_events += 1
+            continue
+        counts = tools.setdefault(item_type, {
+            "started_events": 0, "completed_events": 0, "success_reported_events": 0,
+            "failure_reported_events": 0, "outcome_unreported_events": 0,
+            "tool_names": [], "tool_names_truncated": False,
+        })
+        if item_type == "mcp_tool_call":
+            tool_name = item.get("tool_name", item.get("tool"))
+            if isinstance(tool_name, str) and re.fullmatch(r"[A-Za-z0-9_.:/+-]{1,128}", tool_name):
+                seen = tool_names_seen.setdefault(item_type, set())
+                if tool_name not in seen:
+                    if len(seen) < MAX_CODEX_TOOL_NAMES:
+                        seen.add(tool_name)
+                        counts["tool_names"].append(tool_name)
+                    else:
+                        counts["tool_names_truncated"] = True
+        if event_type == "item.started":
+            counts["started_events"] += 1
+            continue
+        counts["completed_events"] += 1
+        status = item.get("status")
+        exit_code = item.get("exit_code")
+        if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+            outcome = "success" if exit_code == 0 else "failure"
+        elif isinstance(status, str) and status.lower() in {"success", "succeeded"}:
+            outcome = "success"
+        elif isinstance(status, str) and status.lower() in {"failed", "failure", "error", "cancelled"}:
+            outcome = "failure"
+        else:
+            outcome = "unreported"
+        counts[f"{outcome}_reported_events" if outcome != "unreported" else "outcome_unreported_events"] += 1
+
+    evidence.update({
+        "jsonl_event_coverage": "partial" if parse_errors else ("parsed" if event_count else "empty"),
+        "jsonl_event_count": event_count,
+        "jsonl_parse_error_count": parse_errors,
+        "jsonl_unrecognized_event_count": unrecognized_events,
+        "codex_cli_event_counts": event_counts,
+        "codex_cli_turn_status": turn_status,
+        "tool_invocations": [
+            {"item_type": name, **tools[name]} for name in sorted(tools)
+        ],
+        "tool_event_coverage": (
+            "partial" if parse_errors else "captured" if tools else "no_tool_events"
+        ),
+        "reported_usage": reported_usage,
+        "usage_source": "codex_jsonl_turn_completed" if reported_usage is not None else "not_reported",
+        "reported_model": reported_model,
+        "reported_model_source": "codex_jsonl_event" if reported_model is not None else "not_reported",
+    })
+    return evidence
+
+
+def _codex_stream_evidence(
+    stdout: bytes | None,
+    stderr: bytes | None,
+    *,
+    stdout_status: str,
+    stderr_status: str,
+    stdout_truncated: bool | None,
+    stderr_truncated: bool | None,
+) -> dict:
+    evidence = {
+        "stdout_sha256": hashlib.sha256(stdout).hexdigest() if stdout is not None else None,
+        "stdout_bytes": len(stdout) if stdout is not None else None,
+        "stdout_capture_status": stdout_status,
+        "stdout_truncated": stdout_truncated,
+        "stderr_sha256": hashlib.sha256(stderr).hexdigest() if stderr is not None else None,
+        "stderr_bytes": len(stderr) if stderr is not None else None,
+        "stderr_capture_status": stderr_status,
+        "stderr_truncated": stderr_truncated,
+        **_codex_jsonl_evidence(stdout),
+    }
+    return evidence
+
+
+def _codex_langfuse_metadata(
+    operation: dict, *, status: str | None = None, finished_at: str | None = None,
+) -> dict:
+    """Build a bounded, content-free view of persisted Codex operation evidence."""
+    metadata = {
+        "operation": "codex_execution",
+        "operation_id": operation.get("operation_id"),
+        "stage": operation.get("stage"),
+        "attempt": operation.get("attempt"),
+        "invocation_at": operation.get("invocation_at"),
+        "finished_at": finished_at if finished_at is not None else operation.get("finished_at"),
+        "status": status if status is not None else operation.get("status"),
+        "exit_code": operation.get("exit_code"),
+        "error_category": operation.get("error_category"),
+        "duration_ms": operation.get("duration_ms"),
+        "codex_duration_ms": operation.get("duration_ms"),
+        "input_sha256": operation.get("input_sha256"),
+        "input_bytes": operation.get("input_bytes"),
+        "input_characters": operation.get("input_characters"),
+        "output_sha256": operation.get("stdout_sha256"),
+        "output_bytes": operation.get("stdout_bytes"),
+        "output_capture_status": operation.get("stdout_capture_status"),
+        "output_hash_representation": operation.get("stdout_capture_representation"),
+        "stderr_sha256": operation.get("stderr_sha256"),
+        "stderr_bytes": operation.get("stderr_bytes"),
+        "stderr_capture_status": operation.get("stderr_capture_status"),
+        "stderr_hash_representation": operation.get("stderr_capture_representation"),
+        "final_message_sha256": operation.get("last_message_file_sha256"),
+        "final_message_bytes": operation.get("last_message_file_bytes"),
+        "final_message_capture_status": operation.get("last_message_file_status"),
+        "model": operation.get("model"),
+        "model_source": operation.get("model_source"),
+        "reported_model": operation.get("reported_model"),
+        "reported_model_source": operation.get("reported_model_source"),
+        "cli_version": operation.get("cli_version"),
+        "cli_version_source": operation.get("cli_version_source"),
+        "jsonl_event_coverage": operation.get("jsonl_event_coverage"),
+        "usage_source": operation.get("usage_source"),
+    }
+    tools = operation.get("tool_invocations")
+    if isinstance(tools, list):
+        item_types = sorted({
+            item["item_type"] for item in tools
+            if isinstance(item, dict) and isinstance(item.get("item_type"), str)
+        })
+        names = []
+        for item in tools:
+            if not isinstance(item, dict):
+                continue
+            for name in item.get("tool_names", []):
+                if isinstance(name, str) and name not in names:
+                    names.append(name)
+        metadata.update({
+            "tool_item_types": item_types,
+            "tool_names": names,
+            "tool_names_truncated": "true" if any(
+                isinstance(item, dict) and item.get("tool_names_truncated") is True for item in tools
+            ) else "false",
+        })
+        for field, output_field in (
+            ("started_events", "tool_invocation_count"),
+            ("completed_events", "tool_completed_count"),
+            ("success_reported_events", "tool_success_count"),
+            ("failure_reported_events", "tool_failure_count"),
+            ("outcome_unreported_events", "tool_outcome_unreported_count"),
+        ):
+            metadata[output_field] = sum(
+                item.get(field, 0) for item in tools
+                if isinstance(item, dict) and type(item.get(field, 0)) is int and item.get(field, 0) >= 0
+            )
+    usage = operation.get("reported_usage")
+    if isinstance(usage, dict):
+        metadata.update({key: value for key, value in usage.items() if key in _CODEX_USAGE_FIELDS})
+    return {key: value for key, value in metadata.items() if value is not None}
+
+
 def build_codex_command(
     executable: str, target: Path, sandbox: str, output_path: Path, model: str | None = None,
     *, read_only_authorized_urls: list[str] | None = None,
@@ -747,10 +990,8 @@ def validate_workflow_authorization(state: dict, target: Path, workflow_id: str)
         )
         if (not isinstance(observability, dict)
                 or set(observability) != {"version", "enabled", "permitted_data", "langfuse_base_url_sha256"}
-                or type(observability.get("version")) is not int
-                or observability.get("version") != OBSERVABILITY_SCOPE_VERSION
+                or not valid_observability_scope(observability)
                 or type(enabled) is not bool
-                or observability.get("permitted_data") != OBSERVABILITY_PERMITTED_DATA
                 or not valid_endpoint_hash):
             raise WorkflowError("Saved observability scope is invalid or changed.")
     external = authorization.get("claude_aily")
@@ -830,6 +1071,11 @@ class Orchestrator:
         self._tracer = None
         self._active_trace_context = None
         self._trace_started_at: float | None = None
+        self._active_codex_trace_context = None
+        self._active_codex_operation_id: str | None = None
+        self._active_codex_persisted_status: str | None = None
+        self._codex_cli_version_checked = False
+        self._codex_cli_version_cache: str | None = None
         self.workflow_dir = _check_plain_directories(self.target, f"{WORKFLOW_ROOT}/{self.workflow_id}")
         self.state_path = self.workflow_dir / "state.json"
         self.proposal_path = self.workflow_dir / "proposal.md"
@@ -883,6 +1129,37 @@ class Orchestrator:
             "result_consumed": False,
             **details,
         }
+        if operation_type == "codex":
+            operation.update({
+                "workflow_id": self.workflow_id,
+                "invocation_at": operation["started_at"],
+                "duration_ms": None,
+                "stdout_sha256": None,
+                "stdout_bytes": None,
+                "stdout_capture_status": "not_captured",
+                "stdout_truncated": None,
+                "stderr_sha256": None,
+                "stderr_bytes": None,
+                "stderr_capture_status": "not_captured",
+                "stderr_truncated": None,
+                "stdout_capture_representation": "unavailable",
+                "stderr_capture_representation": "unavailable",
+                "last_message_file_sha256": None,
+                "last_message_file_bytes": None,
+                "last_message_file_status": "not_captured",
+                "jsonl_event_coverage": "not_captured",
+                "jsonl_event_count": None,
+                "jsonl_parse_error_count": None,
+                "jsonl_unrecognized_event_count": None,
+                "codex_cli_event_counts": {},
+                "codex_cli_turn_status": "not_reported",
+                "tool_invocations": [],
+                "tool_event_coverage": "not_captured",
+                "reported_usage": None,
+                "usage_source": "not_reported",
+                "reported_model": None,
+                "reported_model_source": "not_reported",
+            })
         history.append(operation)
         self.state["active_operation_id"] = operation["operation_id"]
         if len(history) > MAX_OPERATION_HISTORY:
@@ -924,6 +1201,7 @@ class Orchestrator:
         result_sha256: str | None = None,
         cost_usd: float | None = None,
         launch_state: str | None = None,
+        evidence: dict | None = None,
     ) -> None:
         operation = self._operation(operation_id)
         if operation is None:
@@ -940,9 +1218,23 @@ class Orchestrator:
         })
         if launch_state is not None:
             operation["launch_state"] = launch_state
+        if evidence:
+            operation.update(evidence)
         if self.state.get("active_operation_id") == operation_id:
             self.state["active_operation_id"] = None
         self._save()
+        if operation.get("operation_type") == "codex":
+            self._update_active_codex_trace(operation)
+
+    def _update_active_codex_trace(
+        self, operation: dict, *, status: str | None = None, finished_at: str | None = None,
+    ) -> None:
+        trace_context = getattr(self, "_active_codex_trace_context", None)
+        if trace_context is not None:
+            trace_context.update(**_codex_langfuse_metadata(
+                operation, status=status, finished_at=finished_at,
+            ))
+        self._active_codex_persisted_status = operation.get("status")
 
     def _target_change_inventory(self) -> list[dict[str, str]]:
         baseline = self.state.get("baseline_commit")
@@ -974,6 +1266,15 @@ class Orchestrator:
             operation["finished_at"] = now()
             operation["outcome"] = "The workflow process stopped before recording a terminal result."
             operation["error_category"] = "Interrupted"
+            if operation.get("operation_type") == "codex":
+                operation.update({
+                    "stdout_capture_status": "unavailable",
+                    "stdout_truncated": None,
+                    "stderr_capture_status": "unavailable",
+                    "stderr_truncated": None,
+                    "jsonl_event_coverage": "unavailable",
+                    "tool_event_coverage": "unavailable",
+                })
             if self.state.get("active_operation_id") == operation.get("operation_id"):
                 self.state["active_operation_id"] = None
         if operation is not None and operation.get("operation_type") == "claude":
@@ -1203,6 +1504,15 @@ class Orchestrator:
                     "outcome": "The workflow stopped before launching this external operation; safe to retry.",
                     "error_category": "OperationNotLaunched",
                 })
+                if active_operation.get("operation_type") == "codex":
+                    active_operation.update({
+                        "stdout_capture_status": "not_started",
+                        "stdout_truncated": False,
+                        "stderr_capture_status": "not_started",
+                        "stderr_truncated": False,
+                        "jsonl_event_coverage": "unavailable",
+                        "tool_event_coverage": "unavailable",
+                    })
                 if self.state.get("active_operation_id") == active_operation.get("operation_id"):
                     self.state["active_operation_id"] = None
                 if active_operation.get("operation_type") == "claude":
@@ -1572,8 +1882,71 @@ class Orchestrator:
             metadata["stage"] = self.state["stage"]
         if self.model:
             metadata["model"] = self.model
-        with self._trace_span("provider.codex", metadata, as_type="generation"):
-            return self._run_codex_impl(prompt, sandbox=sandbox)
+        trace_context = self._trace_span("provider.codex", metadata, as_type="generation")
+        previous_trace_context = getattr(self, "_active_codex_trace_context", None)
+        previous_operation_id = getattr(self, "_active_codex_operation_id", None)
+        previous_persisted_status = getattr(self, "_active_codex_persisted_status", None)
+        self._active_codex_trace_context = trace_context
+        self._active_codex_operation_id = None
+        self._active_codex_persisted_status = None
+        try:
+            try:
+                with trace_context:
+                    result = self._run_codex_impl(prompt, sandbox=sandbox)
+            except BaseException as exc:
+                operation = self._operation(self._active_codex_operation_id)
+                if operation is not None:
+                    persisted_status = self._active_codex_persisted_status
+                    if persisted_status in {"completed", "failed", "interrupted"}:
+                        trace_context.update(**_codex_langfuse_metadata(operation))
+                    else:
+                        trace_context.update(**_codex_langfuse_metadata(
+                            operation,
+                            status="unknown",
+                            finished_at=now(),
+                        ))
+                        trace_context.update(error_category=type(exc).__name__)
+                raise
+            operation = self._operation(self._active_codex_operation_id)
+            if operation is not None and self._active_codex_persisted_status is not None:
+                trace_context.update(**_codex_langfuse_metadata(operation))
+            return result
+        finally:
+            self._active_codex_trace_context = previous_trace_context
+            self._active_codex_operation_id = previous_operation_id
+            self._active_codex_persisted_status = previous_persisted_status
+
+    def _codex_cli_version(self) -> str | None:
+        """Read the configured CLI version without making a provider call; optional metadata only."""
+        if self._codex_cli_version_checked:
+            return self._codex_cli_version_cache
+        self._codex_cli_version_checked = True
+        if self.process_runner is not subprocess.run:
+            return None
+        try:
+            result = subprocess.run(
+                [self.codex, "--version"],
+                cwd=str(self.target),
+                env=_git_env(),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+        if result.returncode != 0:
+            return None
+        version_bytes, _source = _output_bytes(result.stdout)
+        if version_bytes is None:
+            return None
+        version = version_bytes.decode("utf-8", "replace").strip().splitlines()
+        if not version or len(version[0]) > 96:
+            return None
+        if re.fullmatch(r"(?:codex-cli|codex)\s+v?[0-9][A-Za-z0-9.+-]*", version[0], re.IGNORECASE):
+            self._codex_cli_version_cache = version[0]
+        return self._codex_cli_version_cache
 
     def _run_process_with_pid(self, command: list[str], *, operation_id: str, **kwargs):
         """Run the normal subprocess interface while persisting a child PID when available."""
@@ -1640,7 +2013,8 @@ class Orchestrator:
                 read_only_authorized_urls=read_only_authorized_urls,
             )
             effective_prompt = authorization_context + prompt
-            prompt_hash = hashlib.sha256(effective_prompt.encode("utf-8")).hexdigest()
+            effective_prompt_bytes = effective_prompt.encode("utf-8")
+            prompt_hash = hashlib.sha256(effective_prompt_bytes).hexdigest()
             prior_operations = [
                 item for item in self.state.get("operation_history", [])
                 if item.get("operation_type") == "codex" and item.get("stage") == stage
@@ -1657,23 +2031,35 @@ class Orchestrator:
                     raise WorkflowError("Codex result recovery is ambiguous; inspect the workflow status.")
                 return prior["result_text"]
 
+            cli_version = self._codex_cli_version()
             operation = self._new_operation(
                 "codex",
                 input_sha256=prompt_hash,
                 sandbox=sandbox,
                 model=self.model,
+                model_source="workflow_configuration" if self.model is not None else "not_reported",
+                reported_model=None,
+                cli_version=cli_version,
+                cli_version_source="codex --version" if cli_version is not None else "unavailable",
+                input_characters=len(effective_prompt),
+                input_bytes=len(effective_prompt_bytes),
                 attempt=1 + sum(
                     item.get("operation_type") == "codex" and item.get("stage") == stage
                     for item in self.state.get("operation_history", [])
                 ),
             )
+            self._active_codex_operation_id = operation["operation_id"]
             self._save()
+            operation["invocation_at"] = now()
+            self._save()
+            self._update_active_codex_trace(operation)
+            invocation_started = time.monotonic()
             try:
                 result = self._run_process_with_pid(
                     command,
                     operation_id=operation["operation_id"],
                     cwd=str(self.target),
-                    input=effective_prompt.encode("utf-8"),
+                    input=effective_prompt_bytes,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     timeout=self.timeout_seconds,
@@ -1681,43 +2067,112 @@ class Orchestrator:
                     env=_git_env(),
                 )
             except subprocess.TimeoutExpired as exc:
+                invocation_finished = time.monotonic()
+                partial_stdout, stdout_representation = _output_bytes(exc.output)
+                partial_stderr, stderr_representation = _output_bytes(exc.stderr)
+                stream_evidence = _codex_stream_evidence(
+                    partial_stdout, partial_stderr,
+                    stdout_status="partial" if partial_stdout is not None else "unavailable",
+                    stderr_status="partial" if partial_stderr is not None else "unavailable",
+                    stdout_truncated=True if partial_stdout is not None else None,
+                    stderr_truncated=True if partial_stderr is not None else None,
+                )
+                stream_evidence.update({
+                    "stdout_capture_representation": stdout_representation,
+                    "stderr_capture_representation": stderr_representation,
+                    "duration_ms": max(0, round((invocation_finished - invocation_started) * 1000)),
+                })
                 self._finish_operation(
                     operation["operation_id"], status="interrupted",
                     outcome=f"Codex timed out after {self.timeout_seconds} seconds; target changes require inspection.",
-                    error_category=type(exc).__name__,
+                    error_category=type(exc).__name__, evidence=stream_evidence,
                 )
                 raise WorkflowError(f"Codex timed out after {self.timeout_seconds} seconds.") from exc
             except OSError as exc:
+                invocation_finished = time.monotonic()
+                stream_evidence = _codex_stream_evidence(
+                    None, None, stdout_status="not_started", stderr_status="not_started",
+                    stdout_truncated=False, stderr_truncated=False,
+                )
+                stream_evidence["duration_ms"] = max(0, round((invocation_finished - invocation_started) * 1000))
                 self._finish_operation(
                     operation["operation_id"], status="failed",
                     outcome=f"Codex could not start: {redact(str(exc))}",
-                    error_category=type(exc).__name__, launch_state="not_started",
+                    error_category=type(exc).__name__, launch_state="not_started", evidence=stream_evidence,
                 )
                 raise WorkflowError(f"Codex could not start: {redact(str(exc))}") from exc
+            invocation_finished = time.monotonic()
+            stdout_raw, stdout_representation = _output_bytes(result.stdout)
+            stderr_raw, stderr_representation = _output_bytes(result.stderr)
             stdout = result.stdout.decode("utf-8", "replace") if isinstance(result.stdout, bytes) else str(result.stdout or "")
             stderr = result.stderr.decode("utf-8", "replace") if isinstance(result.stderr, bytes) else str(result.stderr or "")
+            stdout_status = "unavailable" if stdout_raw is None else "empty" if not stdout_raw else "complete"
+            stderr_status = "unavailable" if stderr_raw is None else "empty" if not stderr_raw else "complete"
+            stream_evidence = _codex_stream_evidence(
+                stdout_raw, stderr_raw,
+                stdout_status=stdout_status, stderr_status=stderr_status,
+                stdout_truncated=False if stdout_raw is not None else None,
+                stderr_truncated=False if stderr_raw is not None else None,
+            )
+            stream_evidence.update({
+                "stdout_capture_representation": stdout_representation,
+                "stderr_capture_representation": stderr_representation,
+                "duration_ms": max(0, round((invocation_finished - invocation_started) * 1000)),
+            })
+            if output_path.exists():
+                last_message_raw = output_path.read_bytes()
+                stream_evidence.update({
+                    "last_message_file_sha256": hashlib.sha256(last_message_raw).hexdigest(),
+                    "last_message_file_bytes": len(last_message_raw),
+                    "last_message_file_status": "empty" if not last_message_raw else "captured",
+                })
+            else:
+                last_message_raw = None
+                stream_evidence.update({
+                    "last_message_file_sha256": None,
+                    "last_message_file_bytes": None,
+                    "last_message_file_status": "missing",
+                })
             if result.returncode:
                 detail = redact(stderr.strip() or _json_line_message(stdout) or "Codex returned no diagnostic output.")
                 self._finish_operation(
                     operation["operation_id"], status="failed",
                     outcome=f"Codex exited with status {result.returncode}: {detail}",
-                    exit_code=result.returncode, error_category="CodexExitError",
+                    exit_code=result.returncode, error_category="CodexExitError", evidence=stream_evidence,
                 )
                 raise WorkflowError(f"Codex exited with status {result.returncode}: {detail}")
-            if output_path.exists():
-                message = output_path.read_text(encoding="utf-8").strip()
+            if stream_evidence.get("codex_cli_turn_status") == "failed":
+                self._finish_operation(
+                    operation["operation_id"], status="failed",
+                    outcome="Codex JSONL reported a failed turn.",
+                    exit_code=result.returncode, error_category="CodexReportedTurnFailure", evidence=stream_evidence,
+                )
+                raise WorkflowError("Codex JSONL reported a failed turn.")
+            if last_message_raw is not None:
+                message = last_message_raw.decode("utf-8").strip()
             else:
-                message = _json_line_message(stdout) or stdout.strip()
+                # --json is always enabled. Only extract an explicit final-message event;
+                # never persist the raw event stream as a recovery result.
+                message = _json_line_message(stdout)
             if not message:
                 self._finish_operation(
                     operation["operation_id"], status="failed", outcome="Codex returned an empty response.",
-                    exit_code=result.returncode, error_category="EmptyCodexResponse",
+                    exit_code=result.returncode, error_category="EmptyCodexResponse", evidence=stream_evidence,
                 )
                 raise WorkflowError("Codex returned an empty response.")
+            stream_evidence.update({
+                "result_text_characters": len(message),
+                "result_text_bytes": len(message.encode("utf-8")),
+            })
+            if stream_evidence.get("reported_model") is not None:
+                if operation.get("model") is None:
+                    operation["model"] = stream_evidence["reported_model"]
+                    operation["model_source"] = "codex_jsonl_event"
             self._finish_operation(
                 operation["operation_id"], status="completed", outcome="Codex returned a response.",
                 exit_code=result.returncode, result_text=message,
                 result_sha256=hashlib.sha256(message.encode("utf-8")).hexdigest(), launch_state="completed",
+                evidence=stream_evidence,
             )
             return message
 

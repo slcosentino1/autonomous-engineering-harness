@@ -83,8 +83,19 @@ def print_summary(state: dict, *, workflow_root: str) -> None:
             {
                 key: operation.get(key)
                 for key in (
-                    "operation_id", "operation_type", "stage", "status", "started_at", "process_id",
-                    "launch_state", "exit_code", "outcome", "error_category",
+                    "operation_id", "workflow_id", "operation_type", "stage", "attempt", "status",
+                    "invocation_at", "started_at", "finished_at", "process_id", "launch_state", "exit_code",
+                    "duration_ms", "model", "model_source", "reported_model", "cli_version",
+                    "cli_version_source",
+                    "input_sha256", "input_characters", "input_bytes", "stdout_sha256", "stdout_bytes",
+                    "stdout_capture_status", "stdout_capture_representation", "stdout_truncated",
+                    "stderr_sha256", "stderr_bytes", "stderr_capture_status", "stderr_capture_representation",
+                    "stderr_truncated", "last_message_file_sha256",
+                    "last_message_file_bytes", "last_message_file_status", "jsonl_event_coverage",
+                    "jsonl_event_count", "jsonl_parse_error_count", "jsonl_unrecognized_event_count",
+                    "codex_cli_turn_status", "tool_event_coverage", "tool_invocations", "reported_usage",
+                    "usage_source", "reported_model_source", "result_text_characters", "result_text_bytes",
+                    "outcome", "error_category",
                 )
             }
             for operation in reversed(state.get("operation_history", []))
@@ -94,10 +105,19 @@ def print_summary(state: dict, *, workflow_root: str) -> None:
             {
                 key: operation.get(key)
                 for key in (
-                    "operation_id", "operation_type", "stage", "status", "started_at", "finished_at",
-                    "process_id", "launch_state", "exit_code", "outcome", "error_category",
-                    "input_sha256", "result_sha256",
-                    "cost_usd", "resolution",
+                    "operation_id", "workflow_id", "operation_type", "stage", "attempt", "status",
+                    "invocation_at", "started_at", "finished_at", "process_id", "launch_state", "exit_code",
+                    "duration_ms", "model", "model_source", "reported_model", "cli_version",
+                    "cli_version_source",
+                    "input_sha256", "input_characters", "input_bytes", "stdout_sha256", "stdout_bytes",
+                    "stdout_capture_status", "stdout_capture_representation", "stdout_truncated",
+                    "stderr_sha256", "stderr_bytes", "stderr_capture_status", "stderr_capture_representation",
+                    "stderr_truncated", "last_message_file_sha256",
+                    "last_message_file_bytes", "last_message_file_status", "jsonl_event_coverage",
+                    "jsonl_event_count", "jsonl_parse_error_count", "jsonl_unrecognized_event_count",
+                    "codex_cli_turn_status", "tool_event_coverage", "tool_invocations", "reported_usage",
+                    "usage_source", "reported_model_source", "result_text_characters", "result_text_bytes",
+                    "result_sha256", "cost_usd", "resolution", "outcome", "error_category",
                 )
             }
             for operation in state.get("operation_history", [])[-10:]
