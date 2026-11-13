@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -13,6 +14,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -21,6 +23,7 @@ sys.path.insert(0, str(ROOT / "harness"))
 
 import claude_reviewer  # noqa: E402
 import orchestrator  # noqa: E402
+from tools import read_documentation_url  # noqa: E402
 from workflow import review as review_contracts  # noqa: E402
 from workflow import workspace as workspace_ops  # noqa: E402
 from workflow import persistence as persistence_ops  # noqa: E402
@@ -46,6 +49,215 @@ def prompt_section(prompt: str, name: str) -> str:
         rf"(?ms)^## {re.escape(name)}\n(.*?)(?=^## |\Z)", prompt,
     )
     return match.group(1).strip() if match else ""
+
+
+class CodexGuidanceTests(unittest.TestCase):
+    def test_read_only_codex_calls_isolate_user_mcp_configuration_even_without_url_access(self):
+        with tempfile.TemporaryDirectory() as root:
+            command = orchestrator.build_codex_command(
+                "codex", Path(root), "read-only", Path(root) / "result.md",
+            )
+
+        self.assertIn("--ignore-user-config", command)
+        self.assertIn("mcp_servers={}", command)
+
+    def test_codex_guidance_keeps_small_file_inventory(self):
+        prompt = orchestrator._guidance_for_codex({"files": ["README.md", "src/api.py"]})
+
+        self.assertIn("Files: README.md, src/api.py", prompt)
+
+    def test_provider_guidance_omits_oversized_file_inventory(self):
+        files = [f"src/module-{index:05d}/file.py" for index in range(5_000)]
+
+        codex_prompt = orchestrator._guidance_for_codex({"files": files})
+        claude_prompt = orchestrator._guidance_for_claude({"files": files})
+
+        for prompt, label in ((codex_prompt, "Files"), (claude_prompt, "Repository files")):
+            self.assertIn(f"{label}: full inventory omitted (5,000 paths;", prompt)
+            self.assertIn("Use `rg --files` and focused `rg` searches", prompt)
+            self.assertNotIn(files[0], prompt)
+            self.assertLess(len(prompt), orchestrator.MAX_PROMPT_FILE_INVENTORY_CHARS)
+
+    def test_claude_repository_context_omits_oversized_file_inventory(self):
+        files = [f"src/module-{index:05d}/file.py" for index in range(5_000)]
+        runner = object.__new__(orchestrator.Orchestrator)
+
+        context = runner._repository_context_for_claude({"files": files})
+
+        self.assertIn("Files: full inventory omitted (5,000 paths;", context)
+        self.assertNotIn(files[0], context)
+
+    def test_default_claude_payload_limit_is_increased(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(claude_reviewer.max_review_payload_chars(), 200_000)
+
+    def test_exact_documentation_urls_are_authorized_only_in_read_only_plan_stages(self):
+        self.assertEqual(
+            orchestrator._planning_read_only_authorized_urls("planning", "Read https://example.com/docs"),
+            ["https://example.com/docs"],
+        )
+        self.assertEqual(
+            orchestrator._planning_read_only_authorized_urls(
+                "plan_refine_1", "Read https://example.com/docs and https://api.example.org/openapi.json",
+            ),
+            ["https://api.example.org/openapi.json", "https://example.com/docs"],
+        )
+        self.assertEqual(
+            orchestrator._planning_read_only_authorized_urls("human_revision", "Read https://example.com/docs"),
+            ["https://example.com/docs"],
+        )
+        self.assertEqual(orchestrator._planning_read_only_authorized_urls(
+            "implementation", "Read https://example.com/docs",
+        ), [])
+        self.assertEqual(orchestrator._planning_read_only_authorized_urls(
+            "planning", "Read http://example.com/docs",
+        ), [])
+        self.assertEqual(orchestrator._planning_read_only_authorized_urls("planning", "No external documentation"), [])
+
+    def test_project_mcp_config_blocks_documentation_tool_isolation(self):
+        with tempfile.TemporaryDirectory() as temporary_target:
+            target = Path(temporary_target)
+            config_dir = target / ".codex"
+            config_dir.mkdir()
+            (config_dir / "config.toml").write_text(
+                '[mcp_servers.unapproved]\ncommand = "unapproved"\n', encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(orchestrator.WorkflowError, "declares MCP servers"):
+                orchestrator._assert_no_project_mcp_servers(target)
+
+    @unittest.skipUnless(shutil.which("codex"), "Codex CLI is unavailable")
+    def test_installed_codex_mcp_config_merges_user_servers_and_exec_flag_is_supported(self):
+        with tempfile.TemporaryDirectory() as temporary_target, tempfile.TemporaryDirectory() as codex_home:
+            target = Path(temporary_target)
+            command = orchestrator.build_codex_command(
+                "codex", target, "read-only", target / "result.md",
+                read_only_authorized_urls=["https://docs.example.com/api"],
+            )
+            config = command[command.index("-c") + 1]
+            (Path(codex_home) / "config.toml").write_text(
+                '[mcp_servers.unrelated]\ncommand = "must-not-load"\nargs = []\n', encoding="utf-8",
+            )
+            environment = dict(os.environ, CODEX_HOME=codex_home)
+            listed = subprocess.run(
+                ["codex", "mcp", "list", "--json", "-c", config],
+                env=environment, capture_output=True, text=True, timeout=10, check=True,
+            )
+            effective_without_isolation = {item["name"] for item in json.loads(listed.stdout)}
+            self.assertEqual(effective_without_isolation, {"documentation_reader", "unrelated"})
+            help_result = subprocess.run(
+                ["codex", "exec", "--ignore-user-config", "--help"],
+                env=environment, capture_output=True, text=True, timeout=10, check=True,
+            )
+            self.assertIn("Do not load `$CODEX_HOME/config.toml`", help_result.stdout)
+        self.assertIn("--ignore-user-config", command)
+
+
+class DocumentationReaderTests(unittest.TestCase):
+    def test_documentation_url_tool_declares_read_only_non_destructive_mcp_annotations(self):
+        tool = read_documentation_url._tool_definition()
+        self.assertEqual(
+            tool["annotations"],
+            {
+                "title": "Read an authorized documentation URL",
+                "readOnlyHint": True,
+                "destructiveHint": False,
+                "idempotentHint": True,
+                "openWorldHint": True,
+            },
+        )
+
+    def test_tls_context_uses_certifi_when_no_system_trust_store_exists(self):
+        certifi_module = SimpleNamespace(where=lambda: "/tmp/ca-bundle.pem")
+        with (
+            patch(
+                "tools.read_documentation_url.ssl.get_default_verify_paths",
+                return_value=SimpleNamespace(cafile=None, capath=None),
+            ),
+            patch.dict(sys.modules, {"certifi": certifi_module}),
+            patch("tools.read_documentation_url.ssl.create_default_context", return_value="verified-context") as create_context,
+        ):
+            self.assertEqual(read_documentation_url._default_tls_context(), "verified-context")
+        create_context.assert_called_once_with(cafile="/tmp/ca-bundle.pem")
+
+    def test_url_validation_requires_https_allowlisted_standard_host(self):
+        url = "https://docs.example.com/api"
+        authorized = {read_documentation_url.authorized_url_sha256(url)}
+        self.assertEqual(
+            read_documentation_url._validate_url(url, authorized), url,
+        )
+        for url in (
+            "http://docs.example.com/api",
+            "https://docs.example.com/other",
+            "https://docs.example.com/api?repository=secret",
+            "https://other.example.com/api",
+            "https://user:password@docs.example.com/api",
+            "https://docs.example.com:8443/api",
+            "https://127.0.0.1/api",
+            "https://docs.example.com/api?access_token=secret",
+        ):
+            with self.subTest(url=url), self.assertRaises(read_documentation_url.ReadOnlyDocsError):
+                read_documentation_url._validate_url(url, authorized)
+
+    def test_dns_policy_accepts_only_global_ipv4_and_ipv6_addresses(self):
+        for address in ("8.8.8.8", "2001:4860:4860::8888"):
+            with self.subTest(address=address), patch(
+                "tools.read_documentation_url.socket.getaddrinfo",
+                return_value=[(socket.AF_INET6 if ":" in address else socket.AF_INET, 1, 6, "", (address, 443))],
+            ):
+                self.assertEqual(read_documentation_url._resolve_public_addresses("docs.example.com"), [address])
+
+        for address in (
+            "10.20.30.40", "172.16.0.10", "192.168.1.10", "fc00::10", "127.0.0.1", "::1",
+            "169.254.169.254", "fe80::1", "224.0.0.1", "ff02::1", "0.0.0.0", "::", "192.0.2.1",
+        ):
+            with self.subTest(address=address), patch(
+                "tools.read_documentation_url.socket.getaddrinfo",
+                return_value=[(socket.AF_INET6 if ":" in address else socket.AF_INET, 1, 6, "", (address, 443))],
+            ), self.assertRaises(read_documentation_url.ReadOnlyDocsError):
+                read_documentation_url._resolve_public_addresses("docs.example.com")
+
+    def test_mixed_dns_answers_fail_closed(self):
+        with patch(
+            "tools.read_documentation_url.socket.getaddrinfo",
+            return_value=[
+                (socket.AF_INET, 1, 6, "", ("8.8.8.8", 443)),
+                (socket.AF_INET, 1, 6, "", ("10.0.0.8", 443)),
+            ],
+        ), self.assertRaisesRegex(read_documentation_url.ReadOnlyDocsError, "non-public"):
+            read_documentation_url._resolve_public_addresses("docs.example.com")
+
+    def test_openapi_filter_returns_matching_operations_and_referenced_schemas(self):
+        document = {
+            "openapi": "3.0.0",
+            "info": {"title": "API"},
+            "paths": {
+                "/gra-milestones/v2/filters": {
+                    "get": {
+                        "tags": ["gra-milestones"],
+                        "responses": {"200": {"$ref": "#/components/responses/Success"}},
+                    },
+                },
+                "/users": {"get": {"tags": ["users"], "responses": {}}},
+            },
+            "components": {
+                "responses": {"Success": {"content": {"application/json": {
+                    "schema": {"$ref": "#/components/schemas/FilterOptions"},
+                }}}},
+                "schemas": {"FilterOptions": {"type": "array", "items": {
+                    "$ref": "#/components/schemas/FilterOption",
+                }}, "FilterOption": {"type": "object", "properties": {"id": {"type": "string"}}}},
+                "securitySchemes": {"BearerAuth": {"type": "http", "scheme": "bearer"}},
+            },
+        }
+
+        filtered = json.loads(read_documentation_url._filter_openapi(document, "gra-milestones"))
+
+        self.assertEqual(list(filtered["paths"]), ["/gra-milestones/v2/filters"])
+        self.assertIn("Success", filtered["components"]["responses"])
+        self.assertIn("FilterOptions", filtered["components"]["schemas"])
+        self.assertIn("FilterOption", filtered["components"]["schemas"])
+        self.assertIn("BearerAuth", filtered["components"]["securitySchemes"])
 
 
 class FakeCodex:
@@ -1865,6 +2077,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(command[0:4], ["codex", "--ask-for-approval", "never", "exec"])
         self.assertLess(command.index("--ask-for-approval"), command.index("exec"))
         self.assertNotIn("--ask-for-approval", command[4:])
+        self.assertIn("mcp_servers={}", command)
         self.assertIn("--sandbox", command)
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", command)
         self.assertNotIn("--model", command)
@@ -1874,6 +2087,91 @@ class WorkflowTests(unittest.TestCase):
         )
         model_index = configured.index("--model")
         self.assertEqual(configured[model_index + 1], "codex-model-test")
+
+        documentation_reader = orchestrator.build_codex_command(
+            "codex", self.target, "read-only", self.root / "last-message.md",
+            read_only_authorized_urls=["https://docs.example.com/api"],
+        )
+        self.assertEqual(
+            documentation_reader[:4],
+            ["codex", "--ask-for-approval", "never", "exec"],
+        )
+        self.assertIn("--ignore-user-config", documentation_reader)
+        self.assertEqual(documentation_reader[documentation_reader.index("--sandbox") + 1], "read-only")
+        config = next(item for item in documentation_reader if item.startswith("mcp_servers={"))
+        grant_hash = read_documentation_url.authorized_url_sha256("https://docs.example.com/api")
+        docs_args = [
+            str(Path(orchestrator.__file__).resolve().parent / "tools" / "read_documentation_url.py"),
+            "--authorized-url-sha256", grant_hash,
+        ]
+        self.assertEqual(
+            config,
+            "mcp_servers={ documentation_reader = { "
+            f"command = {json.dumps(sys.executable)}, args = {json.dumps(docs_args)}"
+            " } }",
+        )
+        self.assertTrue(docs_args[0].endswith("read_documentation_url.py"))
+
+        write_docs = orchestrator.build_codex_command(
+            "codex", self.target, "workspace-write", self.root / "last-message.md",
+            read_only_authorized_urls=["https://docs.example.com/api"],
+        )
+        write_config = next(item for item in write_docs if item.startswith("mcp_servers="))
+        self.assertEqual(json.loads(write_config.removeprefix("mcp_servers=")), {})
+
+    def test_documentation_reader_is_allowlisted_and_only_used_for_url_planning(self):
+        task = "Read https://docs.example.com/api"
+        codex = FakeCodex("Planning result", "Implementation result")
+        runner = orchestrator.Orchestrator(
+            self.target, task=task, budget_usd=1.0, workflow_id="planning-read-only-docs",
+            process_runner=codex, claude_runner=FakeClaude(),
+        )
+        runner.state = {
+            "authorization": {
+                "target": str(self.target), "workspace_operations": [], "restricted_operations": [],
+            },
+            "stage": "planning",
+            "task": task,
+        }
+
+        runner._run_codex_impl("Read the API documentation.", sandbox="read-only")
+        runner.state["stage"] = "implementation"
+        runner._run_codex_impl("Implement the approved change.", sandbox="workspace-write")
+
+        planning_command, implementation_command = codex.commands
+        planning_config = next(item for item in planning_command if item.startswith("mcp_servers={"))
+        grant_hash = read_documentation_url.authorized_url_sha256("https://docs.example.com/api")
+        self.assertIn(f'"--authorized-url-sha256", "{grant_hash}"', planning_config)
+        self.assertIn(orchestrator.READ_ONLY_WEB_ACCESS_INSTRUCTION, codex.prompts[0])
+        self.assertEqual(planning_command[planning_command.index("--sandbox") + 1], "read-only")
+        self.assertIn("--ignore-user-config", planning_command)
+        implementation_config = next(item for item in implementation_command if item.startswith("mcp_servers="))
+        self.assertEqual(json.loads(implementation_config.removeprefix("mcp_servers=")), {})
+        self.assertNotIn("--ignore-user-config", implementation_command)
+
+    def test_project_mcp_servers_fail_closed_before_codex_runs(self):
+        task = "Read https://docs.example.com/api"
+        codex = FakeCodex("Planning result")
+        runner = orchestrator.Orchestrator(
+            self.target, task=task, budget_usd=1.0, workflow_id="planning-mcp-project-config",
+            process_runner=codex, claude_runner=FakeClaude(),
+        )
+        runner.state = {
+            "authorization": {
+                "target": str(self.target), "workspace_operations": [], "restricted_operations": [],
+            },
+            "stage": "planning",
+            "task": task,
+        }
+        config_dir = self.target / ".codex"
+        config_dir.mkdir()
+        (config_dir / "config.toml").write_text(
+            '[mcp_servers.unapproved]\ncommand = "unapproved"\n', encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "declares MCP servers"):
+            runner._run_codex_impl("Read the API documentation.", sandbox="read-only")
+        self.assertEqual(codex.commands, [])
 
     def test_review_packet_excludes_sensitive_and_preexisting_paths_and_redacts_tokens(self):
         (self.target / "src").mkdir()
