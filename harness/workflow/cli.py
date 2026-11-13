@@ -78,6 +78,30 @@ def print_summary(state: dict, *, workflow_root: str) -> None:
         "effective_budget_usd": external_authorization.get("budget_usd"),
         "budget_unknown": external_authorization.get("budget_unknown"),
         "active_call": external_authorization.get("active_call"),
+        "recovery": state.get("recovery"),
+        "active_operation": next((
+            {
+                key: operation.get(key)
+                for key in (
+                    "operation_id", "operation_type", "stage", "status", "started_at", "process_id",
+                    "launch_state", "exit_code", "outcome", "error_category",
+                )
+            }
+            for operation in reversed(state.get("operation_history", []))
+            if operation.get("operation_id") == state.get("active_operation_id")
+        ), None),
+        "recent_operations": [
+            {
+                key: operation.get(key)
+                for key in (
+                    "operation_id", "operation_type", "stage", "status", "started_at", "finished_at",
+                    "process_id", "launch_state", "exit_code", "outcome", "error_category",
+                    "input_sha256", "result_sha256",
+                    "cost_usd", "resolution",
+                )
+            }
+            for operation in state.get("operation_history", [])[-10:]
+        ],
         "authorized_code_review_calls": external_authorization.get("max_code_reviews"),
         "review_campaign_status": state.get("review_campaign", {}).get("status"),
         "code_review_feedback": (
@@ -131,7 +155,7 @@ def main(
 
     for name, help_text in (
         ("approve", "Explicitly approve the saved proposal and start implementation"),
-        ("resume", "Resume the failed stage without restarting completed stages"),
+        ("resume", "Resume a failed stage or explicitly resolve an interrupted operation"),
         ("status", "Show current workflow state"),
     ):
         command = commands.add_parser(name, help=help_text)
@@ -139,6 +163,27 @@ def main(
         command.add_argument("--workflow-id", required=True)
         command.add_argument("--codex", default=CODEX_EXECUTABLE)
         command.add_argument("--aily", default=claude_reviewer.AILY_EXECUTABLE)
+        if name == "resume":
+            command.add_argument(
+                "--recovery-action", choices=("retry", "accept-implementation"),
+                help="Explicitly resolve a detected crash recovery after inspecting status and target changes",
+            )
+            command.add_argument(
+                "--verified-claude-cost-usd", type=float,
+                help="Final Claude charge verified from provider usage before retrying an interrupted paid call",
+            )
+            command.add_argument(
+                "--confirm-provider-inactive", action="store_true",
+                help="Confirm that the interrupted Claude/Aily process is no longer active",
+            )
+            command.add_argument(
+                "--confirm-process-inactive", action="store_true",
+                help="Confirm that the interrupted Codex process is no longer active before retrying",
+            )
+            command.add_argument(
+                "--confirm-target-reviewed", action="store_true",
+                help="Confirm that target changes were inspected before retrying or accepting interrupted implementation",
+            )
 
     recover = commands.add_parser(
         "recover-review", help="Locally revalidate saved code-review reports without provider calls",
@@ -197,7 +242,17 @@ def main(
             if args.command == "approve":
                 state = runner.approve()
             elif args.command == "resume":
-                state = runner.resume()
+                recovery_arguments = {
+                    "recovery_action": args.recovery_action,
+                    "verified_claude_cost_usd": args.verified_claude_cost_usd,
+                    "confirm_provider_inactive": args.confirm_provider_inactive,
+                    "confirm_process_inactive": args.confirm_process_inactive,
+                    "confirm_target_reviewed": args.confirm_target_reviewed,
+                }
+                if any(value not in (None, False) for value in recovery_arguments.values()):
+                    state = runner.resume(**recovery_arguments)
+                else:
+                    state = runner.resume()
             elif args.command == "revise":
                 feedback_text = args.feedback
                 if args.feedback_file:

@@ -737,6 +737,408 @@ class WorkflowTests(unittest.TestCase):
                 path.write_text(content, encoding="utf-8")
         codex.on_call = implementation
 
+    def interrupted_implementation(self, workflow_id: str, *, preexisting: bool = False, mode: str = "during"):
+        if preexisting:
+            (self.target / "README.md").write_text("user change before workflow\n", encoding="utf-8")
+        codex = FakeCodex(
+            "# Proposal\nImplement recovery safely.\n", self.refined(), "Implementation summary.\n",
+        )
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05),
+            response_factory=lambda *_args: claude_reviewer.ReviewResult(
+                "Decision: APPROVED\nNo acceptance-blocking findings.", 0.05,
+            ),
+        )
+
+        def interrupt_implementation(index, _command, _kwargs):
+            if index != 2:
+                return
+            changed = self.target / "src" / "recovery.py"
+            changed.parent.mkdir(parents=True, exist_ok=True)
+            changed.write_text("def recover():\n    return 'partial'\n", encoding="utf-8")
+            if mode == "during":
+                raise KeyboardInterrupt()
+
+        codex.on_call = interrupt_implementation
+        runner = orchestrator.Orchestrator(
+            self.target, task="Implement crash recovery", budget_usd=1.0, workflow_id=workflow_id,
+            process_runner=codex, claude_runner=claude,
+        )
+        runner.start()
+        if mode == "during":
+            with self.assertRaises(KeyboardInterrupt):
+                runner.approve()
+        elif mode == "after-process":
+            finish_operation = runner._finish_operation
+
+            def interrupt_before_result_save(operation_id, **kwargs):
+                if kwargs.get("status") == "completed":
+                    raise KeyboardInterrupt()
+                finish_operation(operation_id, **kwargs)
+
+            runner._finish_operation = interrupt_before_result_save
+            with self.assertRaises(KeyboardInterrupt):
+                runner.approve()
+        elif mode == "after-result-persisted":
+            finish_operation = runner._finish_operation
+
+            def interrupt_after_result_save(operation_id, **kwargs):
+                finish_operation(operation_id, **kwargs)
+                if kwargs.get("status") == "completed":
+                    raise KeyboardInterrupt()
+
+            runner._finish_operation = interrupt_after_result_save
+            with self.assertRaises(KeyboardInterrupt):
+                runner.approve()
+        else:
+            raise AssertionError(f"Unknown interruption mode: {mode}")
+        return runner, codex, claude
+
+    def test_crash_before_operation_start_can_resume_normally(self):
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add a feature", budget_usd=1.0, workflow_id="crash-before-operation",
+        )
+        with patch.object(runner, "_run_codex", side_effect=KeyboardInterrupt()):
+            with self.assertRaises(KeyboardInterrupt):
+                runner.start()
+        state = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["status"], "running")
+        self.assertEqual(state["stage"], "planning")
+        self.assertEqual(state["operation_history"], [])
+
+        codex = FakeCodex("# Proposal\nPlan.\n", self.refined())
+        claude = FakeClaude(claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05))
+        resumed = orchestrator.Orchestrator(
+            self.target, workflow_id="crash-before-operation", process_runner=codex, claude_runner=claude,
+        ).resume()
+        self.assertEqual(resumed["status"], "awaiting_approval")
+        self.assertEqual(len(codex.commands), 2)
+
+    def test_crash_after_started_before_subprocess_launch_is_safe_to_resume(self):
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add a feature", budget_usd=1.0, workflow_id="crash-before-launch",
+            process_runner=FakeCodex("# Proposal\nPlan.\n", self.refined()),
+        )
+        with patch.object(runner, "_run_process_with_pid", side_effect=KeyboardInterrupt()):
+            with self.assertRaises(KeyboardInterrupt):
+                runner.start()
+        persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["operation_history"][-1]["status"], "started")
+        self.assertEqual(persisted["operation_history"][-1]["launch_state"], "not_started")
+        self.assertEqual(persisted["active_operation_id"], persisted["operation_history"][-1]["operation_id"])
+
+        replacement = FakeCodex("# Proposal\nPlan.\n", self.refined())
+        claude = FakeClaude(claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05))
+        resumed = orchestrator.Orchestrator(
+            self.target, workflow_id="crash-before-launch", process_runner=replacement, claude_runner=claude,
+        ).resume()
+        self.assertEqual(resumed["status"], "awaiting_approval")
+        self.assertEqual(len(replacement.commands), 2)
+        state = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["status"], "awaiting_approval")
+        self.assertEqual(state["operation_history"][0]["status"], "failed")
+        self.assertEqual(state["operation_history"][0]["launch_state"], "not_started")
+
+    def test_crash_after_launch_attempt_before_child_identity_requires_inspection(self):
+        calls = 0
+
+        def interrupted_runner(_command, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise KeyboardInterrupt()
+
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add a feature", budget_usd=1.0, workflow_id="crash-during-launch",
+            process_runner=interrupted_runner,
+        )
+        with self.assertRaises(KeyboardInterrupt):
+            runner.start()
+        persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["operation_history"][-1]["status"], "started")
+        self.assertEqual(persisted["operation_history"][-1]["launch_state"], "launching")
+
+        replacement = FakeCodex("# Proposal\nPlan.\n")
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "requires recovery"):
+            orchestrator.Orchestrator(
+                self.target, workflow_id="crash-during-launch", process_runner=replacement,
+            ).resume()
+        self.assertEqual(calls, 1)
+        self.assertEqual(replacement.commands, [])
+        state = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["status"], "recovery_required")
+        self.assertEqual(state["recovery"]["operation_status"], "interrupted")
+
+    def test_interrupted_codex_exposes_partial_target_changes_without_rerunning(self):
+        runner, original_codex, _claude = self.interrupted_implementation("crash-during-codex")
+        replacement = FakeCodex("must not run")
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "requires recovery"):
+            orchestrator.Orchestrator(
+                self.target, workflow_id="crash-during-codex", process_runner=replacement,
+            ).resume()
+        state = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["status"], "recovery_required")
+        self.assertEqual(state["operation_history"][-1]["status"], "interrupted")
+        self.assertEqual(state["recovery"]["target_changes"], [
+            {"path": "src/recovery.py", "change": "untracked", "preexisting": "no"},
+        ])
+        self.assertEqual(len(original_codex.commands), 3)
+        self.assertEqual(replacement.commands, [])
+
+    def test_completed_codex_process_without_saved_result_is_not_repeated(self):
+        runner, _original_codex, _claude = self.interrupted_implementation(
+            "crash-after-codex-exit", mode="after-process",
+        )
+        persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        operation = persisted["operation_history"][-1]
+        self.assertEqual(operation["status"], "started")
+        self.assertIsNone(operation["result_text"])
+        replacement = FakeCodex("must not run")
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "requires recovery"):
+            orchestrator.Orchestrator(
+                self.target, workflow_id="crash-after-codex-exit", process_runner=replacement,
+            ).resume()
+        self.assertEqual(replacement.commands, [])
+
+    def test_completed_codex_result_is_reused_after_parent_stops_before_stage_advance(self):
+        runner, original_codex, claude = self.interrupted_implementation(
+            "reuse-persisted-codex-result", mode="after-result-persisted",
+        )
+        persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        operation = persisted["operation_history"][-1]
+        self.assertEqual(operation["status"], "completed")
+        self.assertEqual(operation["result_text"], "Implementation summary.")
+
+        replacement = FakeCodex()
+        resumed = orchestrator.Orchestrator(
+            self.target, workflow_id="reuse-persisted-codex-result", process_runner=replacement,
+            claude_runner=claude,
+        ).resume()
+        self.assertEqual(resumed["status"], "complete")
+        self.assertEqual(replacement.commands, [])
+        self.assertEqual(len(original_codex.commands), 3)
+
+    def test_interrupted_claude_call_marks_cost_unknown_and_is_not_repeated(self):
+        calls = 0
+
+        def interrupted_claude(_prompt, *, budget_usd, executable):
+            nonlocal calls
+            calls += 1
+            raise KeyboardInterrupt()
+
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add a feature", budget_usd=1.0, workflow_id="crash-during-claude",
+            process_runner=FakeCodex("# Proposal\nPlan.\n"), claude_runner=interrupted_claude,
+        )
+        with self.assertRaises(KeyboardInterrupt):
+            runner.start()
+        replacement = FakeClaude()
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "no recorded cost"):
+            orchestrator.Orchestrator(
+                self.target, workflow_id="crash-during-claude", process_runner=FakeCodex(),
+                claude_runner=replacement,
+            ).resume()
+        state = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertTrue(state["authorization"]["claude_aily"]["budget_unknown"])
+        self.assertEqual(state["operation_history"][-1]["status"], "interrupted")
+        self.assertEqual(calls, 1)
+        self.assertEqual(replacement.prompts, [])
+
+    def test_crash_before_claude_launch_retries_without_unknown_spend(self):
+        claude = FakeClaude(claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05))
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add a feature", budget_usd=1.0, workflow_id="crash-before-claude-launch",
+            process_runner=FakeCodex("# Proposal\nPlan.\n"), claude_runner=claude,
+        )
+        operation_launching = runner._operation_launching
+
+        def interrupt_before_claude_launch(operation_id):
+            if runner._operation(operation_id).get("operation_type") == "claude":
+                raise KeyboardInterrupt()
+            operation_launching(operation_id)
+
+        with patch.object(runner, "_operation_launching", side_effect=interrupt_before_claude_launch):
+            with self.assertRaises(KeyboardInterrupt):
+                runner.start()
+        state = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["operation_history"][-1]["launch_state"], "not_started")
+        self.assertFalse(state["authorization"]["claude_aily"]["budget_unknown"])
+
+        resumed_claude = FakeClaude(claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05))
+        resumed = orchestrator.Orchestrator(
+            self.target, workflow_id="crash-before-claude-launch", process_runner=FakeCodex(self.refined()),
+            claude_runner=resumed_claude,
+        ).resume()
+        self.assertEqual(resumed["status"], "awaiting_approval")
+        self.assertEqual(len(resumed_claude.prompts), 1)
+        self.assertFalse(resumed["authorization"]["claude_aily"]["budget_unknown"])
+
+    def test_interrupted_claude_retry_requires_verified_cost_and_stays_within_budget(self):
+        calls = 0
+
+        def interrupted_claude(_prompt, *, budget_usd, executable):
+            nonlocal calls
+            calls += 1
+            raise KeyboardInterrupt()
+
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add a feature", budget_usd=1.0, workflow_id="verified-claude-recovery",
+            process_runner=FakeCodex("# Proposal\nPlan.\n"), claude_runner=interrupted_claude,
+        )
+        with self.assertRaises(KeyboardInterrupt):
+            runner.start()
+
+        def resume_with(**arguments):
+            return orchestrator.Orchestrator(
+                self.target, workflow_id="verified-claude-recovery", process_runner=FakeCodex(self.refined()),
+                claude_runner=FakeClaude(claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05)),
+            ).resume(recovery_action="retry", **arguments)
+
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "verify the final charge"):
+            resume_with(verified_claude_cost_usd=0.20)
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "exceeds the active call cap"):
+            resume_with(verified_claude_cost_usd=1.01, confirm_provider_inactive=True)
+        blocked = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertTrue(blocked["authorization"]["claude_aily"]["budget_unknown"])
+        self.assertEqual(calls, 1)
+
+        resumed = resume_with(
+            verified_claude_cost_usd=0.20, confirm_provider_inactive=True,
+        )
+        self.assertEqual(resumed["status"], "awaiting_approval")
+        self.assertEqual(resumed["authorization"]["claude_aily"]["spent_usd"], 0.25)
+        self.assertFalse(resumed["authorization"]["claude_aily"]["budget_unknown"])
+        self.assertEqual(calls, 1)
+
+    def test_resume_rejects_while_another_process_holds_workflow_lock(self):
+        runner, _codex, _claude = self.interrupted_implementation("lock-contention-recovery")
+        replacement = orchestrator.Orchestrator(self.target, workflow_id="lock-contention-recovery")
+        with runner._workflow_lock():
+            with self.assertRaisesRegex(orchestrator.WorkflowError, "already being modified"):
+                replacement.resume()
+        state = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["status"], "running")
+
+    def test_running_workflow_without_active_operation_resumes_from_saved_stage(self):
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add a feature", budget_usd=1.0, workflow_id="stale-running-no-operation",
+        )
+        with patch.object(runner, "_run_codex", side_effect=KeyboardInterrupt()):
+            with self.assertRaises(KeyboardInterrupt):
+                runner.start()
+        codex = FakeCodex("# Proposal\nPlan.\n", self.refined())
+        claude = FakeClaude(claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05))
+        resumed = orchestrator.Orchestrator(
+            self.target, workflow_id="stale-running-no-operation", process_runner=codex, claude_runner=claude,
+        ).resume()
+        self.assertEqual(resumed["status"], "awaiting_approval")
+        self.assertEqual(len(codex.commands), 2)
+
+    def test_interrupted_codex_recovery_requires_explicit_process_and_target_confirmation(self):
+        runner, _codex, claude = self.interrupted_implementation("codex-recovery-confirmations")
+        recovering = orchestrator.Orchestrator(
+            self.target, workflow_id="codex-recovery-confirmations", process_runner=FakeCodex("retry summary"),
+            claude_runner=claude,
+        )
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "confirm-process-inactive"):
+            recovering.resume(recovery_action="retry")
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "confirm-target-reviewed"):
+            recovering.resume(recovery_action="retry", confirm_process_inactive=True)
+        retry_codex = FakeCodex("Retry completed after inspection.")
+        resumed = orchestrator.Orchestrator(
+            self.target, workflow_id="codex-recovery-confirmations", process_runner=retry_codex,
+            claude_runner=claude,
+        ).resume(
+            recovery_action="retry", confirm_process_inactive=True, confirm_target_reviewed=True,
+        )
+        self.assertEqual(resumed["status"], "complete")
+        self.assertEqual(len(retry_codex.commands), 1)
+        implementation_operations = [
+            operation for operation in resumed["operation_history"]
+            if operation.get("operation_type") == "codex" and operation.get("stage") == "implementation"
+        ]
+        self.assertEqual(len(implementation_operations), 2, implementation_operations)
+        retried_operation = implementation_operations[-1]
+        self.assertEqual(retried_operation["status"], "completed")
+        self.assertEqual(retried_operation["attempt"], 2)
+        self.assertEqual(
+            implementation_operations[0]["resolution"], "user_approved_retry_after_target_inspection",
+        )
+
+    def test_accepting_partial_implementation_skips_codex_and_runs_independent_review(self):
+        runner, original_codex, claude = self.interrupted_implementation("accept-partial-implementation")
+        replacement = FakeCodex()
+        completed = orchestrator.Orchestrator(
+            self.target, workflow_id="accept-partial-implementation", process_runner=replacement,
+            claude_runner=claude,
+        ).resume(recovery_action="accept-implementation", confirm_target_reviewed=True)
+        self.assertEqual(completed["status"], "complete")
+        self.assertEqual(completed["stage"], "complete")
+        self.assertEqual(replacement.commands, [])
+        self.assertEqual(len(original_codex.commands), 3)
+        accepted = next(
+            operation for operation in completed["operation_history"]
+            if operation.get("resolution") == "human_accepted_current_target_for_independent_review"
+        )
+        self.assertEqual(accepted["operation_type"], "codex")
+
+    def test_accepting_partial_implementation_rejects_preexisting_user_changes(self):
+        runner, _codex, claude = self.interrupted_implementation(
+            "preserve-preexisting-changes", preexisting=True,
+        )
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "already changed before this workflow"):
+            orchestrator.Orchestrator(
+                self.target, workflow_id="preserve-preexisting-changes", process_runner=FakeCodex(),
+                claude_runner=claude,
+            ).resume(recovery_action="accept-implementation", confirm_target_reviewed=True)
+        self.assertEqual((self.target / "README.md").read_text(encoding="utf-8"), "user change before workflow\n")
+        state = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["status"], "recovery_required")
+
+    def test_repeated_recovery_attempts_remain_blocked_without_repeating_operations(self):
+        runner, original_codex, _claude = self.interrupted_implementation("repeat-recovery-safely")
+        replacement = FakeCodex("must not run")
+        recovering = orchestrator.Orchestrator(
+            self.target, workflow_id="repeat-recovery-safely", process_runner=replacement,
+        )
+        for _ in range(2):
+            with self.assertRaisesRegex(orchestrator.WorkflowError, "requires recovery"):
+                recovering.resume()
+        state = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["status"], "recovery_required")
+        self.assertEqual(len(state["operation_history"]), 4)
+        self.assertEqual(len(original_codex.commands), 3)
+        self.assertEqual(replacement.commands, [])
+
+    def test_existing_pid_is_reported_as_unverified_not_proof_of_process_identity(self):
+        runner, _codex, _claude = self.interrupted_implementation("pid-reuse-is-ambiguous")
+        state = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        state["operation_history"][-1]["process_id"] = os.getpid()
+        runner.state_path.write_text(json.dumps(state), encoding="utf-8")
+        recovering = orchestrator.Orchestrator(self.target, workflow_id="pid-reuse-is-ambiguous")
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "requires recovery"):
+            recovering.resume()
+        self.assertEqual(recovering.status()["recovery"]["process_presence"], "present_unverified")
+
+    def test_legacy_running_state_without_operation_records_remains_blocked(self):
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add a feature", budget_usd=1.0, workflow_id="legacy-running-workflow",
+        )
+        with patch.object(runner, "_run_codex", side_effect=KeyboardInterrupt()):
+            with self.assertRaises(KeyboardInterrupt):
+                runner.start()
+        state = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        state.pop("operation_tracking_version")
+        state.pop("operation_history")
+        state.pop("active_operation_id")
+        runner.state_path.write_text(json.dumps(state), encoding="utf-8")
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "requires recovery"):
+            orchestrator.Orchestrator(
+                self.target, workflow_id="legacy-running-workflow",
+            ).resume()
+        persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["status"], "recovery_required")
+        self.assertIsNone(persisted["recovery"]["operation_id"])
+
     def create_completed_review_for_recovery(self, workflow_id: str):
         codex = FakeCodex(
             "# Proposal\nReview the saved implementation.\n", self.refined(), "Implemented a small change.\n",
@@ -878,6 +1280,26 @@ class WorkflowTests(unittest.TestCase):
                 summary = json.loads(output.getvalue())
                 self.assertEqual(summary["workflow_id"], "cli-dispatch")
                 self.assertIn("claude_contexts", summary)
+
+    def test_cli_passes_explicit_recovery_confirmations_to_resume(self):
+        state = {
+            "workflow_id": "cli-recovery", "target": str(self.target),
+            "status": "recovery_required", "stage": "implementation", "authorization": {},
+            "plan_reviews": [], "operation_history": [],
+        }
+        output = StringIO()
+        with patch.object(orchestrator, "Orchestrator") as factory, redirect_stdout(output):
+            factory.return_value.resume.return_value = state
+            result = orchestrator.main([
+                "resume", "--target", str(self.target), "--workflow-id", "cli-recovery",
+                "--recovery-action", "retry", "--verified-claude-cost-usd", "0.20",
+                "--confirm-provider-inactive", "--confirm-process-inactive", "--confirm-target-reviewed",
+            ])
+        self.assertEqual(result, 1)
+        factory.return_value.resume.assert_called_once_with(
+            recovery_action="retry", verified_claude_cost_usd=0.20,
+            confirm_provider_inactive=True, confirm_process_inactive=True, confirm_target_reviewed=True,
+        )
 
     def test_cli_reads_task_and_feedback_files_and_reports_missing_files(self):
         task_file = self.root / "assignment.md"
@@ -2134,9 +2556,11 @@ class WorkflowTests(unittest.TestCase):
             "task": task,
         }
 
-        runner._run_codex_impl("Read the API documentation.", sandbox="read-only")
-        runner.state["stage"] = "implementation"
-        runner._run_codex_impl("Implement the approved change.", sandbox="workspace-write")
+        runner.workflow_dir.mkdir(parents=True)
+        with runner._workflow_lock():
+            runner._run_codex_impl("Read the API documentation.", sandbox="read-only")
+            runner.state["stage"] = "implementation"
+            runner._run_codex_impl("Implement the approved change.", sandbox="workspace-write")
 
         planning_command, implementation_command = codex.commands
         planning_config = next(item for item in planning_command if item.startswith("mcp_servers={"))
@@ -2623,7 +3047,7 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(orchestrator.WorkflowError, "unknown command \\\"claude\\\""):
             runner.start()
         failed = runner.state
-        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["status"], "recovery_required")
         authorization = failed["authorization"]["claude_aily"]
         self.assertTrue(authorization["budget_unknown"])
         self.assertEqual(authorization["spent_usd"], 0)

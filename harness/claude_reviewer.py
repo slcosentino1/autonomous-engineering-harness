@@ -123,6 +123,7 @@ def review(
     executable: str | None = None,
     timeout_seconds: int = 900,
     process_runner: Callable = subprocess.run,
+    process_started: Callable[[int], None] | None = None,
 ) -> ReviewResult:
     """Run one Claude review with a hard per-call cap and no target access."""
     if not isinstance(budget_usd, (int, float)) or isinstance(budget_usd, bool):
@@ -150,15 +151,39 @@ def review(
         env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"})
         try:
-            result = process_runner(
-                command,
-                cwd=review_root,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=timeout_seconds,
-                check=False,
-                env=env,
-            )
+            if process_started is not None and process_runner is subprocess.run:
+                process = subprocess.Popen(
+                    command,
+                    cwd=review_root,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                )
+                try:
+                    process_started(process.pid)
+                except BaseException:
+                    process.kill()
+                    process.communicate()
+                    raise
+                try:
+                    stdout, stderr = process.communicate(timeout=timeout_seconds)
+                except subprocess.TimeoutExpired as exc:
+                    process.kill()
+                    stdout, stderr = process.communicate()
+                    raise subprocess.TimeoutExpired(
+                        command, timeout_seconds, output=stdout, stderr=stderr,
+                    ) from exc
+                result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+            else:
+                result = process_runner(
+                    command,
+                    cwd=review_root,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=timeout_seconds,
+                    check=False,
+                    env=env,
+                )
         except FileNotFoundError as exc:
             raise ReviewError(f"Aily executable is unavailable: {executable}") from exc
         except subprocess.TimeoutExpired as exc:

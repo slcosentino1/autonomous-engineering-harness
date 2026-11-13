@@ -82,6 +82,7 @@ DEFAULT_MAX_CODE_REVIEW_CALLS = _cli.DEFAULT_MAX_CODE_REVIEW_CALLS
 MAX_AUTHORIZED_CODE_REVIEW_CALLS = 64
 MAX_PLANNING_FAILURE_OUTPUT_CHARS = 50_000
 MAX_PLANNING_FAILURE_RECORDS = 3
+MAX_OPERATION_HISTORY = 100
 TRACE_STAGES = frozenset({
     "planning", "plan_review_1", "plan_review_2", "plan_refine_1", "plan_refine_2",
     "human_revision", "implementation", "code_review", "correction", "complete",
@@ -843,10 +844,282 @@ class Orchestrator:
         if not self._process_lock_held:
             raise WorkflowError("Workflow state writes require the workflow process lock.")
         self.state["updated_at"] = now()
+        current_stage = self.state.get("stage")
+        for operation in self.state.get("operation_history", []):
+            if (operation.get("status") == "completed" and operation.get("result_text") is not None
+                    and operation.get("stage") != current_stage):
+                operation["result_text"] = None
+                operation["result_consumed"] = True
+                operation["result_consumed_at"] = now()
         authorization = self.state.get("authorization")
         if isinstance(authorization, dict):
             authorization["scope_sha256"] = authorization_scope_digest(authorization)
         _write_json(self.state_path, self.state)
+
+    def _operation(self, operation_id: str | None) -> dict | None:
+        if not operation_id:
+            return None
+        return next((
+            item for item in reversed(self.state.get("operation_history", []))
+            if item.get("operation_id") == operation_id
+        ), None)
+
+    def _new_operation(self, operation_type: str, *, input_sha256: str | None = None, **details: object) -> dict:
+        history = self.state.setdefault("operation_history", [])
+        operation = {
+            "operation_id": uuid.uuid4().hex,
+            "operation_type": operation_type,
+            "stage": self.state.get("stage"),
+            "status": "started",
+            "started_at": now(),
+            "finished_at": None,
+            "process_id": None,
+            "owner_pid": os.getpid(),
+            "launch_state": "not_started",
+            "exit_code": None,
+            "input_sha256": input_sha256,
+            "result_sha256": None,
+            "result_text": None,
+            "result_consumed": False,
+            **details,
+        }
+        history.append(operation)
+        self.state["active_operation_id"] = operation["operation_id"]
+        if len(history) > MAX_OPERATION_HISTORY:
+            removable = [item for item in history if item is not operation
+                         and item.get("status") != "started"
+                         and item.get("result_text") is None]
+            remove_ids = {item["operation_id"] for item in removable[:len(history) - MAX_OPERATION_HISTORY]}
+            self.state["operation_history"] = [
+                item for item in history if item.get("operation_id") not in remove_ids
+            ]
+        return operation
+
+    def _operation_process_started(self, operation_id: str, process_id: int) -> None:
+        operation = self._operation(operation_id)
+        if operation is None or operation.get("status") != "started":
+            raise WorkflowError("The tracked workflow operation is no longer active.")
+        operation["process_id"] = process_id
+        operation["launch_state"] = "launched"
+        operation["process_started_at"] = now()
+        self._save()
+
+    def _operation_launching(self, operation_id: str) -> None:
+        operation = self._operation(operation_id)
+        if operation is None or operation.get("status") != "started":
+            raise WorkflowError("The tracked workflow operation is no longer active.")
+        operation["launch_state"] = "launching"
+        operation["launch_attempted_at"] = now()
+        self._save()
+
+    def _finish_operation(
+        self,
+        operation_id: str,
+        *,
+        status: str,
+        outcome: str,
+        exit_code: int | None = None,
+        error_category: str | None = None,
+        result_text: str | None = None,
+        result_sha256: str | None = None,
+        cost_usd: float | None = None,
+        launch_state: str | None = None,
+    ) -> None:
+        operation = self._operation(operation_id)
+        if operation is None:
+            raise WorkflowError("The tracked workflow operation is missing from persisted state.")
+        operation.update({
+            "status": status,
+            "finished_at": now(),
+            "outcome": redact(outcome)[:500],
+            "exit_code": exit_code,
+            "error_category": error_category,
+            "result_sha256": result_sha256,
+            "result_text": result_text,
+            "cost_usd": cost_usd,
+        })
+        if launch_state is not None:
+            operation["launch_state"] = launch_state
+        if self.state.get("active_operation_id") == operation_id:
+            self.state["active_operation_id"] = None
+        self._save()
+
+    def _target_change_inventory(self) -> list[dict[str, str]]:
+        baseline = self.state.get("baseline_commit")
+        if not isinstance(baseline, str) or not baseline:
+            return []
+        changes: dict[str, str] = {}
+        raw = git(self.target, "diff", "--name-status", "-z", "--no-renames", baseline, "--")
+        fields = raw.decode("utf-8", "surrogateescape").split("\0")
+        for index in range(0, len(fields) - 1, 2):
+            status, path = fields[index:index + 2]
+            if path:
+                changes[path] = {
+                    "D": "deleted", "A": "added", "M": "modified", "T": "type_changed",
+                }.get(status[:1], "modified")
+        raw_untracked = git(self.target, "ls-files", "--others", "--exclude-standard", "-z", "--")
+        for path in raw_untracked.decode("utf-8", "surrogateescape").split("\0"):
+            if path:
+                changes.setdefault(path, "untracked")
+        preexisting = set(self.state.get("preexisting_paths", []))
+        return [
+            {"path": path, "change": changes[path], "preexisting": "yes" if path in preexisting else "no"}
+            for path in sorted(changes)
+            if path != WORKFLOW_ROOT and not path.startswith(WORKFLOW_ROOT + "/")
+        ]
+
+    def _require_recovery(self, operation: dict | None, reason: str) -> None:
+        if operation is not None and operation.get("status") == "started":
+            operation["status"] = "interrupted"
+            operation["finished_at"] = now()
+            operation["outcome"] = "The workflow process stopped before recording a terminal result."
+            operation["error_category"] = "Interrupted"
+            if self.state.get("active_operation_id") == operation.get("operation_id"):
+                self.state["active_operation_id"] = None
+        if operation is not None and operation.get("operation_type") == "claude":
+            authorization = self.state.get("authorization", {}).get("claude_aily", {})
+            authorization["budget_unknown"] = True
+            authorization["active_call"] = None
+            for context in reversed(self.state.get("claude_contexts", [])):
+                if context.get("operation_id") == operation.get("operation_id"):
+                    context["call_state"] = "interrupted_unknown_cost"
+                    context["error"] = reason
+                    break
+        process_presence = "not_recorded"
+        process_id = operation.get("process_id") if operation is not None else None
+        if isinstance(process_id, int) and not isinstance(process_id, bool) and process_id > 0:
+            try:
+                os.kill(process_id, 0)
+            except ProcessLookupError:
+                process_presence = "not_running"
+            except PermissionError:
+                process_presence = "present_unverified"
+            except OSError:
+                process_presence = "unknown"
+            else:
+                # A live PID can have been reused; treat it as ambiguous, never proof of ownership.
+                process_presence = "present_unverified"
+        recovery = {
+            "operation_id": operation.get("operation_id") if operation else None,
+            "operation_type": operation.get("operation_type") if operation else None,
+            "stage": operation.get("stage") if operation else self.state.get("stage"),
+            "operation_status": operation.get("status") if operation else "unknown",
+            "process_presence": process_presence,
+            "detected_at": now(),
+            "reason": redact(reason),
+            "target_changes": self._target_change_inventory(),
+        }
+        self.state["recovery"] = recovery
+        self.state["status"] = "recovery_required"
+        self.state["error"] = redact(reason)
+        self._save()
+
+    def _resolve_recovery(
+        self,
+        action: str | None,
+        *,
+        verified_claude_cost_usd: float | None,
+        confirm_provider_inactive: bool,
+        confirm_process_inactive: bool,
+        confirm_target_reviewed: bool,
+    ) -> None:
+        recovery = self.state.get("recovery") or {}
+        operation = self._operation(recovery.get("operation_id"))
+        if action is None:
+            operation_id = recovery.get("operation_id") or "unavailable"
+            detail = (
+                "The interrupted Claude/Aily call has no recorded cost; verify its final charge and process state. "
+                if operation is not None and operation.get("operation_type") == "claude"
+                and self.state.get("authorization", {}).get("claude_aily", {}).get("budget_unknown") is True
+                else ""
+            )
+            raise WorkflowError(
+                f"Workflow requires recovery at stage {recovery.get('stage')!r} (operation {operation_id}). "
+                f"{redact(str(recovery.get('reason') or (operation or {}).get('outcome') or ''))} "
+                f"{detail}"
+                "Inspect status and target changes, then resume with an explicit --recovery-action."
+            )
+        if operation is None:
+            raise WorkflowError("Recovery has no verifiable operation record; leave the workflow blocked.")
+
+        current_changes = self._target_change_inventory()
+        recovery["target_changes"] = current_changes
+
+        if action == "accept-implementation":
+            if not (operation.get("operation_type") == "codex"
+                    and operation.get("stage") == "implementation"
+                    and operation.get("status") == "interrupted"):
+                raise WorkflowError("Only an interrupted Codex implementation can be accepted for independent review.")
+            if not confirm_target_reviewed:
+                raise WorkflowError(
+                    "Inspect the target changes and pass --confirm-target-reviewed before accepting an interrupted implementation."
+                )
+            target_changes = current_changes
+            if not target_changes:
+                raise WorkflowError("No target changes were found; an interrupted implementation cannot be accepted.")
+            if any(item.get("preexisting") == "yes" for item in target_changes):
+                raise WorkflowError(
+                    "Target changes overlap paths that were already changed before this workflow; "
+                    "their origin cannot be established safely. Leave the workflow blocked for manual inspection."
+                )
+            paths = [item["path"] for item in target_changes]
+            self.state["implementation_summary"] = (
+                "Human-approved crash recovery: Codex was interrupted before its implementation summary was saved. "
+                "The user inspected and accepted the current target changes for independent review. Changed paths: "
+                + ", ".join(paths)
+            )
+            operation["resolution"] = "human_accepted_current_target_for_independent_review"
+            operation["resolved_at"] = now()
+            self.state["stage"] = "code_review"
+        elif action == "retry":
+            if operation.get("operation_type") == "claude":
+                if not self.state.get("authorization", {}).get("claude_aily", {}).get("budget_unknown"):
+                    raise WorkflowError("Claude recovery does not require unknown-spend resolution; resume normally.")
+                if verified_claude_cost_usd is None or not confirm_provider_inactive:
+                    raise WorkflowError(
+                        "Before retrying Claude, verify the final charge and confirm the prior provider call is inactive; "
+                        "pass --verified-claude-cost-usd and --confirm-provider-inactive."
+                    )
+                try:
+                    cost = Decimal(str(verified_claude_cost_usd))
+                    authorization = self.state["authorization"]["claude_aily"]
+                    budget = Decimal(str(authorization["budget_usd"]))
+                    spent = Decimal(str(authorization["spent_usd"]))
+                    active_cap = Decimal(str(operation.get("cap_usd", 0)))
+                except Exception as exc:
+                    raise WorkflowError("Verified Claude recovery cost is invalid.") from exc
+                if (not cost.is_finite() or cost < 0 or cost > active_cap
+                        or spent + cost > budget):
+                    raise WorkflowError(
+                        "Verified Claude recovery cost exceeds the active call cap or remaining workflow budget."
+                    )
+                authorization["spent_usd"] = round(float(spent + cost), 4)
+                authorization["budget_unknown"] = False
+                operation["resolution_cost_usd"] = float(cost)
+                operation["resolution"] = "user_verified_final_provider_cost_and_inactive_call"
+                operation["resolved_at"] = now()
+            elif operation.get("operation_type") != "codex":
+                raise WorkflowError("This recovery action is not supported for the interrupted operation.")
+            else:
+                if operation.get("status") not in {"interrupted", "failed", "unknown"}:
+                    raise WorkflowError("Only an unresolved Codex operation can be retried during recovery.")
+                if not confirm_process_inactive:
+                    raise WorkflowError(
+                        "Confirm that the prior Codex process is inactive with --confirm-process-inactive before retrying."
+                    )
+                if (operation.get("sandbox") == "workspace-write" and not confirm_target_reviewed):
+                    raise WorkflowError(
+                        "Inspect target changes and pass --confirm-target-reviewed before retrying a write operation."
+                    )
+                operation["resolution"] = "user_approved_retry_after_target_inspection"
+                operation["resolved_at"] = now()
+        else:
+            raise WorkflowError(f"Unsupported recovery action: {action}.")
+
+        self.state["recovery"] = None
+        self.state["status"] = "running"
+        self.state["error"] = None
+        self._save()
 
     def _record_unvalidated_planning_output(
         self, output: str, error: WorkflowError, *, stage: str, proposal_version: int,
@@ -915,6 +1188,71 @@ class Orchestrator:
                 preflight_langfuse_tracing()
             except LangfusePreflightError as exc:
                 raise WorkflowError(str(exc)) from exc
+
+        active_operation = self._operation(self.state.get("active_operation_id"))
+        if active_operation is None:
+            active_operation = next((
+                item for item in reversed(self.state.get("operation_history", []))
+                if item.get("status") == "started"
+            ), None)
+        if active_operation is not None and active_operation.get("status") == "started":
+            if active_operation.get("launch_state") == "not_started":
+                active_operation.update({
+                    "status": "failed",
+                    "finished_at": now(),
+                    "outcome": "The workflow stopped before launching this external operation; safe to retry.",
+                    "error_category": "OperationNotLaunched",
+                })
+                if self.state.get("active_operation_id") == active_operation.get("operation_id"):
+                    self.state["active_operation_id"] = None
+                if active_operation.get("operation_type") == "claude":
+                    external = authorization["claude_aily"]
+                    active_call = external.get("active_call")
+                    if isinstance(active_call, dict) and active_call.get("operation_id") == active_operation.get("operation_id"):
+                        external["active_call"] = None
+                    for context in reversed(self.state.get("claude_contexts", [])):
+                        if context.get("operation_id") == active_operation.get("operation_id"):
+                            context["call_state"] = "not_started"
+                            context["error"] = active_operation["outcome"]
+                            break
+                self._save()
+            else:
+                self._require_recovery(
+                    active_operation,
+                    "The prior workflow process released its lock while an external operation was launching or running. "
+                    "Its outcome and child-process state cannot be established safely; no operation was repeated.",
+                )
+                return
+
+        if self.state.get("status") == "running" and self.state.get("operation_tracking_version") != 1:
+            self._require_recovery(
+                None,
+                "This legacy workflow was left running without operation records; the last external action cannot be established.",
+            )
+            return
+
+        if self.state.get("status") == "failed":
+            latest_operation = next(iter(reversed(self.state.get("operation_history", []))), None)
+            if isinstance(latest_operation, dict):
+                is_unresolved = latest_operation.get("status") in {"unknown", "interrupted"}
+                codex_may_have_written = (
+                    latest_operation.get("operation_type") == "codex"
+                    and latest_operation.get("sandbox") == "workspace-write"
+                    and latest_operation.get("status") == "failed"
+                    and latest_operation.get("launch_state") != "not_started"
+                )
+                claude_spend_unknown = (
+                    latest_operation.get("operation_type") == "claude"
+                    and self.state.get("authorization", {}).get("claude_aily", {}).get("budget_unknown") is True
+                )
+                if is_unresolved or codex_may_have_written or claude_spend_unknown:
+                    self._require_recovery(
+                        latest_operation,
+                        latest_operation.get("outcome")
+                        or "The previous operation may have changed the target or incurred an unknown provider cost.",
+                    )
+                    return
+
         external = authorization["claude_aily"]
         if external.get("active_call"):
             external["budget_unknown"] = True
@@ -989,6 +1327,10 @@ class Orchestrator:
             "code_review": None,
             "correction_summary": None,
             "error": None,
+            "operation_tracking_version": 1,
+            "operation_history": [],
+            "active_operation_id": None,
+            "recovery": None,
         }
         self._save()
         self._begin_execution_trace("start")
@@ -1070,17 +1412,52 @@ class Orchestrator:
         self._save()
         return self.state
 
-    def resume(self) -> dict:
-        return self._execute_locked(self._resume_locked)
+    def resume(
+        self,
+        *,
+        recovery_action: str | None = None,
+        verified_claude_cost_usd: float | None = None,
+        confirm_provider_inactive: bool = False,
+        confirm_process_inactive: bool = False,
+        confirm_target_reviewed: bool = False,
+    ) -> dict:
+        return self._execute_locked(lambda: self._resume_locked(
+            recovery_action=recovery_action,
+            verified_claude_cost_usd=verified_claude_cost_usd,
+            confirm_provider_inactive=confirm_provider_inactive,
+            confirm_process_inactive=confirm_process_inactive,
+            confirm_target_reviewed=confirm_target_reviewed,
+        ))
 
-    def _resume_locked(self) -> dict:
+    def _resume_locked(
+        self,
+        *,
+        recovery_action: str | None = None,
+        verified_claude_cost_usd: float | None = None,
+        confirm_provider_inactive: bool = False,
+        confirm_process_inactive: bool = False,
+        confirm_target_reviewed: bool = False,
+    ) -> dict:
         self._load(preflight_tracing=True)
         if self.state.get("status") == "awaiting_approval":
             return self.state
         if self.state.get("status") == "complete":
             return self.state
-        if self.state.get("status") != "failed":
+        if self.state.get("status") == "recovery_required":
+            self._resolve_recovery(
+                recovery_action,
+                verified_claude_cost_usd=verified_claude_cost_usd,
+                confirm_provider_inactive=confirm_provider_inactive,
+                confirm_process_inactive=confirm_process_inactive,
+                confirm_target_reviewed=confirm_target_reviewed,
+            )
+        elif self.state.get("status") == "running":
+            if recovery_action is not None:
+                raise WorkflowError("No recovery action is pending for this workflow.")
+        elif self.state.get("status") != "failed":
             raise WorkflowError(f"Workflow cannot resume from status {self.state.get('status')!r}.")
+        elif recovery_action is not None or verified_claude_cost_usd is not None:
+            raise WorkflowError("No recovery action is pending for this workflow.")
         authorization = validate_workflow_authorization(self.state, self.target, self.workflow_id)
         if (authorization["claude_aily"]["budget_unknown"]
                 and self.state.get("stage", "").startswith(("plan_review", "code_review"))):
@@ -1164,7 +1541,9 @@ class Orchestrator:
         final_status = self.state.get("status") if isinstance(self.state, dict) else None
         if not isinstance(final_stage, str) or final_stage not in TRACE_STAGES:
             final_stage = "unknown"
-        if final_status not in {"running", "awaiting_approval", "failed", "complete", "rejected"}:
+        if final_status not in {
+            "running", "awaiting_approval", "failed", "recovery_required", "complete", "rejected",
+        }:
             final_status = "unknown"
         duration = max(0, round((time.monotonic() - started_at) * 1000)) if started_at is not None else 0
         context.update(
@@ -1182,6 +1561,9 @@ class Orchestrator:
 
     def status(self) -> dict:
         self._read_state()
+        recovery = self.state.get("recovery")
+        if isinstance(recovery, dict):
+            recovery["target_changes"] = self._target_change_inventory()
         return self.state
 
     def _run_codex(self, prompt: str, *, sandbox: str) -> str:
@@ -1192,6 +1574,45 @@ class Orchestrator:
             metadata["model"] = self.model
         with self._trace_span("provider.codex", metadata, as_type="generation"):
             return self._run_codex_impl(prompt, sandbox=sandbox)
+
+    def _run_process_with_pid(self, command: list[str], *, operation_id: str, **kwargs):
+        """Run the normal subprocess interface while persisting a child PID when available."""
+        timeout = kwargs.pop("timeout", None)
+        check = kwargs.pop("check", False)
+        input_data = kwargs.pop("input", None)
+        self._operation_launching(operation_id)
+        if self.process_runner is subprocess.run:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE if input_data is not None else kwargs.pop("stdin", None),
+                **kwargs,
+            )
+            try:
+                self._operation_process_started(operation_id, process.pid)
+            except BaseException:
+                process.kill()
+                process.communicate()
+                raise
+            try:
+                stdout, stderr = process.communicate(input=input_data, timeout=timeout)
+            except subprocess.TimeoutExpired as exc:
+                process.kill()
+                stdout, stderr = process.communicate()
+                raise subprocess.TimeoutExpired(
+                    command, timeout, output=stdout, stderr=stderr,
+                ) from exc
+            result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+            if check and result.returncode:
+                raise subprocess.CalledProcessError(result.returncode, command, output=stdout, stderr=stderr)
+            return result
+
+        result = self.process_runner(
+            command, input=input_data, timeout=timeout, check=check, **kwargs,
+        )
+        process_id = getattr(result, "pid", None)
+        if isinstance(process_id, int) and not isinstance(process_id, bool) and process_id > 0:
+            self._operation_process_started(operation_id, process_id)
+        return result
 
     def _run_codex_impl(self, prompt: str, *, sandbox: str) -> str:
         with tempfile.TemporaryDirectory(prefix="harness-codex-result-") as output_dir:
@@ -1218,11 +1639,41 @@ class Orchestrator:
                 self.codex, self.target, sandbox, output_path, self.model,
                 read_only_authorized_urls=read_only_authorized_urls,
             )
+            effective_prompt = authorization_context + prompt
+            prompt_hash = hashlib.sha256(effective_prompt.encode("utf-8")).hexdigest()
+            prior_operations = [
+                item for item in self.state.get("operation_history", [])
+                if item.get("operation_type") == "codex" and item.get("stage") == stage
+                and item.get("sandbox") == sandbox and not item.get("result_consumed")
+            ]
+            prior = prior_operations[-1] if prior_operations else None
+            if prior is not None and prior.get("status") == "completed":
+                if (prior.get("input_sha256") != prompt_hash
+                        or not isinstance(prior.get("result_text"), str)):
+                    self._require_recovery(
+                        prior,
+                        "A completed Codex result does not match the current stage input or was not persisted completely.",
+                    )
+                    raise WorkflowError("Codex result recovery is ambiguous; inspect the workflow status.")
+                return prior["result_text"]
+
+            operation = self._new_operation(
+                "codex",
+                input_sha256=prompt_hash,
+                sandbox=sandbox,
+                model=self.model,
+                attempt=1 + sum(
+                    item.get("operation_type") == "codex" and item.get("stage") == stage
+                    for item in self.state.get("operation_history", [])
+                ),
+            )
+            self._save()
             try:
-                result = self.process_runner(
+                result = self._run_process_with_pid(
                     command,
+                    operation_id=operation["operation_id"],
                     cwd=str(self.target),
-                    input=(authorization_context + prompt).encode("utf-8"),
+                    input=effective_prompt.encode("utf-8"),
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     timeout=self.timeout_seconds,
@@ -1230,20 +1681,44 @@ class Orchestrator:
                     env=_git_env(),
                 )
             except subprocess.TimeoutExpired as exc:
+                self._finish_operation(
+                    operation["operation_id"], status="interrupted",
+                    outcome=f"Codex timed out after {self.timeout_seconds} seconds; target changes require inspection.",
+                    error_category=type(exc).__name__,
+                )
                 raise WorkflowError(f"Codex timed out after {self.timeout_seconds} seconds.") from exc
             except OSError as exc:
+                self._finish_operation(
+                    operation["operation_id"], status="failed",
+                    outcome=f"Codex could not start: {redact(str(exc))}",
+                    error_category=type(exc).__name__, launch_state="not_started",
+                )
                 raise WorkflowError(f"Codex could not start: {redact(str(exc))}") from exc
             stdout = result.stdout.decode("utf-8", "replace") if isinstance(result.stdout, bytes) else str(result.stdout or "")
             stderr = result.stderr.decode("utf-8", "replace") if isinstance(result.stderr, bytes) else str(result.stderr or "")
             if result.returncode:
                 detail = redact(stderr.strip() or _json_line_message(stdout) or "Codex returned no diagnostic output.")
+                self._finish_operation(
+                    operation["operation_id"], status="failed",
+                    outcome=f"Codex exited with status {result.returncode}: {detail}",
+                    exit_code=result.returncode, error_category="CodexExitError",
+                )
                 raise WorkflowError(f"Codex exited with status {result.returncode}: {detail}")
             if output_path.exists():
                 message = output_path.read_text(encoding="utf-8").strip()
             else:
                 message = _json_line_message(stdout) or stdout.strip()
             if not message:
+                self._finish_operation(
+                    operation["operation_id"], status="failed", outcome="Codex returned an empty response.",
+                    exit_code=result.returncode, error_category="EmptyCodexResponse",
+                )
                 raise WorkflowError("Codex returned an empty response.")
+            self._finish_operation(
+                operation["operation_id"], status="completed", outcome="Codex returned a response.",
+                exit_code=result.returncode, result_text=message,
+                result_sha256=hashlib.sha256(message.encode("utf-8")).hexdigest(), launch_state="completed",
+            )
             return message
 
     def _call_claude(
@@ -1456,16 +1931,35 @@ class Orchestrator:
         manifest["submitted_at"] = now()
         contexts = self.state.setdefault("claude_contexts", [])
         context_index = len(contexts)
+        operation = self._new_operation(
+            "claude",
+            input_sha256=manifest["prompt_sha256"],
+            cap_usd=remaining,
+            campaign_id=(metadata or {}).get("campaign_id"),
+            part_id=(metadata or {}).get("part_id"),
+            iteration=(metadata or {}).get("iteration"),
+            proposal_version=(metadata or {}).get("proposal_version"),
+            context_index=context_index,
+        )
+        manifest["operation_id"] = operation["operation_id"]
+        operation["call_number"] = code_review_call_number
         contexts.append(manifest)
         external["active_call"] = {
             "stage": stage,
             "started_at": now(),
             "cap_usd": remaining,
             "context_sha256": manifest["prompt_sha256"],
+            "operation_id": operation["operation_id"],
         }
         self._save()
+        self._operation_launching(operation["operation_id"])
         try:
-            result = self.claude_runner(prompt, budget_usd=remaining, executable=self.aily)
+            runner_kwargs = {"budget_usd": remaining, "executable": self.aily}
+            if self.claude_runner is claude_reviewer.review:
+                runner_kwargs["process_started"] = lambda process_id: self._operation_process_started(
+                    operation["operation_id"], process_id,
+                )
+            result = self.claude_runner(prompt, **runner_kwargs)
         except claude_reviewer.ReviewError as exc:
             if exc.cost_usd is None:
                 external["budget_unknown"] = True
@@ -1475,7 +1969,12 @@ class Orchestrator:
             self.state["error"] = str(exc)
             contexts[context_index]["call_state"] = "failed"
             contexts[context_index]["error"] = redact(str(exc))
-            self._save()
+            operation_status = "unknown" if exc.cost_usd is None else "failed"
+            self._finish_operation(
+                operation["operation_id"], status=operation_status,
+                outcome=f"Claude invocation failed: {redact(str(exc))}",
+                error_category=type(exc).__name__, cost_usd=exc.cost_usd,
+            )
             raise WorkflowError(str(exc)) from exc
         except Exception as exc:
             external["budget_unknown"] = True
@@ -1484,7 +1983,10 @@ class Orchestrator:
             self.state["error"] = error
             contexts[context_index]["call_state"] = "failed_unknown_cost"
             contexts[context_index]["error"] = error
-            self._save()
+            self._finish_operation(
+                operation["operation_id"], status="unknown", outcome=error,
+                error_category=type(exc).__name__,
+            )
             raise WorkflowError(error) from exc
         cost = result.cost_usd
         if cost is not None:
@@ -1494,9 +1996,12 @@ class Orchestrator:
         external["active_call"] = None
         contexts[context_index]["call_state"] = "completed"
         contexts[context_index]["cost_usd"] = cost
-        if stage == "code_review":
-            contexts[context_index]["report"] = result.text
-        self._save()
+        contexts[context_index]["report"] = result.text
+        self._finish_operation(
+            operation["operation_id"], status="completed", outcome="Claude returned a report.",
+            result_sha256=hashlib.sha256(result.text.encode("utf-8")).hexdigest(),
+            cost_usd=cost, launch_state="completed",
+        )
         return result.text, manifest
 
     def _code_review_shared_context(self, review_diff: ReviewDiff) -> dict[str, str]:
@@ -1641,6 +2146,26 @@ class Orchestrator:
         self._save()
 
     def _fail(self, exc: Exception) -> None:
+        latest_operation = next(iter(reversed(self.state.get("operation_history", []))), None)
+        if isinstance(latest_operation, dict):
+            if (latest_operation.get("status") == "completed"
+                    and latest_operation.get("stage") == self.state.get("stage")
+                    and latest_operation.get("result_text") is not None):
+                latest_operation["result_text"] = None
+                latest_operation["result_consumed"] = True
+                latest_operation["result_rejected_at"] = now()
+            unsafe_codex_failure = (
+                latest_operation.get("operation_type") == "codex"
+                and latest_operation.get("sandbox") == "workspace-write"
+                and latest_operation.get("status") in {"failed", "interrupted"}
+                and latest_operation.get("launch_state") != "not_started"
+            )
+            if latest_operation.get("status") in {"unknown", "interrupted"} or unsafe_codex_failure:
+                self._require_recovery(
+                    latest_operation,
+                    redact(str(exc)) or "The operation may have stopped after partially changing the target.",
+                )
+                return
         self.state["status"] = "failed"
         self.state["error"] = redact(str(exc))
         self._save()
@@ -1680,7 +2205,23 @@ class Orchestrator:
                 elif stage in {"plan_review_1", "plan_review_2"}:
                     iteration = int(stage[-1])
                     header, sections, metadata = self._plan_review_prompt(iteration)
-                    report, manifest = self._call_claude(header, stage, sections, metadata=metadata)
+                    recoverable_context = next((
+                        context for context in reversed(self.state.get("claude_contexts", []))
+                        if context.get("stage") == stage
+                        and context.get("proposal_version") == metadata["proposal_version"]
+                        and context.get("call_state") == "completed"
+                        and isinstance(context.get("report"), str)
+                        and context.get("report")
+                        and not any(
+                            review.get("context_manifest", {}).get("prompt_sha256")
+                            == context.get("prompt_sha256")
+                            for review in self.state.get("plan_reviews", [])
+                        )
+                    ), None)
+                    if recoverable_context is not None:
+                        report, manifest = recoverable_context["report"], recoverable_context
+                    else:
+                        report, manifest = self._call_claude(header, stage, sections, metadata=metadata)
                     self.state["plan_reviews"].append({
                         "attempt": len(self.state.get("plan_reviews", [])) + 1,
                         "iteration": iteration,
