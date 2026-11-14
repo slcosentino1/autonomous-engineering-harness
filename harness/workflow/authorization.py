@@ -13,9 +13,17 @@ from pathlib import Path
 from observability.tracer import observability_scope, valid_observability_scope
 
 
-DEFAULT_MAX_CODE_REVIEW_CALLS = 16
+DEFAULT_MAX_CODE_REVIEW_CALLS = 32
 MAX_PLAN_REVIEWS = 2
 MAX_AUTHORIZED_CODE_REVIEW_CALLS = 64
+DEFAULT_MAX_CODEX_CALLS = 8
+MAX_AUTHORIZED_CODEX_CALLS = 64
+DEFAULT_CODEX_TIMEOUT_SECONDS = 3600
+DEFAULT_CLAUDE_TIMEOUT_SECONDS = 900
+DEFAULT_WORKFLOW_TIMEOUT_SECONDS = 86400
+MAX_PROVIDER_TIMEOUT_SECONDS = 86400
+MAX_WORKFLOW_TIMEOUT_SECONDS = 604800
+MAX_CORRECTION_ATTEMPTS = 1
 WORKSPACE_OPERATIONS = [
     "read_create_edit_rename_delete_assignment_files_in_target",
     "run_development_commands_builds_tests_linters_and_static_analysis",
@@ -55,6 +63,10 @@ def new_workflow_authorization(
     target: Path, workflow_id: str, budget_usd: float,
     max_code_review_calls: int = DEFAULT_MAX_CODE_REVIEW_CALLS,
     tracing_enabled: bool = False,
+    *, max_codex_calls: int = DEFAULT_MAX_CODEX_CALLS,
+    codex_timeout_seconds: int = DEFAULT_CODEX_TIMEOUT_SECONDS,
+    claude_timeout_seconds: int = DEFAULT_CLAUDE_TIMEOUT_SECONDS,
+    workflow_timeout_seconds: int = DEFAULT_WORKFLOW_TIMEOUT_SECONDS,
 ) -> dict:
     """Create the single persistent authorization attached to a new workflow."""
     if (isinstance(max_code_review_calls, bool) or not isinstance(max_code_review_calls, int)
@@ -62,6 +74,28 @@ def new_workflow_authorization(
         raise AuthorizationError(
             f"Code review call authorization must be between 1 and {MAX_AUTHORIZED_CODE_REVIEW_CALLS}."
         )
+    if (isinstance(max_codex_calls, bool) or not isinstance(max_codex_calls, int)
+            or not 1 <= max_codex_calls <= MAX_AUTHORIZED_CODEX_CALLS):
+        raise AuthorizationError(
+            f"Codex call authorization must be between 1 and {MAX_AUTHORIZED_CODEX_CALLS}."
+        )
+    for name, value in (
+        ("Codex", codex_timeout_seconds), ("Claude", claude_timeout_seconds),
+    ):
+        if (isinstance(value, bool) or not isinstance(value, int)
+                or not 1 <= value <= MAX_PROVIDER_TIMEOUT_SECONDS):
+            raise AuthorizationError(
+                f"{name} timeout must be between 1 and {MAX_PROVIDER_TIMEOUT_SECONDS} seconds."
+            )
+    if (isinstance(workflow_timeout_seconds, bool) or not isinstance(workflow_timeout_seconds, int)
+            or not 1 <= workflow_timeout_seconds <= MAX_WORKFLOW_TIMEOUT_SECONDS):
+        raise AuthorizationError(
+            f"Workflow timeout must be between 1 and {MAX_WORKFLOW_TIMEOUT_SECONDS} seconds."
+        )
+    max_provider_runtime_seconds = (
+        max_codex_calls * codex_timeout_seconds
+        + (MAX_PLAN_REVIEWS + max_code_review_calls) * claude_timeout_seconds
+    )
     authorization = {
         "version": 1,
         "authorization_id": uuid.uuid4().hex,
@@ -70,6 +104,15 @@ def new_workflow_authorization(
         "workflow_id": workflow_id,
         "workspace_operations": WORKSPACE_OPERATIONS.copy(),
         "codex_stages": CODEX_STAGES.copy(),
+        "execution_limits": {
+            "max_codex_calls": max_codex_calls,
+            "codex_timeout_seconds": codex_timeout_seconds,
+            "claude_timeout_seconds": claude_timeout_seconds,
+            "workflow_timeout_seconds": workflow_timeout_seconds,
+            "max_claude_calls": MAX_PLAN_REVIEWS + max_code_review_calls,
+            "max_correction_attempts": MAX_CORRECTION_ATTEMPTS,
+            "max_provider_runtime_seconds": max_provider_runtime_seconds,
+        },
         "claude_aily": {
             "provider": "Claude through Aily",
             "permitted_data": CLAUDE_DATA_SCOPE.copy(),
@@ -149,6 +192,42 @@ def validate_workflow_authorization(state: dict, target: Path, workflow_id: str)
             or external.get("max_plan_reviews") != MAX_PLAN_REVIEWS
             or not (legacy_single_review or configured_review_policy)):
         raise AuthorizationError("Saved Claude/Aily scope or review limit is missing or changed.")
+    limits = authorization.get("execution_limits")
+    if limits is not None:
+        max_codex_calls = limits.get("max_codex_calls") if isinstance(limits, dict) else None
+        codex_timeout = limits.get("codex_timeout_seconds") if isinstance(limits, dict) else None
+        claude_timeout = limits.get("claude_timeout_seconds") if isinstance(limits, dict) else None
+        workflow_timeout = limits.get("workflow_timeout_seconds") if isinstance(limits, dict) else None
+        max_claude_calls = limits.get("max_claude_calls") if isinstance(limits, dict) else None
+        correction_attempts = limits.get("max_correction_attempts") if isinstance(limits, dict) else None
+        runtime_limit = limits.get("max_provider_runtime_seconds") if isinstance(limits, dict) else None
+        expected_runtime = (
+            max_codex_calls * codex_timeout
+            + (MAX_PLAN_REVIEWS + code_review_limit) * claude_timeout
+            if all(isinstance(value, int) and not isinstance(value, bool) for value in (
+                max_codex_calls, codex_timeout, claude_timeout, code_review_limit,
+            )) else None
+        )
+        if (not isinstance(limits, dict)
+                or set(limits) != {
+                    "max_codex_calls", "codex_timeout_seconds", "claude_timeout_seconds",
+                    "workflow_timeout_seconds", "max_claude_calls", "max_correction_attempts",
+                    "max_provider_runtime_seconds",
+                }
+                or isinstance(max_codex_calls, bool) or not isinstance(max_codex_calls, int)
+                or not 1 <= max_codex_calls <= MAX_AUTHORIZED_CODEX_CALLS
+                or any(isinstance(value, bool) or not isinstance(value, int)
+                       or not 1 <= value <= MAX_PROVIDER_TIMEOUT_SECONDS
+                       for value in (codex_timeout, claude_timeout))
+                or isinstance(workflow_timeout, bool) or not isinstance(workflow_timeout, int)
+                or not 1 <= workflow_timeout <= MAX_WORKFLOW_TIMEOUT_SECONDS
+                or isinstance(max_claude_calls, bool) or not isinstance(max_claude_calls, int)
+                or max_claude_calls != MAX_PLAN_REVIEWS + code_review_limit
+                or correction_attempts != MAX_CORRECTION_ATTEMPTS
+                or isinstance(correction_attempts, bool)
+                or not isinstance(runtime_limit, int) or isinstance(runtime_limit, bool)
+                or runtime_limit != expected_runtime):
+            raise AuthorizationError("Saved execution limits are invalid or changed.")
     try:
         budget = Decimal(str(external.get("budget_usd")))
         spent = Decimal(str(external.get("spent_usd")))

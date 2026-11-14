@@ -9,6 +9,7 @@ import copy
 import errno
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -39,6 +40,7 @@ from observability.tracer import (
 from workflow import authorization as _authorization
 from workflow import cli as _cli
 from workflow import persistence as _persistence
+from workflow import process_control as _process_control
 from workflow import planning_review as _planning_review
 from workflow import review_input as _review_input
 from workflow import skills as _skills
@@ -101,13 +103,20 @@ MAX_PLAN_REVIEWS = _authorization.MAX_PLAN_REVIEWS
 DEFAULT_CLAUDE_BUDGET_USD = _cli.DEFAULT_CLAUDE_BUDGET_USD
 DEFAULT_MAX_CODE_REVIEW_CALLS = _authorization.DEFAULT_MAX_CODE_REVIEW_CALLS
 MAX_AUTHORIZED_CODE_REVIEW_CALLS = _authorization.MAX_AUTHORIZED_CODE_REVIEW_CALLS
+DEFAULT_MAX_CODEX_CALLS = _authorization.DEFAULT_MAX_CODEX_CALLS
+MAX_AUTHORIZED_CODEX_CALLS = _authorization.MAX_AUTHORIZED_CODEX_CALLS
+DEFAULT_CODEX_TIMEOUT_SECONDS = _authorization.DEFAULT_CODEX_TIMEOUT_SECONDS
+DEFAULT_CLAUDE_TIMEOUT_SECONDS = _authorization.DEFAULT_CLAUDE_TIMEOUT_SECONDS
+DEFAULT_WORKFLOW_TIMEOUT_SECONDS = _authorization.DEFAULT_WORKFLOW_TIMEOUT_SECONDS
+MAX_PROVIDER_TIMEOUT_SECONDS = _authorization.MAX_PROVIDER_TIMEOUT_SECONDS
+MAX_WORKFLOW_TIMEOUT_SECONDS = _authorization.MAX_WORKFLOW_TIMEOUT_SECONDS
 MAX_PLANNING_FAILURE_OUTPUT_CHARS = 50_000
 MAX_PLANNING_FAILURE_RECORDS = 3
 MAX_OPERATION_HISTORY = 100
 MAX_EXECUTION_CHANGE_EXAMPLES = 10
 TRACE_STAGES = frozenset({
     "planning", "plan_review_1", "plan_review_2", "plan_refine_1", "plan_refine_2",
-    "human_revision", "implementation", "code_review", "correction", "complete",
+    "human_revision", "implementation", "code_review", "correction", "verification", "complete",
 })
 CODEX_EXECUTABLE = _cli.CODEX_EXECUTABLE
 PLANNING_PRINCIPLES = """Engineering Judgment & Proportional Design
@@ -595,14 +604,68 @@ def _clearly_no_review_findings(report: str) -> bool:
     return bool(empty and not re.search(r"(?i)\bMust fix\b", report))
 
 
+def _post_correction_dispositions(
+    initial_campaign: dict, verification_campaign: dict,
+) -> tuple[dict[str, dict[str, str]] | None, str | None]:
+    """Require explicit evidence-backed disposition of each original blocking finding."""
+    expected: set[str] = set()
+    for report in _validated_campaign_reports(initial_campaign):
+        validation = report.get("validation") or {}
+        for finding in validation.get("findings", []):
+            if str(finding.get("Severity", "")).casefold() == "must fix":
+                expected.add(f"{report.get('part_id')}/{finding.get('id')}")
+    if not expected:
+        return None, "The original review has no validated blocking finding to verify."
+
+    if verification_campaign.get("strategy") == "multi_part_with_integration":
+        integration = verification_campaign.get("integration_review")
+        report_text = integration.get("report", "") if isinstance(integration, dict) else ""
+    else:
+        report_text = str(verification_campaign.get("consolidated_report") or "")
+    disposition_pattern = re.compile(
+        r"(?im)^\s*[-*+]\s*`?(part-\d+/F\d+)`?\s*:\s*"
+        r"(Resolved|Partially resolved|Unresolved)\s*[—–-]\s*(\S.*)$"
+    )
+    matches: dict[str, list[tuple[str, str]]] = {}
+    for match in disposition_pattern.finditer(report_text):
+        matches.setdefault(match.group(1), []).append((match.group(2).casefold(), match.group(3).strip()))
+    missing = sorted(expected - matches.keys())
+    duplicated = sorted(key for key, values in matches.items() if key in expected and len(values) != 1)
+    unresolved = sorted(
+        key for key in expected & matches.keys()
+        if len(matches[key]) == 1 and (matches[key][0][0] != "resolved" or not matches[key][0][1])
+    )
+    if missing or duplicated or unresolved:
+        details = []
+        if missing:
+            details.append("missing dispositions for " + ", ".join(missing))
+        if duplicated:
+            details.append("duplicate dispositions for " + ", ".join(duplicated))
+        if unresolved:
+            details.append("unresolved or unsupported dispositions for " + ", ".join(unresolved))
+        return None, "Independent verification is incomplete: " + "; ".join(details) + "."
+    return {
+        key: {"status": matches[key][0][0], "evidence": matches[key][0][1]}
+        for key in sorted(expected)
+    }, None
+
+
 def new_workflow_authorization(
     target: Path, workflow_id: str, budget_usd: float,
     max_code_review_calls: int = DEFAULT_MAX_CODE_REVIEW_CALLS,
     tracing_enabled: bool = False,
+    *, max_codex_calls: int = DEFAULT_MAX_CODEX_CALLS,
+    codex_timeout_seconds: int = DEFAULT_CODEX_TIMEOUT_SECONDS,
+    claude_timeout_seconds: int = DEFAULT_CLAUDE_TIMEOUT_SECONDS,
+    workflow_timeout_seconds: int = DEFAULT_WORKFLOW_TIMEOUT_SECONDS,
 ) -> dict:
     try:
         return _authorization.new_workflow_authorization(
             target, workflow_id, budget_usd, max_code_review_calls, tracing_enabled,
+            max_codex_calls=max_codex_calls,
+            codex_timeout_seconds=codex_timeout_seconds,
+            claude_timeout_seconds=claude_timeout_seconds,
+            workflow_timeout_seconds=workflow_timeout_seconds,
         )
     except _authorization.AuthorizationError as exc:
         raise WorkflowError(str(exc)) from exc
@@ -629,11 +692,14 @@ class Orchestrator:
         task: str | None = None,
         budget_usd: float | None = DEFAULT_CLAUDE_BUDGET_USD,
         max_code_review_calls: int = DEFAULT_MAX_CODE_REVIEW_CALLS,
+        max_codex_calls: int = DEFAULT_MAX_CODEX_CALLS,
         model: str | None = None,
         workflow_id: str | None = None,
         codex: str = CODEX_EXECUTABLE,
         aily: str = claude_reviewer.AILY_EXECUTABLE,
-        timeout_seconds: int = 3600,
+        timeout_seconds: int = DEFAULT_CODEX_TIMEOUT_SECONDS,
+        claude_timeout_seconds: int = DEFAULT_CLAUDE_TIMEOUT_SECONDS,
+        workflow_timeout_seconds: int = DEFAULT_WORKFLOW_TIMEOUT_SECONDS,
         process_runner: Callable = subprocess.run,
         claude_runner: Callable = claude_reviewer.review,
         tracing_enabled: bool = False,
@@ -643,10 +709,29 @@ class Orchestrator:
             raise WorkflowError(
                 f"Code review call authorization must be between 1 and {MAX_AUTHORIZED_CODE_REVIEW_CALLS}."
             )
+        if (isinstance(max_codex_calls, bool) or not isinstance(max_codex_calls, int)
+                or not 1 <= max_codex_calls <= MAX_AUTHORIZED_CODEX_CALLS):
+            raise WorkflowError(
+                f"Codex call authorization must be between 1 and {MAX_AUTHORIZED_CODEX_CALLS}."
+            )
+        for provider, timeout in (
+            ("Codex", timeout_seconds), ("Claude", claude_timeout_seconds),
+        ):
+            if (isinstance(timeout, bool) or not isinstance(timeout, int)
+                    or not 1 <= timeout <= MAX_PROVIDER_TIMEOUT_SECONDS):
+                raise WorkflowError(
+                    f"{provider} timeout must be between 1 and {MAX_PROVIDER_TIMEOUT_SECONDS} seconds."
+                )
+        if (isinstance(workflow_timeout_seconds, bool) or not isinstance(workflow_timeout_seconds, int)
+                or not 1 <= workflow_timeout_seconds <= MAX_WORKFLOW_TIMEOUT_SECONDS):
+            raise WorkflowError(
+                f"Workflow timeout must be between 1 and {MAX_WORKFLOW_TIMEOUT_SECONDS} seconds."
+            )
         self.target = canonical_target(str(target))
         self.task = task
         self.budget_usd = budget_usd
         self.max_code_review_calls = max_code_review_calls
+        self.max_codex_calls = max_codex_calls
         if model is not None and not model.strip():
             raise WorkflowError("--model must name a Codex model when provided.")
         self.model = model.strip() if model is not None else None
@@ -654,6 +739,8 @@ class Orchestrator:
         self.codex = codex
         self.aily = aily
         self.timeout_seconds = timeout_seconds
+        self.claude_timeout_seconds = claude_timeout_seconds
+        self.workflow_timeout_seconds = workflow_timeout_seconds
         self.process_runner = process_runner
         self.claude_runner = claude_runner
         self.tracing_enabled = bool(tracing_enabled)
@@ -698,6 +785,113 @@ class Orchestrator:
             item for item in reversed(self.state.get("operation_history", []))
             if item.get("operation_id") == operation_id
         ), None)
+
+    def _execution_limits(self) -> dict:
+        saved = self.state.get("authorization", {}).get("execution_limits")
+        if isinstance(saved, dict):
+            return saved
+        return {
+            "max_codex_calls": self.max_codex_calls,
+            "codex_timeout_seconds": self.timeout_seconds,
+            "claude_timeout_seconds": self.claude_timeout_seconds,
+            "workflow_timeout_seconds": self.workflow_timeout_seconds,
+            "max_correction_attempts": _authorization.MAX_CORRECTION_ATTEMPTS,
+            "max_claude_calls": MAX_PLAN_REVIEWS + self.state.get("authorization", {}).get("claude_aily", {}).get(
+                "max_code_reviews", self.max_code_review_calls,
+            ),
+            "max_provider_runtime_seconds": (
+                self.max_codex_calls * self.timeout_seconds
+                + (MAX_PLAN_REVIEWS + self.state.get("authorization", {}).get("claude_aily", {}).get(
+                    "max_code_reviews", self.max_code_review_calls,
+                )) * self.claude_timeout_seconds
+            ),
+        }
+
+    def _resource_usage(self) -> dict:
+        usage = self.state.setdefault("resource_usage", {})
+        if not isinstance(usage, dict):
+            raise WorkflowError("Saved workflow resource usage is invalid.")
+        usage.setdefault("codex_calls", 0)
+        usage.setdefault("claude_calls", 0)
+        usage.setdefault("provider_runtime_seconds", 0.0)
+        usage.setdefault("workflow_runtime_seconds", 0.0)
+        usage.setdefault("correction_attempts", 0)
+        for key in ("codex_calls", "claude_calls", "correction_attempts"):
+            value = usage.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise WorkflowError("Saved workflow resource usage is invalid.")
+        for key in ("provider_runtime_seconds", "workflow_runtime_seconds"):
+            value = usage.get(key)
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value)) or value < 0):
+                raise WorkflowError("Saved workflow resource usage is invalid.")
+        return usage
+
+    def _workflow_runtime_remaining(self) -> float:
+        limits = self._execution_limits()
+        usage = self._resource_usage()
+        active = getattr(self, "_workflow_runtime_started_monotonic", None)
+        active_seconds = max(0.0, time.monotonic() - active) if active is not None else 0.0
+        return (
+            float(limits["workflow_timeout_seconds"])
+            - float(usage.get("workflow_runtime_seconds", 0.0))
+            - active_seconds
+        )
+
+    def _begin_workflow_runtime(self) -> None:
+        if not self._process_lock_held:
+            raise WorkflowError("Workflow runtime accounting requires the workflow process lock.")
+        self._workflow_runtime_started_monotonic = time.monotonic()
+        self.state["workflow_active_started_at"] = now()
+        self._save()
+
+    def _finish_workflow_runtime(self) -> None:
+        started = getattr(self, "_workflow_runtime_started_monotonic", None)
+        if started is None:
+            return
+        elapsed = max(0.0, time.monotonic() - started)
+        usage = self._resource_usage()
+        usage["workflow_runtime_seconds"] = round(
+            float(usage.get("workflow_runtime_seconds", 0.0)) + elapsed, 3,
+        )
+        self.state.pop("workflow_active_started_at", None)
+        self._workflow_runtime_started_monotonic = None
+        self._save()
+
+    def _provider_timeout(self, provider: str) -> float:
+        limits = self._execution_limits()
+        usage = self._resource_usage()
+        timeout_key = "codex_timeout_seconds" if provider == "codex" else "claude_timeout_seconds"
+        remaining_runtime = (
+            float(limits["max_provider_runtime_seconds"])
+            - float(usage.get("provider_runtime_seconds", 0.0))
+        )
+        remaining_workflow = self._workflow_runtime_remaining()
+        if remaining_runtime <= 0:
+            raise WorkflowError("The authorized workflow provider-runtime limit is exhausted.")
+        if remaining_workflow <= 0:
+            raise WorkflowError("The authorized workflow execution-time limit is exhausted.")
+        return min(float(limits[timeout_key]), remaining_runtime, remaining_workflow)
+
+    def _record_operation_runtime(self, operation: dict, duration_ms: int | None = None) -> None:
+        if operation.get("runtime_accounted") is True:
+            return
+        measured = duration_ms if isinstance(duration_ms, int) and duration_ms >= 0 else None
+        if measured is None:
+            timeout = operation.get("timeout_seconds", 0)
+            measured = (
+                round(float(timeout) * 1000)
+                if operation.get("launch_state") != "not_started"
+                and isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0
+                else 0
+            )
+        operation["duration_ms"] = measured
+        operation["runtime_accounted"] = True
+        usage = self._resource_usage()
+        usage["provider_runtime_seconds"] = round(
+            float(usage.get("provider_runtime_seconds", 0.0)) + measured / 1000,
+            3,
+        )
 
     def _new_operation(self, operation_type: str, *, input_sha256: str | None = None, **details: object) -> dict:
         history = self.state.setdefault("operation_history", [])
@@ -750,6 +944,11 @@ class Orchestrator:
                 "reported_model_source": "not_reported",
             })
         history.append(operation)
+        usage = self._resource_usage()
+        if operation_type == "codex":
+            usage["codex_calls"] = int(usage.get("codex_calls", 0)) + 1
+        elif operation_type == "claude":
+            usage["claude_calls"] = int(usage.get("claude_calls", 0)) + 1
         self.state["active_operation_id"] = operation["operation_id"]
         if len(history) > MAX_OPERATION_HISTORY:
             removable = [item for item in history if item is not operation
@@ -789,6 +988,7 @@ class Orchestrator:
         result_text: str | None = None,
         result_sha256: str | None = None,
         cost_usd: float | None = None,
+        duration_ms: int | None = None,
         launch_state: str | None = None,
         evidence: dict | None = None,
     ) -> None:
@@ -805,10 +1005,13 @@ class Orchestrator:
             "result_text": result_text,
             "cost_usd": cost_usd,
         })
+        if duration_ms is not None:
+            operation["duration_ms"] = duration_ms
         if launch_state is not None:
             operation["launch_state"] = launch_state
         if evidence:
             operation.update(evidence)
+        self._record_operation_runtime(operation, operation.get("duration_ms"))
         if self.state.get("active_operation_id") == operation_id:
             self.state["active_operation_id"] = None
         self._save()
@@ -942,6 +1145,8 @@ class Orchestrator:
                 })
             if self.state.get("active_operation_id") == operation.get("operation_id"):
                 self.state["active_operation_id"] = None
+        if operation is not None:
+            self._record_operation_runtime(operation)
         if operation is not None and operation.get("operation_type") == "claude":
             authorization = self.state.get("authorization", {}).get("claude_aily", {})
             authorization["budget_unknown"] = True
@@ -1139,7 +1344,44 @@ class Orchestrator:
             raise WorkflowError("Codex model is fixed when the workflow starts.")
         self.model = saved_model
 
-        return validate_workflow_authorization(self.state, self.target, self.workflow_id)
+        authorization = validate_workflow_authorization(self.state, self.target, self.workflow_id)
+        self.max_code_review_calls = authorization["claude_aily"]["max_code_reviews"]
+        limits = authorization.get("execution_limits")
+        if isinstance(limits, dict):
+            self.max_codex_calls = limits["max_codex_calls"]
+            self.timeout_seconds = limits["codex_timeout_seconds"]
+            self.claude_timeout_seconds = limits["claude_timeout_seconds"]
+            self.workflow_timeout_seconds = limits["workflow_timeout_seconds"]
+        usage = self.state.get("resource_usage")
+        if not isinstance(usage, dict):
+            operations = self.state.get("operation_history", [])
+            claude_contexts = self.state.get("claude_contexts", [])
+            usage = {
+                "codex_calls": sum(
+                    isinstance(item, dict) and item.get("operation_type") == "codex"
+                    for item in operations
+                ),
+                "claude_calls": sum(
+                    isinstance(item, dict) and item.get("call_state") != "validation_failed"
+                    for item in claude_contexts
+                ),
+                "provider_runtime_seconds": round(sum(
+                    (item.get("duration_ms", 0) or 0) / 1000
+                    for item in operations if isinstance(item, dict)
+                    and isinstance(item.get("duration_ms"), (int, float))
+                ), 3),
+                "workflow_runtime_seconds": 0.0,
+                "correction_attempts": len(self.state.get("correction_attempts", [])),
+            }
+            if len(operations) >= MAX_OPERATION_HISTORY and "execution_limits" not in authorization:
+                usage["codex_calls"] = max(usage["codex_calls"], self.max_codex_calls)
+                usage["provider_runtime_seconds"] = max(
+                    usage["provider_runtime_seconds"],
+                    self._execution_limits()["max_provider_runtime_seconds"],
+                )
+            self.state["resource_usage"] = usage
+        self._resource_usage()
+        return authorization
 
     def _load(self, *, preflight_tracing: bool = False) -> None:
         """Load state for a locked mutation, recovering only a truly ownerless call."""
@@ -1155,6 +1397,22 @@ class Orchestrator:
                 preflight_langfuse_tracing()
             except LangfusePreflightError as exc:
                 raise WorkflowError(str(exc)) from exc
+
+        active_runtime_start = self.state.pop("workflow_active_started_at", None)
+        if active_runtime_start is not None:
+            usage = self._resource_usage()
+            elapsed = 0.0
+            if self.state.get("status") == "running":
+                try:
+                    started_at = datetime.fromisoformat(str(active_runtime_start).replace("Z", "+00:00"))
+                    elapsed = max(0.0, (datetime.now(timezone.utc) - started_at).total_seconds())
+                except (TypeError, ValueError):
+                    # An invalid persisted start time cannot safely grant a fresh runtime allowance.
+                    elapsed = float(self._execution_limits()["workflow_timeout_seconds"])
+            usage["workflow_runtime_seconds"] = round(
+                float(usage.get("workflow_runtime_seconds", 0.0)) + elapsed, 3,
+            )
+            self._save()
 
         active_operation = self._operation(self.state.get("active_operation_id"))
         if active_operation is None:
@@ -1191,6 +1449,7 @@ class Orchestrator:
                             context["call_state"] = "not_started"
                             context["error"] = active_operation["outcome"]
                             break
+                self._record_operation_runtime(active_operation, 0)
                 self._save()
             else:
                 self._require_recovery(
@@ -1248,6 +1507,157 @@ class Orchestrator:
             raise WorkflowError("Saved proposal is empty.")
         return clean_markdown(proposal)
 
+    def _write_proposal(self, proposal: str) -> None:
+        _atomic_text(self.proposal_path, proposal)
+        content = _persistence.read_bytes(self.proposal_path)
+        digest = hashlib.sha256(content).hexdigest()
+        version = str(self.state.get("proposal_version", 1))
+        self.state.setdefault("proposal_version_hashes", {})[version] = digest
+        self.state["proposal_artifact_sha256"] = digest
+
+    def _record_review_snapshot(self, campaign: dict, review_diff: ReviewDiff, *, purpose: str) -> dict:
+        current_review_diff = _review_diff(self.state, self.target)
+        if _ReviewCampaign._campaign_source_hash(current_review_diff) != _ReviewCampaign._campaign_source_hash(review_diff):
+            raise WorkflowError("Target code changed while the review was running; review provenance is inconclusive.")
+        fingerprint = self._fingerprint_repository(self.target)
+        if fingerprint.get("status") != "captured":
+            raise WorkflowError("Could not capture the target fingerprint for review provenance.")
+        source_hash = _ReviewCampaign._campaign_source_hash(review_diff)
+        if campaign.get("source_patch_sha256") != source_hash:
+            raise WorkflowError("Review provenance does not match the completed review campaign source.")
+        proposal_bytes = _persistence.read_bytes(self.proposal_path)
+        proposal_hash = hashlib.sha256(proposal_bytes).hexdigest()
+        version_hashes = self.state.get("proposal_version_hashes", {})
+        expected_proposal_hash = self.state.get("proposal_artifact_sha256")
+        version_hash = version_hashes.get(str(self.state.get("proposal_version"))) if isinstance(version_hashes, dict) else None
+        if expected_proposal_hash is None and version_hash is None:
+            if self._read_proposal() != clean_markdown(self.state.get("proposal", "")):
+                raise WorkflowError("Review provenance cannot be recorded because the approved proposal changed.")
+            version_hashes = self.state.setdefault("proposal_version_hashes", {})
+            version_hashes[str(self.state.get("proposal_version", 1))] = proposal_hash
+            self.state["proposal_artifact_sha256"] = proposal_hash
+            expected_proposal_hash = proposal_hash
+            version_hash = proposal_hash
+            self._save()
+        if (proposal_hash != expected_proposal_hash or proposal_hash != version_hash
+                or self._read_proposal() != clean_markdown(self.state.get("proposal", ""))):
+            raise WorkflowError("Review provenance cannot be recorded because the proposal changed during review.")
+        report_bundle = {
+            "campaign": {
+                "consolidated_report": campaign.get("consolidated_report"),
+                "part_reviews": [
+                    {"part_id": item.get("part_id"), "report": item.get("report"), "status": item.get("status")}
+                    for item in campaign.get("part_reviews", []) if isinstance(item, dict)
+                ],
+                "integration_review": campaign.get("integration_review"),
+            },
+            "code_review": self.state.get("code_review"),
+            "verification_report": self.state.get("verification_report"),
+        }
+        report_bytes = json.dumps(
+            report_bundle, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")
+        record = {
+            "purpose": purpose,
+            "campaign_id": campaign.get("campaign_id"),
+            "proposal_version": self.state.get("proposal_version"),
+            "proposal_sha256": proposal_hash,
+            "source_patch_sha256": source_hash,
+            "target_commit_sha": fingerprint.get("commit_sha"),
+            "target_working_tree_sha256": fingerprint.get("working_tree_sha256"),
+            "review_reports_sha256": hashlib.sha256(report_bytes).hexdigest(),
+            "implementation_summary_sha256": hashlib.sha256(
+                str(self.state.get("implementation_summary") or "").encode("utf-8"),
+            ).hexdigest(),
+            "correction_summary_sha256": hashlib.sha256(
+                str(self.state.get("correction_summary") or "").encode("utf-8"),
+            ).hexdigest(),
+            "captured_at": fingerprint.get("captured_at"),
+        }
+        if purpose == "verification":
+            attempts = self.state.get("correction_attempts", [])
+            attempt = attempts[-1] if isinstance(attempts, list) and attempts and isinstance(attempts[-1], dict) else {}
+            record["correction_attempt"] = attempt.get("attempt")
+            record["original_campaign_id"] = attempt.get("original_campaign_id")
+        integrity = self.state.setdefault("integrity", {})
+        integrity.setdefault("review_evidence_history", []).append(record)
+        integrity["review_evidence"] = record
+        return record
+
+    def _verify_delivery_integrity(self) -> dict:
+        integrity = self.state.get("integrity")
+        evidence = integrity.get("review_evidence") if isinstance(integrity, dict) else None
+        if not isinstance(evidence, dict):
+            raise WorkflowError("Delivery is blocked because no completed review provenance was recorded.")
+        correction_attempts = self.state.get("correction_attempts", [])
+        expected_purpose = "verification" if correction_attempts else "initial"
+        if evidence.get("purpose") != expected_purpose:
+            raise WorkflowError("Delivery is blocked because the final review does not verify the corrected source.")
+        if correction_attempts:
+            verification = integrity.get("verification_result") if isinstance(integrity, dict) else None
+            if (not isinstance(verification, dict) or verification.get("status") != "verified"
+                    or verification.get("campaign_id") != evidence.get("campaign_id")
+                    or not isinstance(verification.get("original_finding_dispositions"), dict)
+                    or not verification.get("original_finding_dispositions")):
+                raise WorkflowError("Delivery is blocked because post-correction verification is incomplete.")
+        try:
+            proposal_bytes = _persistence.read_bytes(self.proposal_path)
+        except OSError as exc:
+            raise WorkflowError("Delivery is blocked because the saved proposal is missing or unreadable.") from exc
+        proposal_hash = hashlib.sha256(proposal_bytes).hexdigest()
+        expected_proposal_hash = self.state.get("proposal_artifact_sha256")
+        version_hashes = self.state.get("proposal_version_hashes", {})
+        version_hash = version_hashes.get(str(self.state.get("proposal_version"))) if isinstance(version_hashes, dict) else None
+        if (not isinstance(expected_proposal_hash, str) or proposal_hash != expected_proposal_hash
+                or proposal_hash != version_hash
+                or self._read_proposal() != clean_markdown(self.state.get("proposal", ""))):
+            raise WorkflowError("Delivery is blocked because the saved proposal changed after review.")
+        campaign = self.state.get("review_campaign")
+        report_bundle = {
+            "campaign": {
+                "consolidated_report": campaign.get("consolidated_report") if isinstance(campaign, dict) else None,
+                "part_reviews": [
+                    {"part_id": item.get("part_id"), "report": item.get("report"), "status": item.get("status")}
+                    for item in campaign.get("part_reviews", [])
+                    if isinstance(item, dict)
+                ] if isinstance(campaign, dict) else [],
+                "integration_review": campaign.get("integration_review") if isinstance(campaign, dict) else None,
+            },
+            "code_review": self.state.get("code_review"),
+            "verification_report": self.state.get("verification_report"),
+        }
+        report_bytes = json.dumps(
+            report_bundle, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")
+        if hashlib.sha256(report_bytes).hexdigest() != evidence.get("review_reports_sha256"):
+            raise WorkflowError("Delivery is blocked because the final review evidence changed after verification.")
+        if (hashlib.sha256(str(self.state.get("implementation_summary") or "").encode("utf-8")).hexdigest()
+                != evidence.get("implementation_summary_sha256")
+                or hashlib.sha256(str(self.state.get("correction_summary") or "").encode("utf-8")).hexdigest()
+                != evidence.get("correction_summary_sha256")):
+            raise WorkflowError("Delivery is blocked because implementation or correction evidence changed after verification.")
+        current_diff = _review_diff(self.state, self.target)
+        current_patch_hash = _ReviewCampaign._campaign_source_hash(current_diff)
+        if current_patch_hash != evidence.get("source_patch_sha256"):
+            raise WorkflowError("Delivery is blocked because target code changed after its final review.")
+        current_fingerprint = self._fingerprint_repository(self.target)
+        if (current_fingerprint.get("status") != "captured"
+                or current_fingerprint.get("commit_sha") != evidence.get("target_commit_sha")
+                or current_fingerprint.get("working_tree_sha256") != evidence.get("target_working_tree_sha256")):
+            raise WorkflowError("Delivery is blocked because the target fingerprint changed after its final review.")
+        result = {
+            "status": "verified",
+            "checked_at": now(),
+            "proposal_sha256": proposal_hash,
+            "proposal_version": self.state.get("proposal_version"),
+            "source_patch_sha256": current_patch_hash,
+            "target_commit_sha": current_fingerprint["commit_sha"],
+            "target_working_tree_sha256": current_fingerprint["working_tree_sha256"],
+            "review_campaign_id": evidence.get("campaign_id"),
+        }
+        integrity["delivery_verification"] = result
+        return result
+
     def start(self) -> dict:
         return self._execute_locked(self._start_locked)
 
@@ -1299,6 +1709,10 @@ class Orchestrator:
             "authorization": new_workflow_authorization(
                 self.target, self.workflow_id, float(budget), self.max_code_review_calls,
                 tracing_enabled=self.tracing_enabled,
+                max_codex_calls=self.max_codex_calls,
+                codex_timeout_seconds=self.timeout_seconds,
+                claude_timeout_seconds=self.claude_timeout_seconds,
+                workflow_timeout_seconds=self.workflow_timeout_seconds,
             ),
             "plan_reviews": [],
             "claude_contexts": [],
@@ -1315,6 +1729,14 @@ class Orchestrator:
             "operation_tracking_version": 1,
             "operation_history": [],
             "active_operation_id": None,
+            "resource_usage": {
+                "codex_calls": 0,
+                "claude_calls": 0,
+                "provider_runtime_seconds": 0.0,
+                "workflow_runtime_seconds": 0.0,
+                "correction_attempts": 0,
+            },
+            "correction_attempts": [],
             "recovery": None,
         }
         self._save()
@@ -1432,6 +1854,8 @@ class Orchestrator:
         if self.state.get("status") == "awaiting_approval":
             return self.state
         if self.state.get("status") == "complete":
+            self._verify_delivery_integrity()
+            self._verify_delivery_artifact_hash()
             return self.state
         if self.state.get("status") == "recovery_required":
             self._resolve_recovery(
@@ -1450,7 +1874,7 @@ class Orchestrator:
             raise WorkflowError("No recovery action is pending for this workflow.")
         authorization = validate_workflow_authorization(self.state, self.target, self.workflow_id)
         if (authorization["claude_aily"]["budget_unknown"]
-                and self.state.get("stage", "").startswith(("plan_review", "code_review"))):
+                and self.state.get("stage", "").startswith(("plan_review", "code_review", "verification"))):
             raise WorkflowError(self.state.get("error") or "Claude review stopped because spend is unknown.")
         self._begin_execution_trace("resume")
         self.state["status"] = "running"
@@ -1554,7 +1978,40 @@ class Orchestrator:
         recovery = self.state.get("recovery")
         if isinstance(recovery, dict):
             recovery["target_changes"] = self._target_change_inventory()
+            operation = self._operation(recovery.get("operation_id"))
+            process_id = operation.get("process_id") if isinstance(operation, dict) else None
+            if isinstance(process_id, int) and not isinstance(process_id, bool) and process_id > 0:
+                try:
+                    os.kill(process_id, 0)
+                except ProcessLookupError:
+                    recovery["process_presence"] = "not_running"
+                except PermissionError:
+                    recovery["process_presence"] = "present_unverified"
+                except OSError:
+                    recovery["process_presence"] = "unknown"
+                else:
+                    recovery["process_presence"] = "present_unverified"
+        if self.state.get("status") == "complete":
+            integrity = self.state.setdefault("integrity", {})
+            try:
+                self._verify_delivery_integrity()
+                self._verify_delivery_artifact_hash()
+            except WorkflowError as exc:
+                integrity["delivery_artifact_status"] = "integrity_failure"
+                integrity["delivery_artifact_error"] = redact(str(exc))
+            else:
+                integrity["delivery_artifact_status"] = "verified"
         return self.state
+
+    def _verify_delivery_artifact_hash(self) -> None:
+        integrity = self.state.get("integrity")
+        expected = integrity.get("delivery_artifact_sha256") if isinstance(integrity, dict) else None
+        try:
+            actual = hashlib.sha256(_persistence.read_bytes(self.delivery_path)).hexdigest()
+        except OSError as exc:
+            raise WorkflowError("The delivered report is missing or unreadable.") from exc
+        if not isinstance(expected, str) or actual != expected:
+            raise WorkflowError("The delivered report changed after the workflow completed.")
 
     def _run_codex(self, prompt: str, *, sandbox: str) -> str:
         metadata = {"provider": "codex", "operation": "codex_execution", "sandbox": sandbox}
@@ -1638,22 +2095,27 @@ class Orchestrator:
             process = subprocess.Popen(
                 command,
                 stdin=subprocess.PIPE if input_data is not None else kwargs.pop("stdin", None),
+                **_process_control.process_group_options(),
                 **kwargs,
             )
             try:
                 self._operation_process_started(operation_id, process.pid)
             except BaseException:
-                process.kill()
+                _process_control.terminate_process_group(process)
                 process.communicate()
                 raise
             try:
                 stdout, stderr = process.communicate(input=input_data, timeout=timeout)
             except subprocess.TimeoutExpired as exc:
-                process.kill()
+                _process_control.terminate_process_group(process)
                 stdout, stderr = process.communicate()
                 raise subprocess.TimeoutExpired(
                     command, timeout, output=stdout, stderr=stderr,
                 ) from exc
+            except KeyboardInterrupt:
+                _process_control.terminate_process_group(process)
+                process.communicate()
+                raise
             result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
             if check and result.returncode:
                 raise subprocess.CalledProcessError(result.returncode, command, output=stdout, stderr=stderr)
@@ -1714,6 +2176,12 @@ class Orchestrator:
                     raise WorkflowError("Codex result recovery is ambiguous; inspect the workflow status.")
                 return prior["result_text"]
 
+            usage = self._resource_usage()
+            limits = self._execution_limits()
+            if usage["codex_calls"] >= limits["max_codex_calls"]:
+                raise WorkflowError("The authorized Codex invocation limit is exhausted.")
+            call_timeout = self._provider_timeout("codex")
+
             cli_version = self._codex_cli_version()
             operation = self._new_operation(
                 "codex",
@@ -1726,6 +2194,7 @@ class Orchestrator:
                 cli_version_source="codex --version" if cli_version is not None else "unavailable",
                 input_characters=len(effective_prompt),
                 input_bytes=len(effective_prompt_bytes),
+                timeout_seconds=call_timeout,
                 attempt=1 + sum(
                     item.get("operation_type") == "codex" and item.get("stage") == stage
                     for item in self.state.get("operation_history", [])
@@ -1745,7 +2214,7 @@ class Orchestrator:
                     input=effective_prompt_bytes,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    timeout=self.timeout_seconds,
+                    timeout=call_timeout,
                     check=False,
                     env=_git_env(),
                 )
@@ -1767,10 +2236,37 @@ class Orchestrator:
                 })
                 self._finish_operation(
                     operation["operation_id"], status="interrupted",
-                    outcome=f"Codex timed out after {self.timeout_seconds} seconds; target changes require inspection.",
+                    outcome=f"Codex timed out after {call_timeout:g} seconds; target changes require inspection.",
                     error_category=type(exc).__name__, evidence=stream_evidence,
                 )
-                raise WorkflowError(f"Codex timed out after {self.timeout_seconds} seconds.") from exc
+                raise WorkflowError(f"Codex timed out after {call_timeout:g} seconds.") from exc
+            except KeyboardInterrupt:
+                invocation_finished = time.monotonic()
+                not_launched = operation.get("launch_state") == "not_started"
+                stream_evidence = _codex_stream_evidence(
+                    None, None,
+                    stdout_status="not_started" if not_launched else "unavailable",
+                    stderr_status="not_started" if not_launched else "unavailable",
+                    stdout_truncated=False if not_launched else None,
+                    stderr_truncated=False if not_launched else None,
+                )
+                stream_evidence["duration_ms"] = max(0, round((invocation_finished - invocation_started) * 1000))
+                self._finish_operation(
+                    operation["operation_id"], status="failed" if not_launched else "interrupted",
+                    outcome=(
+                        "Codex invocation was cancelled before launch; it is safe to retry."
+                        if not_launched else "Codex invocation was cancelled; target changes require inspection."
+                    ),
+                    error_category="CancelledBeforeLaunch" if not_launched else "Cancelled",
+                    launch_state="not_started" if not_launched else None,
+                    evidence=stream_evidence,
+                )
+                if not not_launched:
+                    self._require_recovery(
+                        operation,
+                        "Codex was cancelled while running; inspect target changes before retrying.",
+                    )
+                raise
             except OSError as exc:
                 invocation_finished = time.monotonic()
                 stream_evidence = _codex_stream_evidence(
@@ -1924,7 +2420,12 @@ class Orchestrator:
         if stage.startswith("plan_review_") and len(self._valid_plan_reviews()) >= external["max_plan_reviews"]:
             raise WorkflowError("The authorized Claude plan-review limit is exhausted.")
         code_review_call_number = None
+        review_purpose = None
         if stage == "code_review":
+            current_campaign = self.state.get("review_campaign")
+            if (isinstance(current_campaign, dict)
+                    and current_campaign.get("campaign_id") == (metadata or {}).get("campaign_id")):
+                review_purpose = current_campaign.get("purpose", "initial")
             code_review_calls = [
                 context for context in self.state.get("claude_contexts", [])
                 if context.get("stage") == "code_review" and context.get("call_state") != "validation_failed"
@@ -1947,6 +2448,9 @@ class Orchestrator:
                 "Individual part reports" if (metadata or {}).get("review_kind") == "integration"
                 else "Complete patch"
             )
+            if review_purpose == "verification":
+                code_required.add("Post-correction verification")
+                code_required.add("Correction and validation summary (unverified agent claim)")
 
         required_sections = {
             "plan_review": {
@@ -2041,6 +2545,8 @@ class Orchestrator:
             ):
                 if (metadata or {}).get(key) is not None:
                     manifest[key] = (metadata or {})[key]
+            if review_purpose is not None:
+                manifest["review_purpose"] = review_purpose
             if code_review_call_number is not None:
                 manifest["campaign_call_number"] = code_review_call_number
             if error is not None:
@@ -2066,6 +2572,11 @@ class Orchestrator:
         remaining = float(remaining_amount.quantize(Decimal("0.01"), rounding=ROUND_DOWN))
         if remaining < 0.01:
             raise WorkflowError("The authorized Claude budget is exhausted.")
+        usage = self._resource_usage()
+        limits = self._execution_limits()
+        if usage["claude_calls"] >= limits["max_claude_calls"]:
+            raise WorkflowError("The authorized total Claude/Aily invocation limit is exhausted.")
+        call_timeout = self._provider_timeout("claude")
 
         manifest = context_manifest("submitted")
         manifest["submitted_at"] = now()
@@ -2080,6 +2591,8 @@ class Orchestrator:
             iteration=(metadata or {}).get("iteration"),
             proposal_version=(metadata or {}).get("proposal_version"),
             context_index=context_index,
+            timeout_seconds=call_timeout,
+            review_purpose=review_purpose,
         )
         manifest["operation_id"] = operation["operation_id"]
         operation["call_number"] = code_review_call_number
@@ -2093,14 +2606,17 @@ class Orchestrator:
         }
         self._save()
         self._operation_launching(operation["operation_id"])
+        invocation_started = time.monotonic()
         try:
             runner_kwargs = {"budget_usd": remaining, "executable": self.aily}
             if self.claude_runner is claude_reviewer.review:
+                runner_kwargs["timeout_seconds"] = call_timeout
                 runner_kwargs["process_started"] = lambda process_id: self._operation_process_started(
                     operation["operation_id"], process_id,
                 )
             result = self.claude_runner(prompt, **runner_kwargs)
         except claude_reviewer.ReviewError as exc:
+            duration_ms = max(0, round((time.monotonic() - invocation_started) * 1000))
             if exc.cost_usd is None:
                 external["budget_unknown"] = True
             else:
@@ -2113,10 +2629,25 @@ class Orchestrator:
             self._finish_operation(
                 operation["operation_id"], status=operation_status,
                 outcome=f"Claude invocation failed: {redact(str(exc))}",
-                error_category=type(exc).__name__, cost_usd=exc.cost_usd,
+                error_category=type(exc).__name__, cost_usd=exc.cost_usd, duration_ms=duration_ms,
             )
             raise WorkflowError(str(exc)) from exc
+        except KeyboardInterrupt:
+            duration_ms = max(0, round((time.monotonic() - invocation_started) * 1000))
+            external["budget_unknown"] = True
+            external["active_call"] = None
+            error = "Claude/Aily invocation was cancelled; provider outcome and final cost are unknown."
+            self.state["error"] = error
+            contexts[context_index]["call_state"] = "interrupted_unknown_cost"
+            contexts[context_index]["error"] = error
+            self._finish_operation(
+                operation["operation_id"], status="interrupted", outcome=error,
+                error_category="Cancelled", duration_ms=duration_ms,
+            )
+            self._require_recovery(operation, error)
+            raise
         except Exception as exc:
+            duration_ms = max(0, round((time.monotonic() - invocation_started) * 1000))
             external["budget_unknown"] = True
             external["active_call"] = None
             error = f"Claude invocation failed without recorded cost: {redact(str(exc))}"
@@ -2125,7 +2656,7 @@ class Orchestrator:
             contexts[context_index]["error"] = error
             self._finish_operation(
                 operation["operation_id"], status="unknown", outcome=error,
-                error_category=type(exc).__name__,
+                error_category=type(exc).__name__, duration_ms=duration_ms,
             )
             raise WorkflowError(error) from exc
         cost = result.cost_usd
@@ -2137,14 +2668,16 @@ class Orchestrator:
         contexts[context_index]["call_state"] = "completed"
         contexts[context_index]["cost_usd"] = cost
         contexts[context_index]["report"] = result.text
+        duration_ms = max(0, round((time.monotonic() - invocation_started) * 1000))
+        contexts[context_index]["duration_ms"] = duration_ms
         self._finish_operation(
             operation["operation_id"], status="completed", outcome="Claude returned a report.",
             result_sha256=hashlib.sha256(result.text.encode("utf-8")).hexdigest(),
-            cost_usd=cost, launch_state="completed",
+            cost_usd=cost, launch_state="completed", duration_ms=duration_ms,
         )
         return result.text, manifest
 
-    def _code_review_shared_context(self, review_diff: ReviewDiff) -> dict[str, str]:
+    def _code_review_shared_context(self, review_diff: ReviewDiff, *, purpose: str = "initial") -> dict[str, str]:
         guidance = self._guidance()
         directory_counts: dict[str, int] = {}
         contract_paths: list[str] = []
@@ -2164,7 +2697,7 @@ class Orchestrator:
             "Use the assignment, approved proposal, implementation summary, repository instructions, and individual "
             "reports to assess dependencies. Do not infer dependency direction from folder names alone."
         )
-        return {
+        shared = {
             "Assignment": self.state["task"],
             "Approved proposal": self.state["proposal"],
             "Implementation summary": self.state["implementation_summary"],
@@ -2187,6 +2720,47 @@ class Orchestrator:
                 "assignment; do not elevate style preferences or hypothetical concerns into findings."
             ),
         }
+        if purpose == "verification":
+            history = self.state.get("review_campaign_history", [])
+            initial = next((
+                campaign for campaign in reversed(history)
+                if isinstance(campaign, dict) and campaign.get("purpose") == "initial"
+            ), {})
+            original_reports = [
+                str(initial.get("consolidated_report") or self.state.get("code_review") or ""),
+                *(str(item.get("report") or "") for item in initial.get("part_reviews", [])
+                  if isinstance(item, dict)),
+            ]
+            integration = initial.get("integration_review")
+            if isinstance(integration, dict):
+                original_reports.append(str(integration.get("report") or ""))
+            original_findings = [
+                f"{item.get('part_id')}/{finding.get('id')}"
+                for item in _validated_campaign_reports(initial)
+                for finding in (item.get("validation") or {}).get("findings", [])
+                if str(finding.get("Severity", "")).casefold() == "must fix"
+            ]
+            shared["Post-correction verification"] = (
+                "Independently verify this actual resulting patch after the single authorized Codex correction. "
+                "For every original Must fix finding below, determine resolved, partially resolved, or unresolved and cite "
+                "current code or test evidence. Inspect for regressions in the affected scope. Do not treat the "
+                "correction summary as proof. An unresolved original Must fix finding, a new Must fix finding, an "
+                "incomplete report, or inconclusive evidence blocks delivery.\n\nOriginal independent review reports:\n\n"
+                + "\n\n--- Original review report ---\n\n".join(
+                    report for report in original_reports if report.strip()
+                )
+                + "\n\nUnder Overall assessment, include exactly one disposition line for each original Must fix identifier "
+                "listed here, using this format: `- part-000001/F1: Resolved — <specific current-code or test evidence>`. "
+                "Use `Partially resolved` or `Unresolved` when appropriate. Do not omit, duplicate, or rename an "
+                "identifier. Original Must fix identifiers requiring disposition: "
+                + (", ".join(sorted(set(original_findings))) if original_findings else "none; explain why no blocking finding exists")
+            )
+            shared["Correction and validation summary (unverified agent claim)"] = (
+                "The following is Codex's report of what it changed and which checks it says it ran. Treat it as a "
+                "claim to compare with the actual resulting patch and visible test changes; it is not independent "
+                "proof that commands succeeded.\n\n" + str(self.state.get("correction_summary") or "No summary recorded.")
+            )
+        return shared
 
 
     def _review_campaign(self) -> _ReviewCampaign:
@@ -2202,7 +2776,21 @@ class Orchestrator:
 
     def _review_call_count_authorized(self, required_calls: int) -> bool:
         limit = self.state["authorization"]["claude_aily"]["max_code_reviews"]
-        return required_calls <= limit
+        used = sum(
+            isinstance(context, dict) and context.get("stage") == "code_review"
+            and context.get("call_state") != "validation_failed"
+            for context in self.state.get("claude_contexts", [])
+        )
+        campaign = self.state.get("review_campaign")
+        campaign_id = campaign.get("campaign_id") if isinstance(campaign, dict) else None
+        current_campaign_calls = sum(
+            isinstance(context, dict) and context.get("stage") == "code_review"
+            and context.get("campaign_id") == campaign_id
+            and context.get("call_state") != "validation_failed"
+            for context in self.state.get("claude_contexts", [])
+        )
+        required_remaining = max(0, required_calls - current_campaign_calls)
+        return used + required_remaining <= limit
 
     @staticmethod
     def _campaign_helper(call):
@@ -2261,11 +2849,19 @@ class Orchestrator:
     def _campaign_part_manifest(parts: list[dict]) -> list[dict]:
         return _ReviewCampaign._campaign_part_manifest(parts)
 
-    def _prepare_review_campaign(self, review_diff: ReviewDiff) -> tuple[dict, dict[str, str], list[dict]]:
-        shared = self._code_review_shared_context(review_diff)
-        return self._campaign_helper(
+    def _prepare_review_campaign(
+        self, review_diff: ReviewDiff, *, purpose: str = "initial",
+    ) -> tuple[dict, dict[str, str], list[dict]]:
+        shared = self._code_review_shared_context(review_diff, purpose=purpose)
+        campaign, shared, parts = self._campaign_helper(
             lambda: self._review_campaign()._prepare_review_campaign(review_diff, shared),
         )
+        saved_purpose = campaign.get("purpose")
+        if saved_purpose is not None and saved_purpose != purpose:
+            raise WorkflowError("Saved review campaign purpose changed during recovery.")
+        campaign["purpose"] = purpose
+        self._save()
+        return campaign, shared, parts
 
     def _sync_review_coverage(self, campaign: dict, review_diff: ReviewDiff) -> None:
         self._campaign_helper(lambda: self._review_campaign()._sync_review_coverage(campaign, review_diff))
@@ -2325,6 +2921,13 @@ class Orchestrator:
     def run_pending(self) -> dict:
         if not self._process_lock_held:
             raise WorkflowError("Workflow execution requires the workflow process lock.")
+        self._begin_workflow_runtime()
+        try:
+            return self._run_pending_stages()
+        finally:
+            self._finish_workflow_runtime()
+
+    def _run_pending_stages(self) -> dict:
         while self.state.get("status") == "running":
             stage = self.state["stage"]
             stage_label = stage if isinstance(stage, str) and stage in TRACE_STAGES else "unknown"
@@ -2332,6 +2935,8 @@ class Orchestrator:
             stage_context = self._trace_span("workflow.stage", {"stage": stage_label})
             stage_context.__enter__()
             try:
+                if self._workflow_runtime_remaining() <= 0:
+                    raise WorkflowError("The authorized workflow execution-time limit is exhausted.")
                 if stage == "planning":
                     guidance = self._guidance()
                     skill_guidance = _guidance_for_codex(
@@ -2355,7 +2960,7 @@ class Orchestrator:
                     proposal = clean_markdown(self._run_codex(prompt, sandbox="read-only"))
                     self.state["proposal"] = proposal
                     self.state["proposal_version"] = 1
-                    _atomic_text(self.proposal_path, proposal)
+                    self._write_proposal(proposal)
                     self.state["stage"] = "plan_review_1"
                     self._save()
                 elif stage in {"plan_review_1", "plan_review_2"}:
@@ -2436,7 +3041,7 @@ class Orchestrator:
                         "proposal_version": self.state["proposal_version"],
                         "dispositions": dispositions,
                     })
-                    _atomic_text(self.proposal_path, proposal)
+                    self._write_proposal(proposal)
                     if iteration == 1 and review_again:
                         self.state["stage"] = "plan_review_2"
                     else:
@@ -2464,7 +3069,7 @@ class Orchestrator:
                     )
                     self.state["proposal"] = clean_markdown(self._run_codex(prompt, sandbox="read-only"))
                     self.state["proposal_version"] = int(self.state.get("proposal_version", 1)) + 1
-                    _atomic_text(self.proposal_path, self.state["proposal"])
+                    self._write_proposal(self.state["proposal"])
                     authorized_plan_limit = self.state["authorization"]["claude_aily"]["max_plan_reviews"]
                     valid_reviews = self._valid_plan_reviews()
                     if len(valid_reviews) < authorized_plan_limit:
@@ -2501,7 +3106,8 @@ class Orchestrator:
                     self.state["implementation_summary"] = self._run_codex(prompt, sandbox="workspace-write")
                     self.state["stage"] = "code_review"
                     self._save()
-                elif stage == "code_review":
+                elif stage in {"code_review", "verification"}:
+                    purpose = "verification" if stage == "verification" else "initial"
                     review_diff = _review_diff(self.state, self.target)
                     if not review_diff.included_paths:
                         self.state["review_included_files"] = []
@@ -2517,7 +3123,7 @@ class Orchestrator:
                         detail = f"No reviewable text changes were found. Excluded changed files: {reasons or 'none'}"
                         raise WorkflowError(detail)
                     try:
-                        campaign, shared, parts = self._prepare_review_campaign(review_diff)
+                        campaign, shared, parts = self._prepare_review_campaign(review_diff, purpose=purpose)
                     except WorkflowError as exc:
                         if not self.state.get("review_campaign"):
                             self.state["review_included_files"] = list(review_diff.included_paths)
@@ -2531,18 +3137,81 @@ class Orchestrator:
                             ]
                             self._save()
                         raise
-                    self.state["code_review"] = self._run_review_campaign(
+                    report = self._run_review_campaign(
                         campaign, shared, parts, review_diff,
                     )
-                    self.state["code_review_context_sha256"] = campaign.get("shared_context_sha256")
+                    campaign["purpose"] = purpose
+                    if purpose == "verification":
+                        self.state["verification_report"] = report
+                    else:
+                        self.state["code_review"] = report
+                    if purpose == "verification":
+                        self.state["verification_context_sha256"] = campaign.get("shared_context_sha256")
+                    else:
+                        self.state["code_review_context_sha256"] = campaign.get("shared_context_sha256")
                     review_evidence = "\n\n".join([
-                        self.state["code_review"],
+                        report,
                         *(record.get("report", "") for record in campaign.get("part_reviews", [])),
                     ])
-                    if _clearly_no_review_findings(review_evidence):
+                    if campaign.get("status") != "complete" or campaign.get("files_not_reviewed"):
+                        raise WorkflowError("Review did not complete all required files and parts; delivery is blocked.")
+                    no_blocking_findings = _clearly_no_review_findings(review_evidence)
+                    if purpose == "initial" and no_blocking_findings:
                         self.state["correction_summary"] = (
                             "Claude reported no acceptance-blocking findings; no correction run was needed."
                         )
+                    verification_dispositions = None
+                    if purpose == "verification" and no_blocking_findings:
+                        history = self.state.get("review_campaign_history", [])
+                        original_campaign = next((
+                            item for item in reversed(history)
+                            if isinstance(item, dict) and item.get("purpose") == "initial"
+                        ), {})
+                        verification_dispositions, disposition_error = _post_correction_dispositions(
+                            original_campaign, campaign,
+                        )
+                        if disposition_error is not None:
+                            self.state.setdefault("integrity", {})["verification_result"] = {
+                                "status": "failed",
+                                "campaign_id": campaign.get("campaign_id"),
+                                "checked_at": now(),
+                                "report_sha256": hashlib.sha256(report.encode("utf-8")).hexdigest(),
+                                "finding": disposition_error,
+                            }
+                            self._save()
+                            raise WorkflowError(
+                                "Independent post-correction verification is inconclusive; delivery is blocked. "
+                                + disposition_error
+                            )
+                    self._record_review_snapshot(campaign, review_diff, purpose=purpose)
+                    if purpose == "verification":
+                        integrity = self.state.setdefault("integrity", {})
+                        if no_blocking_findings:
+                            integrity["verification_result"] = {
+                                "status": "verified",
+                                "campaign_id": campaign.get("campaign_id"),
+                                "original_campaign_id": (self.state.get("correction_attempts") or [{}])[-1].get(
+                                    "original_campaign_id",
+                                ),
+                                "checked_at": now(),
+                                "report_sha256": hashlib.sha256(report.encode("utf-8")).hexdigest(),
+                                "finding": "No unresolved blocking findings were reported.",
+                                "original_finding_dispositions": verification_dispositions,
+                            }
+                            self.state["stage"] = "complete"
+                        else:
+                            integrity["verification_result"] = {
+                                "status": "failed",
+                                "campaign_id": campaign.get("campaign_id"),
+                                "checked_at": now(),
+                                "report_sha256": hashlib.sha256(report.encode("utf-8")).hexdigest(),
+                                "finding": "The independent verification reports unresolved or new blocking findings.",
+                            }
+                            self._save()
+                            raise WorkflowError(
+                                "Independent post-correction verification found unresolved or new blocking findings; delivery is blocked."
+                            )
+                    elif no_blocking_findings:
                         self.state["stage"] = "complete"
                     else:
                         self.state["stage"] = "correction"
@@ -2550,6 +3219,36 @@ class Orchestrator:
                 elif stage == "correction":
                     guidance = self._guidance()
                     campaign = self.state.get("review_campaign") or {}
+                    if campaign.get("status") != "complete":
+                        raise WorkflowError("Correction is blocked because the initial review campaign is incomplete.")
+                    external = self.state["authorization"]["claude_aily"]
+                    if external.get("budget_unknown") is True:
+                        raise WorkflowError("Correction is blocked because Claude spend is unknown and verification cannot be authorized safely.")
+                    limits = self._execution_limits()
+                    usage = self._resource_usage()
+                    remaining_claude_calls = limits["max_claude_calls"] - usage["claude_calls"]
+                    minimum_verification_calls = max(1, int(campaign.get("required_calls", 1)))
+                    if remaining_claude_calls < minimum_verification_calls:
+                        raise WorkflowError(
+                            "Correction is blocked because the saved Claude call authorization cannot cover an independent verification campaign."
+                        )
+                    attempts = self.state.setdefault("correction_attempts", [])
+                    attempt = attempts[-1] if attempts and attempts[-1].get("status") == "in_progress" else None
+                    if attempt is None:
+                        if len(attempts) >= limits["max_correction_attempts"]:
+                            raise WorkflowError("The authorized Codex correction-attempt limit is exhausted.")
+                        attempt = {
+                            "attempt": len(attempts) + 1,
+                            "status": "in_progress",
+                            "started_at": now(),
+                            "original_campaign_id": campaign.get("campaign_id"),
+                            "original_report_sha256": hashlib.sha256(
+                                str(self.state.get("code_review") or "").encode("utf-8"),
+                            ).hexdigest(),
+                        }
+                        attempts.append(attempt)
+                        usage["correction_attempts"] += 1
+                        self._save()
                     individual_reports = "\n\n".join(
                         f"### {record.get('part_id')}\n{record.get('report', '')}"
                         for record in campaign.get("part_reviews", []) if record.get("report")
@@ -2577,16 +3276,88 @@ class Orchestrator:
                         f"Prior implementation summary:\n{self.state['implementation_summary']}"
                     )
                     self.state["correction_summary"] = self._run_codex(prompt, sandbox="workspace-write")
-                    self.state["stage"] = "complete"
+                    attempt["status"] = "completed"
+                    attempt["finished_at"] = now()
+                    attempt["correction_summary_sha256"] = hashlib.sha256(
+                        self.state["correction_summary"].encode("utf-8"),
+                    ).hexdigest()
+                    campaign["purpose"] = "initial"
+                    campaign_history = self.state.setdefault("review_campaign_history", [])
+                    if not any(item.get("campaign_id") == campaign.get("campaign_id") for item in campaign_history):
+                        campaign_history.append(copy.deepcopy(campaign))
+                    self.state["review_campaign"] = None
+                    self.state["review_campaign_id"] = None
+                    self.state["verification_report"] = None
+                    self.state["stage"] = "verification"
                     self._save()
                 elif stage == "complete":
+                    delivery_verification = self._verify_delivery_integrity()
+                    self._capture_final_target_fingerprint()
+                    final_target = self.state.get("execution_fingerprint", {}).get("final", {}).get("target", {})
+                    if (final_target.get("status") != "captured"
+                            or final_target.get("commit_sha") != delivery_verification.get("target_commit_sha")
+                            or final_target.get("working_tree_sha256") != delivery_verification.get("target_working_tree_sha256")):
+                        raise WorkflowError("Delivery is blocked because the target changed during final integrity checks.")
                     self.state["status"] = "complete"
                     self.state["completed_at"] = now()
-                    self._capture_final_target_fingerprint()
                     _atomic_text(self.delivery_path, self._delivery_report())
+                    delivery_hash = hashlib.sha256(_persistence.read_bytes(self.delivery_path)).hexdigest()
+                    self.state.setdefault("integrity", {})["delivery_artifact_sha256"] = delivery_hash
                     self._save()
                 else:
                     raise WorkflowError(f"Unknown workflow stage: {stage}")
+            except KeyboardInterrupt:
+                if self.state.get("status") != "recovery_required":
+                    operation = self._operation(self.state.get("active_operation_id"))
+                    error = f"Workflow cancelled during stage {stage}; resume will retry only the saved stage."
+                    if operation is not None and operation.get("status") == "started":
+                        if operation.get("launch_state") == "not_started":
+                            operation.update({
+                                "status": "failed",
+                                "finished_at": now(),
+                                "outcome": "Workflow was cancelled before launching this external operation; safe to retry.",
+                                "error_category": "CancelledBeforeLaunch",
+                            })
+                            if self.state.get("active_operation_id") == operation.get("operation_id"):
+                                self.state["active_operation_id"] = None
+                            if operation.get("operation_type") == "claude":
+                                external = self.state.get("authorization", {}).get("claude_aily", {})
+                                active_call = external.get("active_call")
+                                if isinstance(active_call, dict) and active_call.get("operation_id") == operation.get("operation_id"):
+                                    external["active_call"] = None
+                                for context in reversed(self.state.get("claude_contexts", [])):
+                                    if context.get("operation_id") == operation.get("operation_id"):
+                                        context["call_state"] = "not_started"
+                                        context["error"] = operation["outcome"]
+                                        break
+                            self._record_operation_runtime(operation, 0)
+                            self.state["status"] = "failed"
+                            self.state["error"] = error
+                            self.state["cancellation"] = {"stage": stage, "cancelled_at": now(), "outcome": error}
+                            self._save()
+                        else:
+                            self.state["cancellation"] = {
+                                "stage": stage,
+                                "cancelled_at": now(),
+                                "outcome": "Process group was stopped locally; any accepted remote provider work may remain unknown.",
+                                "requires_recovery": True,
+                            }
+                            self._require_recovery(operation, error)
+                    else:
+                        self.state["status"] = "failed"
+                        self.state["error"] = error
+                        self.state["cancellation"] = {"stage": stage, "cancelled_at": now(), "outcome": error}
+                        self._capture_final_target_fingerprint()
+                        self._save()
+                else:
+                    self.state["cancellation"] = {
+                        "stage": stage,
+                        "cancelled_at": now(),
+                        "outcome": "The active provider operation was interrupted and requires recovery.",
+                        "requires_recovery": True,
+                    }
+                    self._save()
+                raise
             except Exception as exc:
                 self._fail(exc)
                 raise WorkflowError(f"Workflow stopped at {stage}: {redact(str(exc))}") from exc
@@ -2722,11 +3493,15 @@ class Orchestrator:
 
     def _delivery_report(self) -> str:
         campaign = self.state.get("review_campaign")
-        structured_review_feedback = ""
-        if campaign:
-            feedback_reports = _validated_campaign_reports(campaign)
-            if feedback_reports:
-                structured_review_feedback = render_review_feedback(feedback_reports)
+        campaigns = [
+            item for item in self.state.get("review_campaign_history", []) if isinstance(item, dict)
+        ] if isinstance(self.state.get("review_campaign_history"), list) else []
+        if isinstance(campaign, dict):
+            campaigns.append(campaign)
+        feedback_reports = [
+            report for item in campaigns for report in _validated_campaign_reports(item)
+        ]
+        structured_review_feedback = render_review_feedback(feedback_reports) if feedback_reports else ""
         return render_delivery_report(
             self.state,
             workflow_id=self.workflow_id,

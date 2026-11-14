@@ -1262,10 +1262,10 @@ class CodexInvocationEvidenceTests(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             self.run_locked(interrupted)
         interrupted_operation = interrupted.state["operation_history"][-1]
-        self.assertEqual(interrupted_operation["status"], "started")
+        self.assertEqual(interrupted_operation["status"], "interrupted")
         self.assertEqual(interrupted_operation["launch_state"], "launching")
-        self.assertEqual(interrupted_operation["stdout_capture_status"], "not_captured")
-        self.assertEqual(interrupted_operation["tool_event_coverage"], "not_captured")
+        self.assertEqual(interrupted_operation["stdout_capture_status"], "unavailable")
+        self.assertEqual(interrupted_operation["tool_event_coverage"], "unavailable")
 
     def test_process_exit_before_evidence_persistence_leaves_operation_unresolved(self):
         runner, _process = self.invoke(stdout=b'{"type":"turn.completed"}\n')
@@ -1418,9 +1418,9 @@ class CodexInvocationEvidenceTests(unittest.TestCase):
             self.fail("process interruption should propagate")
         interrupted_observations = self.export_trace(interrupted_tracer)
         interrupted_span = interrupted_observations[1]["metadata"]
-        self.assertEqual(interrupted_span["status"], "unknown")
-        self.assertEqual(interrupted_span["error_category"], "KeyboardInterrupt")
-        self.assertEqual(interrupted.state["operation_history"][-1]["status"], "started")
+        self.assertEqual(interrupted_span["status"], "interrupted")
+        self.assertEqual(interrupted_span["error_category"], "Cancelled")
+        self.assertEqual(interrupted.state["operation_history"][-1]["status"], "interrupted")
 
     def test_langfuse_export_failure_does_not_change_codex_result(self):
         runner, _process = self.invoke(stdout=b"safe stream", message=b"Success stays success")
@@ -1552,7 +1552,8 @@ class WorkflowTests(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 runner.start()
         state = json.loads(runner.state_path.read_text(encoding="utf-8"))
-        self.assertEqual(state["status"], "running")
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["cancellation"]["stage"], "planning")
         self.assertEqual(state["stage"], "planning")
         self.assertEqual(state["operation_history"], [])
 
@@ -1573,9 +1574,9 @@ class WorkflowTests(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 runner.start()
         persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
-        self.assertEqual(persisted["operation_history"][-1]["status"], "started")
+        self.assertEqual(persisted["operation_history"][-1]["status"], "failed")
         self.assertEqual(persisted["operation_history"][-1]["launch_state"], "not_started")
-        self.assertEqual(persisted["active_operation_id"], persisted["operation_history"][-1]["operation_id"])
+        self.assertIsNone(persisted["active_operation_id"])
 
         replacement = FakeCodex("# Proposal\nPlan.\n", self.refined())
         claude = FakeClaude(claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05))
@@ -1604,7 +1605,7 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             runner.start()
         persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
-        self.assertEqual(persisted["operation_history"][-1]["status"], "started")
+        self.assertEqual(persisted["operation_history"][-1]["status"], "interrupted")
         self.assertEqual(persisted["operation_history"][-1]["launch_state"], "launching")
 
         replacement = FakeCodex("# Proposal\nPlan.\n")
@@ -1640,7 +1641,7 @@ class WorkflowTests(unittest.TestCase):
         )
         persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
         operation = persisted["operation_history"][-1]
-        self.assertEqual(operation["status"], "started")
+        self.assertEqual(operation["status"], "interrupted")
         self.assertIsNone(operation["result_text"])
         replacement = FakeCodex("must not run")
         with self.assertRaisesRegex(orchestrator.WorkflowError, "requires recovery"):
@@ -1761,12 +1762,14 @@ class WorkflowTests(unittest.TestCase):
 
     def test_resume_rejects_while_another_process_holds_workflow_lock(self):
         runner, _codex, _claude = self.interrupted_implementation("lock-contention-recovery")
+        before = json.loads(runner.state_path.read_text(encoding="utf-8"))
         replacement = orchestrator.Orchestrator(self.target, workflow_id="lock-contention-recovery")
         with runner._workflow_lock():
             with self.assertRaisesRegex(orchestrator.WorkflowError, "already being modified"):
                 replacement.resume()
         state = json.loads(runner.state_path.read_text(encoding="utf-8"))
-        self.assertEqual(state["status"], "running")
+        self.assertEqual(state["status"], before["status"])
+        self.assertEqual(state["stage"], before["stage"])
 
     def test_running_workflow_without_active_operation_resumes_from_saved_stage(self):
         runner = orchestrator.Orchestrator(
@@ -1880,6 +1883,7 @@ class WorkflowTests(unittest.TestCase):
         state.pop("operation_tracking_version")
         state.pop("operation_history")
         state.pop("active_operation_id")
+        state["status"] = "running"
         runner.state_path.write_text(json.dumps(state), encoding="utf-8")
         with self.assertRaisesRegex(orchestrator.WorkflowError, "requires recovery"):
             orchestrator.Orchestrator(
@@ -1974,6 +1978,14 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(
             factory.call_args.kwargs["max_code_review_calls"], orchestrator.DEFAULT_MAX_CODE_REVIEW_CALLS,
         )
+        self.assertEqual(factory.call_args.kwargs["max_codex_calls"], orchestrator.DEFAULT_MAX_CODEX_CALLS)
+        self.assertEqual(factory.call_args.kwargs["timeout_seconds"], orchestrator.DEFAULT_CODEX_TIMEOUT_SECONDS)
+        self.assertEqual(
+            factory.call_args.kwargs["claude_timeout_seconds"], orchestrator.DEFAULT_CLAUDE_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            factory.call_args.kwargs["workflow_timeout_seconds"], orchestrator.DEFAULT_WORKFLOW_TIMEOUT_SECONDS,
+        )
         self.assertIn("Effective Claude/Aily budget: $2.00", output.getvalue())
         self.assertIn('"effective_budget_usd": 2.0', output.getvalue())
         self.assertIsNone(factory.call_args.kwargs["model"])
@@ -1996,13 +2008,92 @@ class WorkflowTests(unittest.TestCase):
                 result = orchestrator.main([
                     "start", "--target", str(self.target), "--task", "Add a feature",
                     "--budget-usd", "0.75", "--model", "codex-model-test",
-                    "--max-code-review-calls", "12",
+                    "--max-code-review-calls", "12", "--max-codex-calls", "5",
+                    "--codex-timeout-seconds", "300", "--claude-timeout-seconds", "120",
+                    "--workflow-timeout-seconds", "7200",
                 ])
         self.assertEqual(result, 0)
         self.assertEqual(factory.call_args.kwargs["budget_usd"], 0.75)
         self.assertEqual(factory.call_args.kwargs["model"], "codex-model-test")
         self.assertEqual(factory.call_args.kwargs["max_code_review_calls"], 12)
+        self.assertEqual(factory.call_args.kwargs["max_codex_calls"], 5)
+        self.assertEqual(factory.call_args.kwargs["timeout_seconds"], 300)
+        self.assertEqual(factory.call_args.kwargs["claude_timeout_seconds"], 120)
+        self.assertEqual(factory.call_args.kwargs["workflow_timeout_seconds"], 7200)
         self.assertIn("Effective Claude/Aily budget: $0.75", output.getvalue())
+
+    def test_codex_call_limit_is_persisted_and_stops_a_later_provider_call(self):
+        codex = FakeCodex("# Proposal\nPlan.\n")
+        claude = FakeClaude(claude_reviewer.ReviewResult("Plan looks good.", 0.05))
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add a feature", budget_usd=1.0, max_codex_calls=1,
+            workflow_id="codex-call-limit", process_runner=codex, claude_runner=claude,
+        )
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "Codex invocation limit is exhausted"):
+            runner.start()
+        persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["authorization"]["execution_limits"]["max_codex_calls"], 1)
+        self.assertEqual(persisted["resource_usage"]["codex_calls"], 1)
+        self.assertEqual(len(codex.commands), 1)
+
+    def test_total_claude_call_limit_persists_across_resume(self):
+        codex = FakeCodex("# Proposal\nPlan.\n")
+        failure = claude_reviewer.ReviewError("temporary reviewer error", cost_usd=0)
+        claude = FakeClaude(failure, failure, failure, failure)
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add a feature", budget_usd=1.0, max_code_review_calls=1,
+            workflow_id="claude-call-limit", process_runner=codex, claude_runner=claude,
+        )
+        for action in (runner.start, runner.resume, runner.resume):
+            with self.assertRaises(orchestrator.WorkflowError):
+                action()
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "total Claude/Aily invocation limit is exhausted"):
+            runner.resume()
+        persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["resource_usage"]["claude_calls"], 3)
+        self.assertEqual(len(claude.prompts), 3)
+
+    def test_workflow_runtime_limit_is_persisted_and_blocks_resume(self):
+        codex = FakeCodex("# Proposal\nPlan.\n", self.refined())
+        claude = FakeClaude(claude_reviewer.ReviewResult("Plan looks good.", 0.05))
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add a feature", budget_usd=1.0, workflow_timeout_seconds=3600,
+            workflow_id="workflow-runtime-limit", process_runner=codex, claude_runner=claude,
+        )
+        started = runner.start()
+        previous_runtime = started["resource_usage"]["workflow_runtime_seconds"]
+        saved = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        saved["resource_usage"]["workflow_runtime_seconds"] = 3600
+        runner.state_path.write_text(json.dumps(saved), encoding="utf-8")
+        replacement = FakeCodex("must not run")
+        resumed = orchestrator.Orchestrator(
+            self.target, workflow_id="workflow-runtime-limit", process_runner=replacement,
+            claude_runner=FakeClaude(),
+        )
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "execution-time limit is exhausted"):
+            resumed.approve()
+        persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["status"], "failed")
+        self.assertGreaterEqual(persisted["resource_usage"]["workflow_runtime_seconds"], 3600)
+        self.assertGreaterEqual(previous_runtime, 0)
+        self.assertEqual(replacement.commands, [])
+
+    def test_cli_summary_exposes_persisted_cancellation_and_integrity_outcomes(self):
+        output = StringIO()
+        state = {
+            "workflow_id": "guardrail-summary",
+            "status": "failed",
+            "stage": "verification",
+            "cancellation": {"stage": "verification", "requires_recovery": True},
+            "integrity": {"verification_result": {"status": "failed"}},
+        }
+
+        with redirect_stdout(output):
+            orchestrator._print_summary(state)
+
+        summary = json.loads(output.getvalue())
+        self.assertEqual(summary["cancellation"], state["cancellation"])
+        self.assertEqual(summary["integrity"], state["integrity"])
 
     def test_cli_dispatches_each_workflow_command_through_runner_methods(self):
         commands = (
@@ -2355,7 +2446,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(rejected["rejection_reason"], "Out of scope.")
         self.assertFalse(any("workspace-write" in command for command in codex.commands))
 
-    def test_code_findings_trigger_one_correction_without_a_review_loop(self):
+    def test_code_findings_trigger_one_correction_then_independent_verification(self):
         codex = FakeCodex(
             "# Proposal\nPlan.\n", self.refined(),
             "Implemented the feature.\nChecks passed.\n",
@@ -2365,6 +2456,11 @@ class WorkflowTests(unittest.TestCase):
             claude_reviewer.ReviewResult("Plan looks good.", 0.1),
             claude_reviewer.ReviewResult(
                 "Decision: CHANGES_REQUESTED\nFinding: Handle empty input in the new parser.", 0.2,
+            ),
+            claude_reviewer.ReviewResult(
+                "Decision: APPROVED\nOriginal finding dispositions:\n"
+                "- part-000001/F1: Resolved — current parser handles empty input and the changed tests cover it.",
+                0.2,
             ),
         )
         (self.target / "src").mkdir()
@@ -2381,12 +2477,198 @@ class WorkflowTests(unittest.TestCase):
             self.target, workflow_id="finding-flow", process_runner=codex, claude_runner=claude,
         ).approve()
         self.assertEqual(state["status"], "complete")
-        self.assertEqual(len(claude.prompts), 2)
+        self.assertEqual(len(claude.prompts), 3)
         self.assertEqual(len(codex.commands), 4)
         self.assertTrue(all(prompt.startswith("Persistent workflow authorization is already active")
                             for prompt in codex.prompts))
         self.assertIn("Handle empty input", codex.prompts[-1])
         self.assertIn("reran the unit tests", state["correction_summary"])
+        self.assertEqual(state["correction_attempts"][0]["status"], "completed")
+        self.assertEqual(len(state["review_campaign_history"]), 1)
+        self.assertEqual(state["review_campaign_history"][0]["purpose"], "initial")
+        self.assertEqual(state["review_campaign"]["purpose"], "verification")
+        self.assertEqual(state["integrity"]["verification_result"]["status"], "verified")
+        self.assertIn("Post-correction verification", claude.prompts[-1])
+        self.assertIn("Handle empty input", claude.prompts[-1])
+        self.assertEqual(
+            state["integrity"]["delivery_artifact_sha256"],
+            hashlib.sha256((runner.workflow_dir / "delivery.md").read_bytes()).hexdigest(),
+        )
+
+    def test_unresolved_verification_blocks_delivery_without_a_second_correction(self):
+        codex = FakeCodex(
+            "# Proposal\nPlan.\n", self.refined(), "Implemented the feature.\n",
+            "Attempted the correction but the finding remains.\n",
+        )
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Plan looks good.", 0.05),
+            response_factory=lambda prompt, *_args: claude_reviewer.ReviewResult(
+                "Decision: CHANGES_REQUESTED\nFinding: The empty-input defect remains."
+                if "Post-correction verification" not in prompt else
+                "Decision: CHANGES_REQUESTED\nFinding: The empty-input defect remains after correction.",
+                0.05,
+            ),
+        )
+        source = self.target / "src" / "parser.py"
+        codex.on_call = lambda index, _command, _kwargs: (
+            (source.parent.mkdir(parents=True, exist_ok=True), source.write_text("def parse(x): return x\n", encoding="utf-8"))
+            if index == 2 else None
+        )
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add robust parsing", budget_usd=1.0, workflow_id="failed-verification",
+            process_runner=codex, claude_runner=claude,
+        )
+        runner.start()
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "verification found unresolved"):
+            runner.approve()
+        persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["status"], "failed")
+        self.assertEqual(persisted["stage"], "verification")
+        self.assertEqual(persisted["integrity"]["verification_result"]["status"], "failed")
+        self.assertEqual(len(persisted["correction_attempts"]), 1)
+        self.assertEqual(len(codex.commands), 4)
+        self.assertFalse((runner.workflow_dir / "delivery.md").exists())
+
+    def test_approved_verification_without_original_finding_disposition_is_inconclusive(self):
+        codex = FakeCodex(
+            "# Proposal\nPlan.\n", self.refined(), "Implemented.\n", "Attempted correction.\n",
+        )
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Plan looks good.", 0.05),
+            claude_reviewer.ReviewResult("Decision: CHANGES_REQUESTED\nFinding: Handle empty input.", 0.05),
+            claude_reviewer.ReviewResult("Decision: APPROVED\nNo blocking findings remain.", 0.05),
+        )
+        source = self.target / "src" / "parser.py"
+
+        def write_source(index, _command, _kwargs):
+            if index == 2:
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_text("def parse(value): return value\n", encoding="utf-8")
+
+        codex.on_call = write_source
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add robust parsing", budget_usd=1.0,
+            workflow_id="verification-inconclusive", process_runner=codex, claude_runner=claude,
+        )
+        runner.start()
+
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "verification is inconclusive"):
+            orchestrator.Orchestrator(
+                self.target, workflow_id="verification-inconclusive",
+                process_runner=codex, claude_runner=claude,
+            ).approve()
+
+        saved = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(saved["integrity"]["verification_result"]["status"], "failed")
+        self.assertIn("missing dispositions", saved["integrity"]["verification_result"]["finding"])
+        self.assertFalse((runner.workflow_dir / "delivery.md").exists())
+
+    def test_verification_detects_a_new_blocking_regression_from_the_correction(self):
+        codex = FakeCodex(
+            "# Proposal\nPlan.\n", self.refined(),
+            "Implemented the feature.\n", "Corrected the original finding.\n",
+        )
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Plan looks good.", 0.05),
+            claude_reviewer.ReviewResult(
+                "Decision: CHANGES_REQUESTED\nFinding: Handle empty input.", 0.05,
+            ),
+            claude_reviewer.ReviewResult(
+                "Decision: CHANGES_REQUESTED\nFinding: The correction introduces an unsafe fallback.", 0.05,
+            ),
+        )
+        source = self.target / "src" / "parser.py"
+
+        def write_source(index, _command, _kwargs):
+            if index == 2:
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_text("def parse(value): return value\n", encoding="utf-8")
+            elif index == 3:
+                source.write_text("def parse(value): return unsafe_default if not value else value\n", encoding="utf-8")
+
+        codex.on_call = write_source
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add robust parsing", budget_usd=1.0,
+            workflow_id="verification-regression", process_runner=codex, claude_runner=claude,
+        )
+        runner.start()
+
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "verification found unresolved or new blocking findings"):
+            orchestrator.Orchestrator(
+                self.target, workflow_id="verification-regression",
+                process_runner=codex, claude_runner=claude,
+            ).approve()
+
+        saved = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(saved["stage"], "verification")
+        self.assertEqual(saved["integrity"]["verification_result"]["status"], "failed")
+        self.assertEqual(len(saved["correction_attempts"]), 1)
+        self.assertEqual(len(codex.commands), 4)
+        self.assertFalse((runner.workflow_dir / "delivery.md").exists())
+
+    def test_code_change_between_final_review_and_delivery_blocks_completion(self):
+        codex = FakeCodex("# Proposal\nPlan.\n", self.refined(), "Implemented.\n")
+        source = self.target / "src" / "feature.py"
+        def implement(index, _command, _kwargs):
+            if index == 2:
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_text("value = 1\n", encoding="utf-8")
+        codex.on_call = implement
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Plan looks good.", 0.05),
+            claude_reviewer.ReviewResult("Decision: APPROVED\nNo blocking findings.", 0.05),
+        )
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add a feature", budget_usd=1.0, workflow_id="changed-before-delivery",
+            process_runner=codex, claude_runner=claude,
+        )
+        runner.start()
+        approver = orchestrator.Orchestrator(
+            self.target, workflow_id="changed-before-delivery", process_runner=codex, claude_runner=claude,
+        )
+        verify = approver._verify_delivery_integrity
+        def mutate_then_verify():
+            source.write_text("value = 2\n", encoding="utf-8")
+            return verify()
+        approver._verify_delivery_integrity = mutate_then_verify
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "target code changed after its final review"):
+            approver.approve()
+        persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["status"], "failed")
+        self.assertFalse((runner.workflow_dir / "delivery.md").exists())
+
+    def test_proposal_change_between_review_and_delivery_blocks_completion(self):
+        codex = FakeCodex("# Proposal\nPlan.\n", self.refined(), "Implemented.\n")
+        source = self.target / "src" / "feature.py"
+        def implement(index, _command, _kwargs):
+            if index == 2:
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_text("value = 1\n", encoding="utf-8")
+        codex.on_call = implement
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Plan looks good.", 0.05),
+            claude_reviewer.ReviewResult("Decision: APPROVED\nNo blocking findings.", 0.05),
+        )
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add a feature", budget_usd=1.0, workflow_id="proposal-changed-before-delivery",
+            process_runner=codex, claude_runner=claude,
+        )
+        runner.start()
+        approver = orchestrator.Orchestrator(
+            self.target, workflow_id="proposal-changed-before-delivery", process_runner=codex, claude_runner=claude,
+        )
+        verify = approver._verify_delivery_integrity
+        def mutate_then_verify():
+            approver.proposal_path.write_text("# Tampered proposal\n", encoding="utf-8")
+            return verify()
+        approver._verify_delivery_integrity = mutate_then_verify
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "saved proposal changed after review"):
+            approver.approve()
+        persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["status"], "failed")
+        self.assertFalse((runner.workflow_dir / "delivery.md").exists())
 
     def test_code_review_context_records_exclusions_and_preserves_all_relevant_files(self):
         metadata = self.target / ".DS_Store"
@@ -3042,6 +3324,13 @@ class WorkflowTests(unittest.TestCase):
             orchestrator._print_summary(state)
         self.assertIn("code_review_feedback", output.getvalue())
         self.assertIn("Original reviewer reports", output.getvalue())
+        delivery_path = runner.workflow_dir / "delivery.md"
+        delivery_path.write_text(delivery_path.read_text(encoding="utf-8") + "tampered\n", encoding="utf-8")
+        status = orchestrator.Orchestrator(self.target, workflow_id="optional-review").status()
+        self.assertEqual(status["integrity"]["delivery_artifact_status"], "integrity_failure")
+        delivery_path.unlink()
+        missing = orchestrator.Orchestrator(self.target, workflow_id="optional-review").status()
+        self.assertEqual(missing["integrity"]["delivery_artifact_status"], "integrity_failure")
 
     def test_legacy_authorization_can_call_claude_without_skill_bodies(self):
         codex = FakeCodex("# Proposal\nAdd the requested behavior.\n", self.refined())
@@ -3777,8 +4066,13 @@ class WorkflowTests(unittest.TestCase):
         )
         claude = FakeClaude(
             claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05),
-            response_factory=lambda *_args: claude_reviewer.ReviewResult(
-                "Decision: CHANGES_REQUESTED\nFinding: Handle empty input in the parser.", 0.05,
+            response_factory=lambda prompt, *_args: claude_reviewer.ReviewResult(
+                "Decision: APPROVED\nOriginal finding dispositions:\n"
+                "- part-000001/F1: Resolved — current parser and tests show the defect is fixed.\n"
+                "No blocking regressions remain."
+                if "Post-correction verification" in prompt else
+                "Decision: CHANGES_REQUESTED\nFinding: Handle empty input in the parser.",
+                0.05,
             ),
         )
 
@@ -3821,6 +4115,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("Compare the actual change with the assignment and existing contracts.", claude.prompts[1])
         self.assertIn("Make the smallest cohesive change that satisfies the assignment", claude.prompts[1])
         self.assertIn("Test the behavior at risk; passing tests and line coverage alone do not establish correctness.", claude.prompts[1])
+        self.assertIn("Post-correction verification", claude.prompts[2])
+        self.assertIn("Original independent review reports", claude.prompts[2])
 
         self.assertEqual(completed["status"], "complete")
         saved_guidance = started["project_guidance"]
@@ -4193,7 +4489,7 @@ class WorkflowExecutionFingerprintTests(unittest.TestCase):
             self.assertEqual(initial[repository]["error_category"], "WorkspaceError")
             self.assertNotIn("hidden", json.dumps(initial[repository]))
 
-    def test_final_fingerprint_failure_does_not_discard_completed_evidence(self):
+    def test_final_fingerprint_failure_blocks_delivery_without_discarding_evidence(self):
         def implement(_index, _command, _kwargs):
             generated = self.target / "generated.py"
             generated.write_text("value = 1\n", encoding="utf-8")
@@ -4201,18 +4497,16 @@ class WorkflowExecutionFingerprintTests(unittest.TestCase):
         runner, _codex, _claude = self.make_runner("final-fingerprint-error", on_implementation=implement)
         runner.start()
         with patch.object(workspace_ops, "repository_fingerprint", side_effect=workspace_ops.WorkspaceError("hidden")):
-            state = orchestrator.Orchestrator(
-                self.target, workflow_id="final-fingerprint-error", process_runner=runner.process_runner,
-                claude_runner=runner.claude_runner,
-            ).approve()
+            with self.assertRaisesRegex(orchestrator.WorkflowError, "Could not capture the target fingerprint"):
+                orchestrator.Orchestrator(
+                    self.target, workflow_id="final-fingerprint-error", process_runner=runner.process_runner,
+                    claude_runner=runner.claude_runner,
+                ).approve()
 
-        self.assertEqual(state["status"], "complete")
-        self.assertEqual(state["implementation_summary"], "Implementation summary.")
-        self.assertEqual(state["execution_fingerprint"]["final"]["target"]["status"], "unavailable")
-        self.assertTrue((runner.workflow_dir / "delivery.md").is_file())
         persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
-        self.assertEqual(persisted["status"], "complete")
+        self.assertEqual(persisted["status"], "failed")
         self.assertEqual(persisted["implementation_summary"], "Implementation summary.")
+        self.assertFalse((runner.workflow_dir / "delivery.md").exists())
 
     def test_rejected_and_recovery_required_workflows_capture_final_target(self):
         rejected_runner, _codex, _claude = self.make_runner("rejected-final-fingerprint")

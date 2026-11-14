@@ -10,7 +10,16 @@ from typing import Callable
 
 import claude_reviewer
 from observability.tracer import tracing_enabled_from_environment
-from workflow.authorization import DEFAULT_MAX_CODE_REVIEW_CALLS
+from workflow.authorization import (
+    DEFAULT_CLAUDE_TIMEOUT_SECONDS,
+    DEFAULT_CODEX_TIMEOUT_SECONDS,
+    DEFAULT_MAX_CODE_REVIEW_CALLS,
+    DEFAULT_MAX_CODEX_CALLS,
+    DEFAULT_WORKFLOW_TIMEOUT_SECONDS,
+    MAX_AUTHORIZED_CODEX_CALLS,
+    MAX_PROVIDER_TIMEOUT_SECONDS,
+    MAX_WORKFLOW_TIMEOUT_SECONDS,
+)
 from workflow.review import _validated_campaign_reports, render_review_feedback
 
 
@@ -37,6 +46,16 @@ def code_review_calls_arg(value: str, *, maximum: int) -> int:
     if not 1 <= calls <= maximum:
         raise argparse.ArgumentTypeError(f"must be between 1 and {maximum}")
     return calls
+
+
+def bounded_integer_arg(value: str, *, name: str, maximum: int) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if not 1 <= number <= maximum:
+        raise argparse.ArgumentTypeError(f"must be between 1 and {maximum}")
+    return number
 
 
 def print_summary(state: dict, *, workflow_root: str) -> None:
@@ -123,6 +142,10 @@ def print_summary(state: dict, *, workflow_root: str) -> None:
             for operation in state.get("operation_history", [])[-10:]
         ],
         "authorized_code_review_calls": external_authorization.get("max_code_reviews"),
+        "execution_limits": state.get("authorization", {}).get("execution_limits"),
+        "resource_usage": state.get("resource_usage"),
+        "cancellation": state.get("cancellation"),
+        "integrity": state.get("integrity"),
         "review_campaign_status": state.get("review_campaign", {}).get("status"),
         "code_review_feedback": (
             render_review_feedback(_validated_campaign_reports(state.get("review_campaign", {})))
@@ -167,6 +190,38 @@ def main(
         default=DEFAULT_MAX_CODE_REVIEW_CALLS,
         help=(f"Maximum calls in the Claude code-review campaign, including integration review "
               f"(default: {DEFAULT_MAX_CODE_REVIEW_CALLS}; maximum: {max_authorized_code_review_calls})"),
+    )
+    start.add_argument(
+        "--max-codex-calls",
+        type=lambda value: bounded_integer_arg(
+            value, name="Codex calls", maximum=MAX_AUTHORIZED_CODEX_CALLS,
+        ),
+        default=DEFAULT_MAX_CODEX_CALLS,
+        help=f"Maximum Codex invocations for this workflow (default: {DEFAULT_MAX_CODEX_CALLS})",
+    )
+    start.add_argument(
+        "--codex-timeout-seconds",
+        type=lambda value: bounded_integer_arg(
+            value, name="Codex timeout", maximum=MAX_PROVIDER_TIMEOUT_SECONDS,
+        ),
+        default=DEFAULT_CODEX_TIMEOUT_SECONDS,
+        help=f"Per-call Codex timeout in seconds (default: {DEFAULT_CODEX_TIMEOUT_SECONDS})",
+    )
+    start.add_argument(
+        "--claude-timeout-seconds",
+        type=lambda value: bounded_integer_arg(
+            value, name="Claude timeout", maximum=MAX_PROVIDER_TIMEOUT_SECONDS,
+        ),
+        default=DEFAULT_CLAUDE_TIMEOUT_SECONDS,
+        help=f"Per-call Claude/Aily timeout in seconds (default: {DEFAULT_CLAUDE_TIMEOUT_SECONDS})",
+    )
+    start.add_argument(
+        "--workflow-timeout-seconds",
+        type=lambda value: bounded_integer_arg(
+            value, name="workflow timeout", maximum=MAX_WORKFLOW_TIMEOUT_SECONDS,
+        ),
+        default=DEFAULT_WORKFLOW_TIMEOUT_SECONDS,
+        help=f"Maximum active workflow time in seconds (default: {DEFAULT_WORKFLOW_TIMEOUT_SECONDS})",
     )
     start.add_argument("--codex", default=CODEX_EXECUTABLE)
     start.add_argument("--aily", default=claude_reviewer.AILY_EXECUTABLE)
@@ -242,11 +297,20 @@ def main(
             runner = runner_factory(
                 args.target, task=task_text(args, workflow_error=workflow_error),
                 budget_usd=args.budget_usd, max_code_review_calls=args.max_code_review_calls,
+                max_codex_calls=args.max_codex_calls,
+                timeout_seconds=args.codex_timeout_seconds,
+                claude_timeout_seconds=args.claude_timeout_seconds,
+                workflow_timeout_seconds=args.workflow_timeout_seconds,
                 workflow_id=args.workflow_id, codex=args.codex, aily=args.aily, model=args.model,
                 tracing_enabled=args.trace or tracing_enabled_from_environment(),
             )
             print(f"Effective Claude/Aily budget: ${runner.budget_usd:.2f}")
             print(f"Authorized Claude code-review campaign calls: {runner.max_code_review_calls}")
+            print(f"Authorized Codex calls: {args.max_codex_calls}")
+            print(
+                f"Authorized execution limits: workflow {args.workflow_timeout_seconds}s; "
+                f"Codex {args.codex_timeout_seconds}s/call; Claude/Aily {args.claude_timeout_seconds}s/call"
+            )
             state = runner.start()
         elif args.command == "recover-review":
             result = recover_review(args.target, args.workflow_id, apply=args.apply)

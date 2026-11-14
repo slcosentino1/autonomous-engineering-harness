@@ -12,6 +12,8 @@ import tempfile
 from dataclasses import dataclass
 from typing import Callable
 
+from workflow.process_control import process_group_options, terminate_process_group
+
 
 DEFAULT_AILY_EXECUTABLE = "/Users/slcosentino/.local/bin/aily"
 AILY_EXECUTABLE = os.environ.get("AILY_EXECUTABLE", DEFAULT_AILY_EXECUTABLE)
@@ -158,21 +160,26 @@ def review(
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     env=env,
+                    **process_group_options(),
                 )
                 try:
                     process_started(process.pid)
                 except BaseException:
-                    process.kill()
+                    terminate_process_group(process)
                     process.communicate()
                     raise
                 try:
                     stdout, stderr = process.communicate(timeout=timeout_seconds)
                 except subprocess.TimeoutExpired as exc:
-                    process.kill()
+                    terminate_process_group(process)
                     stdout, stderr = process.communicate()
                     raise subprocess.TimeoutExpired(
                         command, timeout_seconds, output=stdout, stderr=stderr,
                     ) from exc
+                except KeyboardInterrupt:
+                    terminate_process_group(process)
+                    process.communicate()
+                    raise
                 result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
             else:
                 result = process_runner(

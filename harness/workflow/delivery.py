@@ -170,50 +170,61 @@ def render_delivery_report(
         sections.append("No code-review file coverage was recorded.")
     campaign = state.get("review_campaign")
     sections.extend(["", "## Code review campaign", ""])
+    campaign_history = state.get("review_campaign_history", [])
+    campaigns = [item for item in campaign_history if isinstance(item, dict)] if isinstance(campaign_history, list) else []
     if campaign:
+        campaigns.append(campaign)
+    if campaigns:
         if structured_review_feedback:
             sections.extend([
                 "## Structured code-review feedback", "", structured_review_feedback, "",
             ])
-        invocation_count = sum(
-            call.get("call_state") != "validation_failed"
-            for record in campaign.get("part_reviews", []) for call in record.get("calls", [])
-        ) + sum(
-            call.get("call_state") != "validation_failed"
-            for call in campaign.get("integration_review", {}).get("calls", [])
-        )
-        sections.extend([
-            f"- Campaign `{campaign.get('campaign_id')}`; strategy `{campaign.get('strategy')}`; "
-            f"status `{campaign.get('status')}`.",
-            f"- Parts: {len(campaign.get('parts', []))}; Claude invocation attempts: {invocation_count}; "
-            f"authorized call maximum: {campaign.get('authorized_call_limit')}.",
-            f"- Shared context SHA-256: `{campaign.get('shared_context_sha256')}`; per-call payload limit: "
-            f"{campaign.get('payload_limit_characters')} characters.",
-            f"- Files reviewed: {len(campaign.get('files_reviewed', []))}.",
-        ])
-        sections.extend(f"  - `{path}`" for path in campaign.get("files_reviewed", []))
-        sections.append(f"- Files not reviewed: {len(campaign.get('files_not_reviewed', []))}.")
-        sections.extend(
-            f"  - `{item.get('path')}` — {item.get('reason')}"
-            for item in campaign.get("files_not_reviewed", [])
-        )
-        sections.append(
-            f"- Integration review: {campaign.get('integration_review', {}).get('status')}."
-        )
-        for record in campaign.get("part_reviews", []):
+        for campaign_number, item in enumerate(campaigns, start=1):
+            invocation_count = sum(
+                call.get("call_state") != "validation_failed"
+                for record in item.get("part_reviews", []) for call in record.get("calls", [])
+            ) + sum(
+                call.get("call_state") != "validation_failed"
+                for call in item.get("integration_review", {}).get("calls", [])
+            )
             sections.extend([
-                f"### {record.get('part_id')} — {record.get('status')}", "",
-                record.get("report") or "No report recorded.", "",
+                f"### Campaign {campaign_number}: {item.get('purpose', 'initial')} review", "",
+                f"- Campaign `{item.get('campaign_id')}`; strategy `{item.get('strategy')}`; "
+                f"status `{item.get('status')}`.",
+                f"- Parts: {len(item.get('parts', []))}; Claude invocation attempts: {invocation_count}; "
+                f"authorized call maximum: {item.get('authorized_call_limit')}.",
+                f"- Shared context SHA-256: `{item.get('shared_context_sha256')}`; per-call payload limit: "
+                f"{item.get('payload_limit_characters')} characters.",
+                f"- Files reviewed: {len(item.get('files_reviewed', []))}.",
             ])
-        integration_report = campaign.get("integration_review", {}).get("report")
-        if integration_report:
-            sections.extend(["### Integration report", "", integration_report, ""])
+            sections.extend(f"  - `{path}`" for path in item.get("files_reviewed", []))
+            sections.append(f"- Files not reviewed: {len(item.get('files_not_reviewed', []))}.")
+            sections.extend(
+                f"  - `{record.get('path')}` — {record.get('reason')}"
+                for record in item.get("files_not_reviewed", []) if isinstance(record, dict)
+            )
+            sections.append(
+                f"- Integration review: {item.get('integration_review', {}).get('status')}."
+            )
+            for record in item.get("part_reviews", []):
+                sections.extend([
+                    f"#### {record.get('part_id')} — {record.get('status')}", "",
+                    record.get("report") or "No report recorded.", "",
+                ])
+            integration_report = item.get("integration_review", {}).get("report")
+            if integration_report:
+                sections.extend(["#### Integration report", "", integration_report, ""])
     else:
         sections.append("No code review campaign was recorded.")
     sections.extend([
         "## Code review",
         "",
         state.get("code_review") or "No code review report was recorded.",
+        "",
+        "## Independent post-correction verification",
+        "",
+        f"Verification status: {(state.get('integrity') or {}).get('verification_result', {}).get('status', 'not required or unavailable')}.",
+        state.get("verification_report") or "No post-correction verification was required.",
         "",
         "## Corrections and validation",
         "",
@@ -229,4 +240,18 @@ def render_delivery_report(
         "",
         state.get("proposal") or "",
     ])
+    integrity = state.get("integrity", {})
+    if isinstance(integrity, dict):
+        evidence = integrity.get("review_evidence", {})
+        delivery_verification = integrity.get("delivery_verification", {})
+        sections.extend([
+            "",
+            "## Artifact integrity and provenance",
+            "",
+            f"- Proposal version: {evidence.get('proposal_version', 'unavailable')}; SHA-256 `{evidence.get('proposal_sha256', 'unavailable')}`.",
+            f"- Reviewed source patch SHA-256: `{evidence.get('source_patch_sha256', 'unavailable')}`.",
+            f"- Review campaign: `{evidence.get('campaign_id', 'unavailable')}` ({evidence.get('purpose', 'unknown')}).",
+            f"- Delivery verification: `{delivery_verification.get('status', 'unavailable')}`.",
+            f"- Delivery file SHA-256 is saved in state.json after this report is written.",
+        ])
     return "\n".join(sections).rstrip() + "\n"

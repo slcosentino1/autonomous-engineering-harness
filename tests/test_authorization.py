@@ -51,6 +51,37 @@ class AuthorizationModuleTests(unittest.TestCase):
         self.assertEqual(created["scope_sha256"], authorization.authorization_scope_digest(created))
         self.assertIn("relevant_skill_instructions", created["claude_aily"]["permitted_data"])
 
+    def test_execution_limits_are_persisted_and_digest_protected(self):
+        target = Path("/target")
+        created = authorization.new_workflow_authorization(
+            target, "bounded-workflow", 2.0, max_code_review_calls=12,
+            max_codex_calls=7, codex_timeout_seconds=120,
+            claude_timeout_seconds=90, workflow_timeout_seconds=3600,
+        )
+        limits = created["execution_limits"]
+        self.assertEqual(limits["max_codex_calls"], 7)
+        self.assertEqual(limits["max_claude_calls"], authorization.MAX_PLAN_REVIEWS + 12)
+        self.assertEqual(limits["codex_timeout_seconds"], 120)
+        self.assertEqual(limits["claude_timeout_seconds"], 90)
+        self.assertEqual(limits["workflow_timeout_seconds"], 3600)
+        self.assertEqual(limits["max_correction_attempts"], 1)
+        self.assertEqual(
+            limits["max_provider_runtime_seconds"], 7 * 120 + (authorization.MAX_PLAN_REVIEWS + 12) * 90,
+        )
+        authorization.validate_workflow_authorization(
+            {"authorization": created}, target, "bounded-workflow",
+        )
+
+        changed = copy.deepcopy(created)
+        changed["execution_limits"]["max_codex_calls"] = 8
+        changed["execution_limits"]["max_provider_runtime_seconds"] += 120
+        with self.assertRaisesRegex(
+            authorization.AuthorizationError, "Saved workflow authorization changed after initialization",
+        ):
+            authorization.validate_workflow_authorization(
+                {"authorization": changed}, target, "bounded-workflow",
+            )
+
     def test_modified_digest_and_broadened_scope_are_rejected(self):
         target = Path("/target")
         auth = authorization.new_workflow_authorization(target, "modified-test", 2.0)
