@@ -426,23 +426,31 @@ def _sha256_text(value: str) -> str | None:
 def build_codex_command(
     executable: str, target: Path, sandbox: str, output_path: Path, model: str | None = None,
     *, read_only_authorized_urls: list[str] | None = None,
+    disabled_user_mcp_servers: list[str] | None = None,
 ) -> list[str]:
     """Build the installed CLI's supported command; approval policy is a root option."""
     command = [executable]
     authorized_urls = sorted(set(read_only_authorized_urls or [])) if sandbox == "read-only" else []
-    command.extend([
-        "--ask-for-approval", "never", "exec",
-    ])
-    if sandbox == "read-only":
-        # The installed Codex CLI supports this exec option. Authentication remains in CODEX_HOME,
-        # but unrelated user-configured MCP servers are not loaded.
-        command.append("--ignore-user-config")
+    command.extend(["--ask-for-approval", "never", "exec"])
     command.extend([
         "--json", "--ephemeral", "--disable", "plugins",
         "--sandbox", sandbox, "--cd", str(target),
         "--output-last-message", str(output_path),
     ])
-    mcp_config = "mcp_servers={}"
+    user_mcp_servers: list[str] = []
+    if sandbox == "read-only":
+        if disabled_user_mcp_servers is None:
+            raise WorkflowError("Read-only Codex calls require explicit user MCP isolation.")
+        if any(not isinstance(name, str) or not name for name in disabled_user_mcp_servers):
+            raise WorkflowError(
+                "Configured Codex MCP server names are invalid; planning stopped before provider execution."
+            )
+        user_mcp_servers = sorted(set(disabled_user_mcp_servers))
+    if authorized_urls and "documentation_reader" in user_mcp_servers:
+        raise WorkflowError(
+            "Read-only documentation access cannot use the configured MCP name 'documentation_reader'."
+        )
+    mcp_entries = [f"{json.dumps(name)} = {{ enabled = false }}" for name in user_mcp_servers]
     if authorized_urls:
         docs_args = [
             str(Path(__file__).resolve().parent / "tools" / "read_documentation_url.py"),
@@ -452,16 +460,44 @@ def build_codex_command(
                 for item in ("--authorized-url-sha256", authorized_url_sha256(url))
             ],
         ]
-        mcp_config = (
-            "mcp_servers={ documentation_reader = { "
-            f"command = {json.dumps(sys.executable)}, args = {json.dumps(docs_args)}"
-            " } }"
+        mcp_entries.append(
+            f'"documentation_reader" = {{ enabled = true, command = {json.dumps(sys.executable)}, '
+            f"args = {json.dumps(docs_args)} }}"
         )
+    mcp_config = "mcp_servers={ " + ", ".join(mcp_entries) + " }" if mcp_entries else "mcp_servers={}"
     command.extend(["-c", mcp_config])
     if model is not None:
         command.extend(["--model", model])
     command.append("-")
     return command
+
+
+def _configured_codex_mcp_servers(environ=None) -> list[str]:
+    """Return user-configured MCP names so read-only calls can disable them explicitly."""
+    env = os.environ if environ is None else environ
+    configured_home = env.get("CODEX_HOME")
+    codex_home = Path(configured_home).expanduser() if configured_home else Path.home() / ".codex"
+    config_path = codex_home / "config.toml"
+    try:
+        config_text = config_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    except (OSError, UnicodeError) as exc:
+        raise WorkflowError(
+            "Could not inspect Codex user configuration to isolate MCP servers; planning stopped before provider execution."
+        ) from exc
+    try:
+        config = tomllib.loads(config_text)
+    except tomllib.TOMLDecodeError as exc:
+        raise WorkflowError(
+            "Codex user configuration is invalid; planning stopped before provider execution to preserve MCP isolation."
+        ) from exc
+    servers = config.get("mcp_servers", {})
+    if not isinstance(servers, dict) or any(not isinstance(name, str) or not name for name in servers):
+        raise WorkflowError(
+            "Codex user MCP configuration is invalid; planning stopped before provider execution."
+        )
+    return sorted(servers)
 
 
 def _planning_read_only_authorized_urls(stage: str, task: str) -> list[str]:
@@ -1613,13 +1649,16 @@ class Orchestrator:
                 _planning_read_only_authorized_urls(str(stage or ""), str(task))
                 if sandbox == "read-only" else []
             )
+            disabled_user_mcp_servers: list[str] = []
             if sandbox == "read-only":
                 _assert_no_project_mcp_servers(self.target)
+                disabled_user_mcp_servers = _configured_codex_mcp_servers()
             if read_only_authorized_urls:
                 prompt = f"{READ_ONLY_WEB_ACCESS_INSTRUCTION}\n\n{prompt}"
             command = build_codex_command(
                 self.codex, self.target, sandbox, output_path, self.model,
                 read_only_authorized_urls=read_only_authorized_urls,
+                disabled_user_mcp_servers=disabled_user_mcp_servers,
             )
             effective_prompt = authorization_context + prompt
             effective_prompt_bytes = effective_prompt.encode("utf-8")

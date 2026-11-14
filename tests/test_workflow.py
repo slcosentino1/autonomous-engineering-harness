@@ -54,14 +54,44 @@ def prompt_section(prompt: str, name: str) -> str:
 
 
 class CodexGuidanceTests(unittest.TestCase):
-    def test_read_only_codex_calls_isolate_user_mcp_configuration_even_without_url_access(self):
+    def test_read_only_codex_calls_keep_user_provider_config_and_disable_user_mcp(self):
         with tempfile.TemporaryDirectory() as root:
             command = orchestrator.build_codex_command(
                 "codex", Path(root), "read-only", Path(root) / "result.md",
+                disabled_user_mcp_servers=["unrelated"],
+            )
+            with self.assertRaisesRegex(orchestrator.WorkflowError, "require explicit user MCP isolation"):
+                orchestrator.build_codex_command(
+                    "codex", Path(root), "read-only", Path(root) / "unisolated.md",
+                )
+
+        self.assertNotIn("--ignore-user-config", command)
+        config = command[command.index("-c") + 1]
+        self.assertEqual(config, 'mcp_servers={ "unrelated" = { enabled = false } }')
+
+    def test_configured_codex_mcp_server_names_are_returned_without_provider_values(self):
+        with tempfile.TemporaryDirectory() as codex_home:
+            Path(codex_home, "config.toml").write_text(
+                'model_provider = "company-proxy"\n'
+                '[model_providers.company-proxy]\n'
+                'name = "Company Proxy"\n'
+                'base_url = "https://proxy.example.invalid/v1"\n'
+                'wire_api = "responses"\n'
+                '[mcp_servers."user.tools"]\n'
+                'command = "private-server"\n',
+                encoding="utf-8",
             )
 
-        self.assertIn("--ignore-user-config", command)
-        self.assertIn("mcp_servers={}", command)
+            servers = orchestrator._configured_codex_mcp_servers({"CODEX_HOME": codex_home})
+
+        self.assertEqual(servers, ["user.tools"])
+
+    def test_invalid_user_codex_config_fails_closed(self):
+        with tempfile.TemporaryDirectory() as codex_home:
+            Path(codex_home, "config.toml").write_text("[mcp_servers\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(orchestrator.WorkflowError, "Codex user configuration is invalid"):
+                orchestrator._configured_codex_mcp_servers({"CODEX_HOME": codex_home})
 
     def test_codex_guidance_keeps_small_file_inventory(self):
         prompt = orchestrator._guidance_for_codex({"files": ["README.md", "src/api.py"]})
@@ -129,30 +159,52 @@ class CodexGuidanceTests(unittest.TestCase):
                 orchestrator._assert_no_project_mcp_servers(target)
 
     @unittest.skipUnless(shutil.which("codex"), "Codex CLI is unavailable")
-    def test_installed_codex_mcp_config_merges_user_servers_and_exec_flag_is_supported(self):
+    def test_installed_codex_mcp_override_disables_user_servers_while_loading_user_config(self):
         with tempfile.TemporaryDirectory() as temporary_target, tempfile.TemporaryDirectory() as codex_home:
             target = Path(temporary_target)
+            Path(codex_home, "config.toml").write_text(
+                'model_provider = "company-proxy"\n'
+                '[model_providers.company-proxy]\n'
+                'name = "Company Proxy"\n'
+                'base_url = "https://proxy.example.invalid/v1"\n'
+                'wire_api = "responses"\n'
+                '[mcp_servers."user.tools"]\n'
+                'command = "must-not-load"\n'
+                'args = []\n',
+                encoding="utf-8",
+            )
+            configured_mcp_servers = orchestrator._configured_codex_mcp_servers(
+                {"CODEX_HOME": codex_home},
+            )
+            plain_planning = orchestrator.build_codex_command(
+                "codex", target, "read-only", target / "plain.md",
+                disabled_user_mcp_servers=configured_mcp_servers,
+            )
+            plain_config = plain_planning[plain_planning.index("-c") + 1]
+            environment = dict(os.environ, CODEX_HOME=codex_home)
+            plain_listed = subprocess.run(
+                ["codex", "mcp", "list", "--json", "-c", plain_config],
+                env=environment, capture_output=True, text=True, timeout=10, check=True,
+            )
+            self.assertEqual(
+                {item["name"]: item["enabled"] for item in json.loads(plain_listed.stdout)},
+                {"user.tools": False},
+            )
             command = orchestrator.build_codex_command(
                 "codex", target, "read-only", target / "result.md",
                 read_only_authorized_urls=["https://docs.example.com/api"],
+                disabled_user_mcp_servers=configured_mcp_servers,
             )
             config = command[command.index("-c") + 1]
-            (Path(codex_home) / "config.toml").write_text(
-                '[mcp_servers.unrelated]\ncommand = "must-not-load"\nargs = []\n', encoding="utf-8",
-            )
-            environment = dict(os.environ, CODEX_HOME=codex_home)
             listed = subprocess.run(
                 ["codex", "mcp", "list", "--json", "-c", config],
                 env=environment, capture_output=True, text=True, timeout=10, check=True,
             )
-            effective_without_isolation = {item["name"] for item in json.loads(listed.stdout)}
-            self.assertEqual(effective_without_isolation, {"documentation_reader", "unrelated"})
-            help_result = subprocess.run(
-                ["codex", "exec", "--ignore-user-config", "--help"],
-                env=environment, capture_output=True, text=True, timeout=10, check=True,
-            )
-            self.assertIn("Do not load `$CODEX_HOME/config.toml`", help_result.stdout)
-        self.assertIn("--ignore-user-config", command)
+            effective_servers = {item["name"]: item["enabled"] for item in json.loads(listed.stdout)}
+            self.assertEqual(effective_servers, {"documentation_reader": True, "user.tools": False})
+            self.assertIn('model_provider = "company-proxy"', Path(codex_home, "config.toml").read_text())
+            self.assertNotIn("--ignore-user-config", plain_planning)
+            self.assertNotIn("--ignore-user-config", command)
 
 
 class DocumentationReaderTests(unittest.TestCase):
@@ -3227,12 +3279,12 @@ class WorkflowTests(unittest.TestCase):
         documentation_reader = orchestrator.build_codex_command(
             "codex", self.target, "read-only", self.root / "last-message.md",
             read_only_authorized_urls=["https://docs.example.com/api"],
+            disabled_user_mcp_servers=["unrelated"],
         )
         self.assertEqual(
             documentation_reader[:4],
             ["codex", "--ask-for-approval", "never", "exec"],
         )
-        self.assertIn("--ignore-user-config", documentation_reader)
         self.assertEqual(documentation_reader[documentation_reader.index("--sandbox") + 1], "read-only")
         config = next(item for item in documentation_reader if item.startswith("mcp_servers={"))
         grant_hash = read_documentation_url.authorized_url_sha256("https://docs.example.com/api")
@@ -3242,15 +3294,16 @@ class WorkflowTests(unittest.TestCase):
         ]
         self.assertEqual(
             config,
-            "mcp_servers={ documentation_reader = { "
-            f"command = {json.dumps(sys.executable)}, args = {json.dumps(docs_args)}"
-            " } }",
+            'mcp_servers={ "unrelated" = { enabled = false }, '
+            f'"documentation_reader" = {{ enabled = true, command = {json.dumps(sys.executable)}, '
+            f"args = {json.dumps(docs_args)} }} }}",
         )
         self.assertTrue(docs_args[0].endswith("read_documentation_url.py"))
 
         write_docs = orchestrator.build_codex_command(
             "codex", self.target, "workspace-write", self.root / "last-message.md",
             read_only_authorized_urls=["https://docs.example.com/api"],
+            disabled_user_mcp_servers=["unrelated"],
         )
         write_config = next(item for item in write_docs if item.startswith("mcp_servers="))
         self.assertEqual(json.loads(write_config.removeprefix("mcp_servers=")), {})
@@ -3271,7 +3324,7 @@ class WorkflowTests(unittest.TestCase):
         }
 
         runner.workflow_dir.mkdir(parents=True)
-        with runner._workflow_lock():
+        with patch.dict(os.environ, {"CODEX_HOME": str(self.root / "empty-codex-home")}), runner._workflow_lock():
             runner._run_codex_impl("Read the API documentation.", sandbox="read-only")
             runner.state["stage"] = "implementation"
             runner._run_codex_impl("Implement the approved change.", sandbox="workspace-write")
@@ -3282,7 +3335,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn(f'"--authorized-url-sha256", "{grant_hash}"', planning_config)
         self.assertIn(orchestrator.READ_ONLY_WEB_ACCESS_INSTRUCTION, codex.prompts[0])
         self.assertEqual(planning_command[planning_command.index("--sandbox") + 1], "read-only")
-        self.assertIn("--ignore-user-config", planning_command)
+        self.assertNotIn("--ignore-user-config", planning_command)
         implementation_config = next(item for item in implementation_command if item.startswith("mcp_servers="))
         self.assertEqual(json.loads(implementation_config.removeprefix("mcp_servers=")), {})
         self.assertNotIn("--ignore-user-config", implementation_command)
@@ -3309,6 +3362,27 @@ class WorkflowTests(unittest.TestCase):
 
         with self.assertRaisesRegex(orchestrator.WorkflowError, "declares MCP servers"):
             runner._run_codex_impl("Read the API documentation.", sandbox="read-only")
+        self.assertEqual(codex.commands, [])
+
+    def test_invalid_user_codex_config_fails_closed_before_planning_runs(self):
+        codex = FakeCodex("Planning result")
+        runner = orchestrator.Orchestrator(
+            self.target, task="Plan the work", budget_usd=1.0, workflow_id="planning-invalid-user-config",
+            process_runner=codex, claude_runner=FakeClaude(),
+        )
+        runner.state = {
+            "authorization": {
+                "target": str(self.target), "workspace_operations": [], "restricted_operations": [],
+            },
+            "stage": "planning",
+            "task": "Plan the work",
+        }
+        with tempfile.TemporaryDirectory() as codex_home:
+            Path(codex_home, "config.toml").write_text("[mcp_servers\n", encoding="utf-8")
+            runner.workflow_dir.mkdir(parents=True)
+            with patch.dict(os.environ, {"CODEX_HOME": codex_home}), runner._workflow_lock():
+                with self.assertRaisesRegex(orchestrator.WorkflowError, "Codex user configuration is invalid"):
+                    runner._run_codex_impl("Plan the work.", sandbox="read-only")
         self.assertEqual(codex.commands, [])
 
     def test_review_packet_excludes_sensitive_and_preexisting_paths_and_redacts_tokens(self):
