@@ -26,6 +26,9 @@ class SkillResolutionTests(unittest.TestCase):
         architecture = by_name["architecture-design"]
         self.assertEqual(architecture["source"], "harness")
         self.assertIn("## Changes to existing systems", architecture["content"])
+        self.assertIn("Discover material decisions", architecture["content"])
+        self.assertIn("head-of-line blocking", architecture["content"])
+        self.assertIn("A deliberately simple design remains preferable", architecture["content"])
         self.assertIn("# Architecture approaches", architecture["content"])
         self.assertIn("# Scenario examples", architecture["content"])
         for name in ("software-engineering", "testing-strategy", "code-review"):

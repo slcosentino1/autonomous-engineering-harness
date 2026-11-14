@@ -53,6 +53,16 @@ def prompt_section(prompt: str, name: str) -> str:
     return match.group(1).strip() if match else ""
 
 
+def planning_scorecard_text(scores=None) -> str:
+    scores = scores or {name: 4 for name in orchestrator._planning_review.SCORECARD_CRITERIA}
+    rows = ["## Planning quality scorecard"]
+    rows.extend(
+        f"- {name}: {scores[name]}/5 — Evidence: proposal section `{name}` states the relevant decision."
+        for name in orchestrator._planning_review.SCORECARD_CRITERIA
+    )
+    return "\n".join(rows)
+
+
 class CodexGuidanceTests(unittest.TestCase):
     def test_read_only_codex_calls_keep_user_provider_config_and_disable_user_mcp(self):
         with tempfile.TemporaryDirectory() as root:
@@ -2209,15 +2219,39 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("python -m unittest", (runner.workflow_dir / "delivery.md").read_text())
 
     def test_plan_review_is_limited_to_two_iterations(self):
+        first_finding = (
+            "Finding: The global FIFO worker can block later Jobs behind a long Job. Compare a bounded worker "
+            "pool and explain the user-visible queue-delay trade-off."
+        )
+        refined_proposal = (
+            "# Refined proposal\n\n## Architectural decisions and trade-offs\n"
+            "Jobs are processed sequentially internally. A bounded pool runs independent Jobs concurrently; this "
+            "reduces cross-job queue delay while limiting processor load. A single FIFO worker remains simpler but "
+            "can cause head-of-line blocking. Revisit pool size using measured processor capacity and queue latency.\n\n"
+            "## Claude finding dispositions\n"
+            "- Finding: compare bounded cross-job concurrency | Decision: incorporated | Reason: the proposal now "
+            "documents the bounded pool, queue-delay trade-off, and operating trigger.\n\n"
+            "Second plan review needed: yes\n"
+        )
+        final_proposal = (
+            "# Final proposal\n\n## Architectural decisions and trade-offs\n"
+            "Each Job processes items sequentially. A bounded worker pool runs multiple Jobs concurrently to limit "
+            "head-of-line delay without unbounded processor calls. Adjust the pool after measuring capacity and queue "
+            "latency.\n\n## Claude finding dispositions\n- No actionable findings.\n\n"
+            "Second plan review needed: no\n"
+        )
         codex = FakeCodex(
             "# Proposal\nInitial plan.\n",
-            self.refined("yes", "- Finding: clarify the data edge case | Decision: incorporated | "
-                                  "Reason: cover the data boundary."),
-            self.refined("yes"),
+            refined_proposal,
+            final_proposal,
         )
         claude = FakeClaude(
-            claude_reviewer.ReviewResult("Please clarify the data edge case.", 0.1),
-            claude_reviewer.ReviewResult("The revised plan is adequate.", 0.2),
+            claude_reviewer.ReviewResult(
+                first_finding + "\n\n" + planning_scorecard_text(), 0.1,
+            ),
+            claude_reviewer.ReviewResult(
+                "The bounded pool and trigger are sufficiently reasoned.\n\n" + planning_scorecard_text(), 0.2,
+            ),
         )
         runner = orchestrator.Orchestrator(
             self.target, task="Add a feature", budget_usd=1.0, workflow_id="two-reviews",
@@ -2229,11 +2263,49 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(state["plan_reviews"]), 2)
         self.assertEqual(len(claude.prompts), 2)
         self.assertEqual(len(codex.commands), 3)
-        self.assertIn("Please clarify the data edge case.", claude.prompts[1])
-        self.assertIn("Decision: incorporated", claude.prompts[1])
+        self.assertIn(first_finding, codex.prompts[1])
+        self.assertIn("bounded worker pool", (runner.workflow_dir / "proposal.md").read_text())
+        self.assertNotIn(first_finding, claude.prompts[1])
+        self.assertNotIn("Decision: incorporated", claude.prompts[1])
+        self.assertNotIn("## Claude finding dispositions", prompt_section(claude.prompts[1], "Current proposal"))
+        self.assertIn("withheld from this review", claude.prompts[1])
+        self.assertIn("Planning quality scorecard", claude.prompts[0])
+        self.assertIn("Harness-calculated arithmetic mean:** 4.00/5", state["plan_reviews"][0]["report"])
+        self.assertIn("specific proposal section", claude.prompts[0])
         self.assertIn("Plan review iteration 2", claude.prompts[1])
         self.assertIn("proposal version 2", claude.prompts[1])
         self.assertEqual(state["claude_contexts"][1]["proposal_version"], 2)
+
+    def test_well_justified_simple_architecture_can_receive_a_high_score(self):
+        proposal = (
+            "# Proposal\n\n## Architectural decisions and trade-offs\n"
+            "Use one in-process worker because the current workload has no throughput target and the processor's "
+            "capacity is unknown. It preserves global FIFO and limits downstream concurrency. A bounded pool would "
+            "reduce queue delay but add concurrency and recovery concerns; revisit it if measured queue latency or "
+            "throughput misses a target. This deliberately simple design is adequate for the stated scope.\n"
+        )
+        codex = FakeCodex(
+            proposal,
+            proposal + "\n## Claude finding dispositions\n- No actionable findings.\n\n"
+            "Second plan review needed: no\n",
+        )
+        claude = FakeClaude(claude_reviewer.ReviewResult(
+            "No material architectural gaps found. The single worker is proportionate to the stated constraints.\n\n"
+            + planning_scorecard_text({name: 5 for name in orchestrator._planning_review.SCORECARD_CRITERIA}),
+            0.1,
+        ))
+        runner = orchestrator.Orchestrator(
+            self.target, task="Build a small jobs API with ordered items and no throughput target.",
+            budget_usd=1.0, workflow_id="simple-architecture-scorecard",
+            process_runner=codex, claude_runner=claude,
+        )
+
+        state = runner.start()
+
+        self.assertEqual(state["status"], "awaiting_approval")
+        self.assertIn("Use one in-process worker", state["proposal"])
+        self.assertIn("Harness-calculated arithmetic mean:** 5.00/5", state["plan_reviews"][0]["report"])
+        self.assertIn("not an approval threshold", state["plan_reviews"][0]["report"])
 
     def test_user_revision_uses_remaining_plan_review_and_still_waits_for_approval(self):
         codex = FakeCodex(
@@ -3500,6 +3572,13 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("These are analysis prompts, not automatic implementation requirements", codex.prompts[0])
         self.assertIn("State important unknowns", codex.prompts[0])
         self.assertIn("observable outcomes and acceptance criteria", codex.prompts[0])
+        self.assertIn("Architectural decisions and trade-offs", codex.prompts[0])
+        self.assertIn("assumptions or unknowns, accepted risks", codex.prompts[0])
+        self.assertIn("not mandatory components", codex.prompts[0])
+        self.assertIn("minimum component count", codex.prompts[0])
+        self.assertIn("## Planning quality scorecard", claude.prompts[0])
+        self.assertIn("Alternatives analysis", claude.prompts[0])
+        self.assertIn("simple architecture when it adequately meets the needs", claude.prompts[0])
         self.assertIn("future production considerations", claude.prompts[0])
 
     def test_missing_or_oversized_review_context_prevents_a_paid_call(self):
@@ -3644,9 +3723,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(revised["plan_reviews"][1]["proposal_version"], 3)
         self.assertEqual(len([r for r in revised["plan_reviews"] if r.get("valid")]), 1)
         self.assertEqual(revised["authorization"]["claude_aily"]["spent_usd"], 0.3)
-        self.assertIn("Invalidated attempt", claude.prompts[1])
-        self.assertIn("Does the proposal satisfy every explicit assignment requirement?", claude.prompts[1])
-        self.assertIn("Is each architectural component and abstraction justified", claude.prompts[1])
+        self.assertNotIn("Invalidated attempt", claude.prompts[1])
+        self.assertIn("Prior Claude reports and Codex finding dispositions are deliberately withheld", claude.prompts[1])
+        self.assertIn("Architectural decision completeness", claude.prompts[1])
+        self.assertIn("Alternatives analysis", claude.prompts[1])
         self.assertIn("Mark the prior review invalid", codex.prompts[2])
 
     def test_codex_receives_target_instructions_and_applicable_skill_contents(self):

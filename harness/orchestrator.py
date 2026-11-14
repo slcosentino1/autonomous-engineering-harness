@@ -39,6 +39,7 @@ from observability.tracer import (
 from workflow import authorization as _authorization
 from workflow import cli as _cli
 from workflow import persistence as _persistence
+from workflow import planning_review as _planning_review
 from workflow import review_input as _review_input
 from workflow import skills as _skills
 from workflow import workspace as _workspace
@@ -151,6 +152,40 @@ need a mock or stub, and which require a real external integration.
 Classify decisions as must implement, should implement, future production considerations, out of scope, open
 questions or ambiguities, and external dependencies. Use only the categories that apply. Keep the proposal at the
 level of detail needed to explain the reasoning; do not make it longer or more sophisticated for its own sake."""
+ARCHITECTURAL_DECISION_OUTPUT = """Choose the simplest architecture that adequately satisfies the functional and operational requirements. Do not
+optimize for minimum component count at the expense of correctness, reliability, concurrency, scalability, or operations.
+For planning and proposal refinement, apply the architecture-design skill by recording a concise
+`Architectural decisions and trade-offs` section. For each material decision, state the choice, viable alternatives,
+the relevant consequences and user or operational impact, assumptions or unknowns, accepted risks, and what evidence
+would change the choice. Explain why a deferred capability is unnecessary now, its accepted risk, likely later cost,
+and a concrete reconsideration trigger. Include only decisions material to this assignment. Concurrency, idempotency,
+storage, recovery, and failure behavior are examples of areas to assess when relevant, not mandatory components or
+requirements. A simple, well-justified design can be the best result."""
+PLAN_REVIEW_GUIDANCE = """Act as an independent architectural reviewer, not only a requirements checklist. First assess the current
+assignment and proposal on their own merits. Search for material decisions that are missing, viable alternatives that
+were skipped, simplifications with unexamined consequences, weak trade-off reasoning, unstated assumptions, and
+deferrals without an assessed risk, later cost, or reconsideration trigger. Examine concurrency, idempotency,
+persistence, recovery, and failure behavior when relevant; these are not mandatory design features. Do not penalize a
+simple architecture when it adequately meets the needs and its consequences are justified. A material choice that
+was not analyzed is still an open gap even if the chosen design appears plausible. Do not mistake minimum component
+count for simplicity when it sacrifices correctness, reliability, concurrency, scalability, or operational fit.
+
+For each actionable finding, identify the decision or missing aspect, the alternative or scenario not evaluated, its
+consequence, why that consequence matters here, and the concrete change or clarification recommended. Classify it as
+an architectural defect, an acceptable but undocumented risk, insufficient information, or an optional improvement.
+Do not elevate personal preferences or speculative enhancements into blockers. Important gaps must be findings that
+Codex can address in its existing refinement step.
+
+Return a `## Planning quality scorecard` with exactly one line per criterion in this form:
+`- Criterion: N/5 — Evidence: specific proposal section, decision, or omission`
+Score these seven criteria: Requirement understanding; Architectural decision completeness; Alternatives analysis;
+Trade-off reasoning; Operational and failure-mode thinking; Assumption management; Review effectiveness. Use 1 for
+unsupported or materially inadequate evidence, 3 for adequate but incomplete reasoning, and 5 for explicit, strong,
+proportionate reasoning; use 2 and 4 for intermediate evidence. For the first six criteria, score the proposal; score
+Review effectiveness by this review's coverage and evidence-supported findings, not by the number of findings. Cite
+concrete evidence for every rating. Score reasoning, not proposal length or component count. The Harness calculates
+the arithmetic mean; do not supply an aggregate. Scores are descriptive and have no approval threshold. A low score
+is not automatically a blocker, but explain any important gap as a finding."""
 CLAUDE_MAX_PAYLOAD_ENV = claude_reviewer.MAX_REVIEW_PAYLOAD_ENV
 WORKSPACE_OPERATIONS = _authorization.WORKSPACE_OPERATIONS
 CODEX_STAGES = _authorization.CODEX_STAGES
@@ -1917,7 +1952,7 @@ class Orchestrator:
             "plan_review": {
                 "Review metadata", "Assignment", "Current proposal", "Repository context",
                 "Workflow constraints", "Engineering Judgment & Proportional Design", "Relevant skills",
-                "Review duties", "Review history and Codex decisions",
+                "Review duties", "Independence boundary",
             },
         }["plan_review"] if stage != "code_review" else code_required
         safe_header = redact(header)
@@ -2308,14 +2343,15 @@ class Orchestrator:
                         "relevant guidance and record each selected skill and its use. If none apply, say so. "
                         "Make reasonable technical decisions, identify requirements, edge cases, and verification. "
                         "Apply Engineering Judgment & Proportional Design. Separate must implement, should implement, "
-                        "future production considerations, and out of scope. Compare alternatives for important "
-                        "architectural choices and do not invent product behavior. "
+                        "future production considerations, and out of scope. Do not invent product behavior. "
                         "Return a concise, readable Markdown implementation proposal with scope, approach, risks, "
-                        "a requirements-to-design mapping, relevant skills and how they were applied, and concrete "
-                        "validation commands. Do not modify files or run tests.\n\n"
+                        "a requirements-to-design mapping, material architectural decisions and their trade-offs, "
+                        "relevant skills and how they were applied, and concrete validation commands. Do not modify "
+                        "files or run tests.\n\n"
                         f"{skill_guidance}\n\n"
                         f"{PLANNING_PRINCIPLES}\n\nTarget: {self.target}\n\nAssignment:\n{self.state['task']}"
                     )
+                    prompt = f"{ARCHITECTURAL_DECISION_OUTPUT}\n\n{prompt}"
                     proposal = clean_markdown(self._run_codex(prompt, sandbox="read-only"))
                     self.state["proposal"] = proposal
                     self.state["proposal_version"] = 1
@@ -2342,6 +2378,7 @@ class Orchestrator:
                         report, manifest = recoverable_context["report"], recoverable_context
                     else:
                         report, manifest = self._call_claude(header, stage, sections, metadata=metadata)
+                    report, _scorecard = _planning_review.normalize_scorecard(report)
                     self.state["plan_reviews"].append({
                         "attempt": len(self.state.get("plan_reviews", [])) + 1,
                         "iteration": iteration,
@@ -2370,14 +2407,15 @@ class Orchestrator:
                         "mark incorporated, rejected, or deferred and give a reason. Incorporate valid in-scope "
                         "recommendations; do not turn optional production advice into assignment requirements. "
                         "Return the complete refined proposal as readable Markdown, retaining requirements mapping, "
-                        "scope distinctions, and the relevant skills and their application. Put a section titled "
+                        "material architectural decisions and trade-offs, scope distinctions, and the relevant skills "
+                        "and their application. Put a section titled "
                         "`## Claude finding dispositions` at the end of the proposal. Use one bullet for every finding "
                         "in this format: `- Finding: ... | Decision: incorporated/rejected/deferred | Reason: ...`. "
                         "If there are none, write `- No actionable findings.` Apply Engineering Judgment & "
                         "Proportional Design. Add one final "
                         "line exactly in this form: `Second plan review needed: yes` or `...: no`. Use yes only when "
                         "a material plan change needs a second independent plan review.\n\n"
-                        f"{PLANNING_PRINCIPLES}\n\n{skill_guidance}\n\n"
+                        f"{ARCHITECTURAL_DECISION_OUTPUT}\n\n{PLANNING_PRINCIPLES}\n\n{skill_guidance}\n\n"
                         f"Assignment:\n{self.state['task']}\n\nCurrent proposal (version "
                         f"{self.state.get('proposal_version', 1)}):\n{self.state['proposal']}\n\n"
                         f"Claude review (iteration {iteration}, proposal version {review.get('proposal_version')}):\n{report}"
@@ -2418,7 +2456,7 @@ class Orchestrator:
                         "proposal; if there are no applicable skills, state that. Distinguish must implement, should "
                         "implement, future production considerations, and out of scope. Return the complete proposal "
                         "in readable Markdown; do not implement code.\n\n"
-                        f"{PLANNING_PRINCIPLES}\n\n{skill_guidance}\n\n"
+                        f"{ARCHITECTURAL_DECISION_OUTPUT}\n\n{PLANNING_PRINCIPLES}\n\n{skill_guidance}\n\n"
                         f"Assignment:\n{self.state['task']}\n\nCurrent proposal (version "
                         f"{self.state.get('proposal_version', 1)}):\n{self.state['proposal']}\n\n"
                         f"Prior review attempts:\n{self._review_history_for_prompt()}\n\n"
@@ -2609,10 +2647,17 @@ class Orchestrator:
         limit = self.state["authorization"]["claude_aily"]["max_plan_reviews"]
         version = int(self.state.get("proposal_version", 1))
         guidance = self._guidance()
+        proposal_for_review = self.state["proposal"]
+        disposition_heading = re.search(
+            r"(?im)^\s*##\s+Claude finding dispositions\s*$", proposal_for_review,
+        )
+        if disposition_heading:
+            proposal_for_review = proposal_for_review[:disposition_heading.start()].rstrip()
         header = (
-            "Act as a Senior Software Architect, Senior Software Engineer, and Product Engineer performing a "
-            "read-only plan review. Inspect the complete assignment, complete current proposal, repository context, "
-            "workflow constraints, and listed skill guidance. Give concrete findings with reasons. Do not implement code."
+            "Act as an independent Senior Software Architect reviewing a proposal. Inspect the complete assignment, "
+            "current proposal, repository context, workflow constraints, and listed skill guidance. "
+            "Do not rely on prior review conclusions or Codex dispositions; they are withheld. Give evidence-based "
+            "findings and a scorecard. Do not implement code."
         )
         sections = {
             "Review metadata": (
@@ -2620,7 +2665,7 @@ class Orchestrator:
                 "all required context sections below are complete."
             ),
             "Assignment": self.state["task"],
-            "Current proposal": self.state["proposal"],
+            "Current proposal": proposal_for_review,
             "Repository context": self._repository_context_for_claude(guidance),
             "Workflow constraints": (
                 f"Target: {self.target}. The proposal is awaiting human approval; implementation is not authorized "
@@ -2635,13 +2680,12 @@ class Orchestrator:
                 context="\n".join((self.state.get("task", ""), self.state.get("proposal", ""))),
                 include_skill_content=self._claude_skill_content_authorized(),
             ),
-            "Review duties": (
-                "Answer both questions explicitly: (1) Does the proposal satisfy every explicit assignment requirement? "
-                "(2) Is each architectural component and abstraction justified by those requirements? Prefer the "
-                "simplest adequate solution. Distinguish genuine omissions from should-implement items, future "
-                "production considerations, and out-of-scope ideas. Do not reward complexity by itself."
+            "Review duties": PLAN_REVIEW_GUIDANCE,
+            "Independence boundary": (
+                "Prior Claude reports and Codex finding dispositions are deliberately withheld from this review. "
+                "Base the assessment on the assignment and current proposal supplied here. The proposal's revision "
+                "number is context only; do not infer that earlier conclusions were correct."
             ),
-            "Review history and Codex decisions": self._review_history_for_prompt(),
         }
         metadata = {
             "iteration": iteration,

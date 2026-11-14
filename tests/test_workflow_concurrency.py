@@ -157,7 +157,8 @@ print("DONE " + json.dumps({{"status": state["status"], "budget_unknown": state[
             self.assertEqual(completed["status"], "awaiting_approval")
             final = json.loads(state_path.read_text(encoding="utf-8"))
             authorization = final["authorization"]["claude_aily"]
-            self.assertEqual(final["plan_reviews"][0]["report"], "Plan looks good.")
+            self.assertTrue(final["plan_reviews"][0]["report"].startswith("Plan looks good."))
+            self.assertIn("Planning quality scorecard status:** INCOMPLETE", final["plan_reviews"][0]["report"])
             self.assertEqual(final["claude_contexts"][0]["cost_usd"], 0.125)
             self.assertFalse(authorization["budget_unknown"])
             self.assertIsNone(authorization["active_call"])
