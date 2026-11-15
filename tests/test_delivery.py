@@ -124,6 +124,32 @@ class DeliveryReportTests(unittest.TestCase):
         self.assertIn("No code review report was recorded.", report)
         self.assertIn("No correction summary was recorded.", report)
         self.assertIn("- Change summary: unavailable", report)
+        self.assertIn("Traceability is unavailable or was not recorded for this legacy workflow.", report)
+
+    def test_workflow_completion_is_rendered_separately_from_partial_delivery(self):
+        state = copy.deepcopy(self.state)
+        state["workflow_status"] = "complete"
+        state["delivery_disposition"] = "partial"
+        state["commitment_gate"] = {
+            "disposition": "partial",
+            "rationale": "A required integration test was blocked by an approved external dependency policy.",
+            "commitments": [{
+                "id": "C-001", "class": "mandatory_user_requirement", "availability": "externally_blocked",
+                "acceptance_condition": "The processor interaction passes its deterministic recovery scenario.",
+                "implementation_status": "partial", "verification_status": "blocked",
+                "claude_assessment": "insufficient_evidence", "source_evidence_status": "missing",
+                "source_refs": [], "validation_refs": [], "reasons": ["PostgreSQL test service unavailable."],
+                "claude_explanation": "The required scenario could not be validated.",
+            }],
+        }
+
+        report = self.render(state)
+
+        self.assertIn("- Workflow status: `complete`", report)
+        self.assertIn("- Delivery disposition: `partial`", report)
+        self.assertIn("C-001 — `mandatory_user_requirement`", report)
+        self.assertIn("`blocked`", report)
+        self.assertIn("PostgreSQL test service unavailable.", report)
 
     def test_fingerprint_and_execution_change_summary_sections(self):
         self.state["execution_fingerprint"] = {

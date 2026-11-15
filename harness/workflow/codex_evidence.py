@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
+from pathlib import PurePosixPath
 
 
 def _json_line_message(stdout: str) -> str:
@@ -44,6 +46,80 @@ def _output_bytes(value: bytes | str | None) -> tuple[bytes | None, str]:
     return None, "unavailable"
 
 
+_PYTEST_RESULT = re.compile(
+    r"^\s*(?P<test>[^\s].*?::[^\s]+)\s+(?P<status>PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS)\b",
+    re.IGNORECASE,
+)
+_UNITTEST_RESULT = re.compile(
+    r"^\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s+\((?P<case>[A-Za-z0-9_.]+)\)\s+\.\.\.\s+"
+    r"(?P<status>ok|FAIL|ERROR|skipped(?:\s+.*)?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _runner_test_results(output: str, *, exit_code: int | None) -> list[dict]:
+    """Extract only individual pytest/unittest outcomes; never retain raw command output."""
+    results: list[dict[str, str]] = []
+    for line in output.splitlines():
+        match = _PYTEST_RESULT.match(line)
+        if match:
+            status = match.group("status").upper()
+            normalized = "passed" if status in {"PASSED", "XFAIL"} else (
+                "skipped" if status == "SKIPPED" else "failed"
+            )
+            results.append({"test_id": match.group("test"), "status": normalized})
+            continue
+        match = _UNITTEST_RESULT.match(line)
+        if match:
+            raw_status = match.group("status").lower()
+            normalized = "passed" if raw_status == "ok" else (
+                "skipped" if raw_status.startswith("skipped") else "failed"
+            )
+            case = match.group("case")
+            name = match.group("name")
+            test_id = case if case.endswith("." + name) else f"{case}.{name}"
+            results.append({"test_id": test_id, "status": normalized})
+    return sorted(results, key=lambda item: (item["test_id"], item["status"]))
+
+
+def _runner_name(command: str | None) -> str:
+    if not isinstance(command, str):
+        return "unknown"
+    if re.search(r"\bpytest\b", command):
+        return "pytest"
+    if re.search(r"\b(?:python(?:3(?:\.\d+)?)?\s+-m\s+unittest|unittest)\b", command):
+        return "unittest"
+    return "unknown"
+
+
+def _junit_report_path(command: str | None) -> str | None:
+    """Capture only an explicit, safe pytest JUnit output path from the command line."""
+    if not isinstance(command, str):
+        return None
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    paths: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token.startswith(("--junitxml=", "--junit-xml=")):
+            paths.append(token.split("=", 1)[1])
+        elif token in {"--junitxml", "--junit-xml"}:
+            if index + 1 >= len(tokens):
+                return None
+            index += 1
+            paths.append(tokens[index])
+        index += 1
+    if len(paths) != 1 or not paths[0] or "\\" in paths[0]:
+        return None
+    path = PurePosixPath(paths[0])
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        return None
+    return path.as_posix()
+
+
 def _codex_jsonl_evidence(stdout: bytes | None) -> dict:
     evidence = {
         "jsonl_event_coverage": "unavailable" if stdout is None else "empty",
@@ -53,7 +129,9 @@ def _codex_jsonl_evidence(stdout: bytes | None) -> dict:
         "codex_cli_event_counts": {},
         "codex_cli_turn_status": "not_reported",
         "tool_invocations": [],
+        "test_execution_events": [],
         "tool_event_coverage": "unavailable" if stdout is None else "no_tool_events",
+        "last_tool_event_index": None,
         "reported_usage": None,
         "usage_source": "not_reported",
         "reported_model": None,
@@ -71,6 +149,8 @@ def _codex_jsonl_evidence(stdout: bytes | None) -> dict:
     reported_model: str | None = None
     event_count = 0
     tool_names_seen: dict[str, set[str]] = {}
+    test_execution_events: list[dict] = []
+    last_tool_event_index: int | None = None
 
     for line in stdout.splitlines():
         if not line.strip():
@@ -112,6 +192,7 @@ def _codex_jsonl_evidence(stdout: bytes | None) -> dict:
             continue
         if item_type in _CODEX_NON_TOOL_ITEM_TYPES:
             continue
+        last_tool_event_index = event_count
         if item_type not in _CODEX_TOOL_ITEM_TYPES:
             unrecognized_events += 1
             continue
@@ -145,6 +226,28 @@ def _codex_jsonl_evidence(stdout: bytes | None) -> dict:
         else:
             outcome = "unreported"
         counts[f"{outcome}_reported_events" if outcome != "unreported" else "outcome_unreported_events"] += 1
+        if item_type == "command_execution":
+            aggregated_output = item.get("aggregated_output", item.get("output", item.get("stdout")))
+            output_bytes = aggregated_output.encode("utf-8") if isinstance(aggregated_output, str) else None
+            command = item.get("command")
+            command_bytes = command.encode("utf-8") if isinstance(command, str) else None
+            runner = _runner_name(command)
+            event_id = item.get("id", event.get("event_id"))
+            if not isinstance(event_id, str) or not event_id.strip():
+                event_id = f"codex-event-{event_count}"
+            test_execution_events.append({
+                "event_id": event_id,
+                "event_index": event_count,
+                "exit_code": exit_code if isinstance(exit_code, int) and not isinstance(exit_code, bool) else None,
+                "runner": runner,
+                "junit_report_path": _junit_report_path(command),
+                "command_sha256": hashlib.sha256(command_bytes).hexdigest() if command_bytes is not None else None,
+                "output_sha256": hashlib.sha256(output_bytes).hexdigest() if output_bytes is not None else None,
+                "tests": _runner_test_results(
+                    aggregated_output if isinstance(aggregated_output, str) else "",
+                    exit_code=exit_code if isinstance(exit_code, int) and not isinstance(exit_code, bool) else None,
+                ),
+            })
 
     evidence.update({
         "jsonl_event_coverage": "partial" if parse_errors else ("parsed" if event_count else "empty"),
@@ -156,9 +259,11 @@ def _codex_jsonl_evidence(stdout: bytes | None) -> dict:
         "tool_invocations": [
             {"item_type": name, **tools[name]} for name in sorted(tools)
         ],
+        "test_execution_events": test_execution_events,
         "tool_event_coverage": (
             "partial" if parse_errors else "captured" if tools else "no_tool_events"
         ),
+        "last_tool_event_index": last_tool_event_index,
         "reported_usage": reported_usage,
         "usage_source": "codex_jsonl_turn_completed" if reported_usage is not None else "not_reported",
         "reported_model": reported_model,

@@ -97,6 +97,58 @@ class CodexEvidenceTests(unittest.TestCase):
         self.assertEqual(tool["completed_events"], 1)
         self.assertEqual(tool["success_reported_events"], 1)
 
+    def test_command_execution_events_record_individual_test_results_without_raw_output(self):
+        output = "tests/test_worker.py::test_recovers PASSED\n2 passed in 0.02s"
+        events = [
+            {"type": "item.completed", "item": {
+                "id": "exec-1", "type": "command_execution",
+                "command": "python -m pytest --junitxml=reports/out.xml",
+                "exit_code": 0, "aggregated_output": output,
+            }},
+        ]
+        stdout = b"\n".join(json.dumps(event).encode("utf-8") for event in events)
+
+        evidence = codex_evidence._codex_jsonl_evidence(stdout)
+
+        self.assertEqual(evidence["test_execution_events"], [{
+            "event_id": "exec-1", "event_index": 1, "exit_code": 0,
+            "runner": "pytest",
+            "command_sha256": hashlib.sha256(b"python -m pytest --junitxml=reports/out.xml").hexdigest(),
+            "output_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
+            "junit_report_path": "reports/out.xml",
+            "tests": [{"test_id": "tests/test_worker.py::test_recovers", "status": "passed"}],
+        }])
+        self.assertNotIn(output, json.dumps(evidence))
+
+    def test_unittest_execution_is_bound_to_event_and_nonzero_exit_does_not_pass(self):
+        output = "test_recovers (tests.test_worker.WorkerTests.test_recovers) ... ok"
+        event = {"type": "item.completed", "item": {
+            "id": "exec-2", "type": "command_execution", "command": "python -m unittest",
+            "exit_code": 2, "aggregated_output": output,
+        }}
+        evidence = codex_evidence._codex_jsonl_evidence(json.dumps(event).encode("utf-8"))
+        receipt = evidence["test_execution_events"][0]
+        self.assertEqual(receipt["event_id"], "exec-2")
+        self.assertEqual(receipt["exit_code"], 2)
+        self.assertEqual(receipt["tests"], [{
+            "test_id": "tests.test_worker.WorkerTests.test_recovers", "status": "passed",
+        }])
+
+    def test_duplicate_test_ids_are_preserved_for_fail_closed_validation(self):
+        output = (
+            "tests/test_worker.py::test_recovers PASSED\n"
+            "tests/test_worker.py::test_recovers FAILED\n"
+        )
+        evidence = codex_evidence._codex_jsonl_evidence(json.dumps({"type": "item.completed", "item": {
+            "id": "exec-duplicate", "type": "command_execution", "command": "python -m pytest",
+            "exit_code": 1, "aggregated_output": output,
+        }}).encode("utf-8"))
+
+        self.assertEqual(evidence["test_execution_events"][0]["tests"], [
+            {"test_id": "tests/test_worker.py::test_recovers", "status": "failed"},
+            {"test_id": "tests/test_worker.py::test_recovers", "status": "passed"},
+        ])
+
     def test_langfuse_metadata_is_bounded_and_normalizes_values(self):
         operation = {
             "operation_id": "operation-1",

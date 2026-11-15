@@ -44,6 +44,7 @@ from workflow import process_control as _process_control
 from workflow import planning_review as _planning_review
 from workflow import review_input as _review_input
 from workflow import skills as _skills
+from workflow import traceability as _traceability
 from workflow import workspace as _workspace
 from workflow.delivery import render_delivery_report
 from workflow.codex_evidence import (
@@ -161,6 +162,30 @@ need a mock or stub, and which require a real external integration.
 Classify decisions as must implement, should implement, future production considerations, out of scope, open
 questions or ambiguities, and external dependencies. Use only the categories that apply. Keep the proposal at the
 level of detail needed to explain the reasoning; do not make it longer or more sophisticated for its own sake."""
+COMMITMENT_LEDGER_GUIDANCE = """Commitment ledger contract
+Represent only material commitments. Do not convert every proposal sentence or general best practice into an
+implementation obligation. Classify each ledger entry as one of: mandatory_user_requirement,
+accepted_architectural_commitment, required_validation_scenario, optional_recommendation,
+future_production_consideration, or explicitly_out_of_scope. Use availability active or externally_blocked
+independently from class. Give every entry a stable ID such as C-001, a concise statement, an observable acceptance
+condition, implementation_expectations, and verification_scenarios (an array of {id, description}; use an empty
+array only when no specific scenario is required). Partial-delivery policy is optional. If no partial delivery is
+authorized, omit the `partial_delivery_policy` property entirely; do not add an empty policy or infer permission.
+When authorizations are explicitly approved, use exactly this structure:
+`partial_delivery_policy: {"reason":"non-empty policy-level reason","authorizations":[{"commitment_id":"C-001","allowed_dispositions":["externally_blocked"]}]}`.
+The non-empty `reason` belongs to the `partial_delivery_policy` object itself, never inside an authorization.
+Each authorization contains `commitment_id` and `allowed_dispositions`; allowed dispositions are externally_blocked,
+deferred, waived, or unverified. Do not infer partial-delivery authorization. Return exactly one machine-readable
+fenced block in this form:
+
+```commitment-ledger
+{"schema_version":1,"commitments":[{"id":"C-001","class":"mandatory_user_requirement","statement":"...","acceptance_condition":"...","implementation_expectations":["..."],"verification_scenarios":[{"id":"scenario-1","description":"..."}],"availability":"active"}]}
+```
+
+If a partial-delivery policy is present, add it as a top-level property of that same ledger JSON object using the
+exact policy structure above. If no partial authorizations are approved, leave the property out.
+The user's existing proposal approval explicitly approves the visible classifications, acceptance conditions, and
+any partial-delivery policy. Preserve the block during every proposal refinement and human revision."""
 ARCHITECTURAL_DECISION_OUTPUT = """Choose the simplest architecture that adequately satisfies the functional and operational requirements. Do not
 optimize for minimum component count at the expense of correctness, reliability, concurrency, scalability, or operations.
 For planning and proposal refinement, apply the architecture-design skill by recording a concise
@@ -329,6 +354,7 @@ def _workflow_process_lock(target: Path, workflow_id: str):
     the kernel lock, never by the file's existence, so a process crash cannot leave
     a stale lock that blocks future recovery.
     """
+
     workflows_dir = _check_plain_directories(target, WORKFLOW_ROOT, create=True)
     lock_path = workflows_dir / f".{workflow_id}.lock"
     _safe_artifact(lock_path)
@@ -766,6 +792,7 @@ class Orchestrator:
         if not self._process_lock_held:
             raise WorkflowError("Workflow state writes require the workflow process lock.")
         self.state["updated_at"] = now()
+        self.state["workflow_status"] = self.state.get("status")
         current_stage = self.state.get("stage")
         for operation in self.state.get("operation_history", []):
             if (operation.get("status") == "completed" and operation.get("result_text") is not None
@@ -1508,6 +1535,11 @@ class Orchestrator:
         return clean_markdown(proposal)
 
     def _write_proposal(self, proposal: str) -> None:
+        if self.state.get("traceability_required") is True:
+            try:
+                _traceability.parse_commitment_ledger(proposal)
+            except _traceability.TraceabilityError as exc:
+                raise WorkflowError(f"Proposal must preserve a valid commitment ledger before review or approval: {exc}") from exc
         _atomic_text(self.proposal_path, proposal)
         content = _persistence.read_bytes(self.proposal_path)
         digest = hashlib.sha256(content).hexdigest()
@@ -1554,6 +1586,8 @@ class Orchestrator:
             "code_review": self.state.get("code_review"),
             "verification_report": self.state.get("verification_report"),
         }
+        if self.state.get("traceability_required") is True:
+            report_bundle["commitment_assessment"] = self.state.get("commitment_assessment")
         report_bytes = json.dumps(
             report_bundle, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
         ).encode("utf-8")
@@ -1572,6 +1606,17 @@ class Orchestrator:
             "correction_summary_sha256": hashlib.sha256(
                 str(self.state.get("correction_summary") or "").encode("utf-8"),
             ).hexdigest(),
+            "commitment_ledger_sha256": (
+                self.state.get("commitment_ledger_approval", {}).get("ledger_sha256")
+                if isinstance(self.state.get("commitment_ledger_approval"), dict) else None
+            ),
+            "commitment_evidence_sha256": (
+                self.state.get("commitment_evidence", {}).get("evidence_sha256")
+                if isinstance(self.state.get("commitment_evidence"), dict) else None
+            ),
+            "commitment_assessment_sha256": _traceability.canonical_sha256(
+                self.state.get("commitment_assessment"),
+            ) if self.state.get("traceability_required") is True else None,
             "captured_at": fingerprint.get("captured_at"),
         }
         if purpose == "verification":
@@ -1612,6 +1657,18 @@ class Orchestrator:
                 or proposal_hash != version_hash
                 or self._read_proposal() != clean_markdown(self.state.get("proposal", ""))):
             raise WorkflowError("Delivery is blocked because the saved proposal changed after review.")
+        approved_ledger_snapshot = self.state.get("commitment_ledger_approval")
+        if self.state.get("traceability_required") is True:
+            try:
+                current_ledger = _traceability.parse_commitment_ledger(self._read_proposal())
+            except _traceability.TraceabilityError as exc:
+                raise WorkflowError(f"Delivery is blocked because the approved commitment ledger is invalid: {exc}") from exc
+            if (not isinstance(approved_ledger_snapshot, dict)
+                    or approved_ledger_snapshot.get("proposal_version") != self.state.get("proposal_version")
+                    or approved_ledger_snapshot.get("proposal_sha256") != proposal_hash
+                    or approved_ledger_snapshot.get("ledger_sha256") != _traceability.canonical_sha256(current_ledger)
+                    or approved_ledger_snapshot.get("ledger") != current_ledger):
+                raise WorkflowError("Delivery is blocked because the approved commitment ledger binding changed.")
         campaign = self.state.get("review_campaign")
         report_bundle = {
             "campaign": {
@@ -1626,11 +1683,33 @@ class Orchestrator:
             "code_review": self.state.get("code_review"),
             "verification_report": self.state.get("verification_report"),
         }
+        if self.state.get("traceability_required") is True:
+            report_bundle["commitment_assessment"] = self.state.get("commitment_assessment")
         report_bytes = json.dumps(
             report_bundle, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
         ).encode("utf-8")
         if hashlib.sha256(report_bytes).hexdigest() != evidence.get("review_reports_sha256"):
             raise WorkflowError("Delivery is blocked because the final review evidence changed after verification.")
+        if self.state.get("traceability_required") is True:
+            approved_ledger = self.state.get("commitment_ledger_approval", {})
+            commitment_evidence = self.state.get("commitment_evidence")
+            if isinstance(commitment_evidence, dict):
+                evidence_payload = dict(commitment_evidence)
+                expected_evidence_hash = evidence_payload.pop("evidence_sha256", None)
+                evidence_record_matches = (
+                    expected_evidence_hash == _traceability.canonical_sha256(evidence_payload)
+                    and evidence.get("commitment_evidence_sha256") == expected_evidence_hash
+                )
+            else:
+                evidence_record_matches = (
+                    commitment_evidence is None and evidence.get("commitment_evidence_sha256") is None
+                )
+            if (evidence.get("commitment_ledger_sha256") != approved_ledger.get("ledger_sha256")
+                    or not evidence_record_matches
+                    or evidence.get("commitment_assessment_sha256") != _traceability.canonical_sha256(
+                        self.state.get("commitment_assessment"),
+                    )):
+                raise WorkflowError("Delivery is blocked because commitment traceability evidence changed after review.")
         if (hashlib.sha256(str(self.state.get("implementation_summary") or "").encode("utf-8")).hexdigest()
                 != evidence.get("implementation_summary_sha256")
                 or hashlib.sha256(str(self.state.get("correction_summary") or "").encode("utf-8")).hexdigest()
@@ -1704,6 +1783,12 @@ class Orchestrator:
             "preexisting_paths": _protected_paths(self.target, baseline),
             "project_guidance": _project_guidance(self.target, self.task.strip()),
             "proposal_version": 0,
+            "traceability_required": True,
+            "commitment_ledger_approval": None,
+            "commitment_evidence": None,
+            "commitment_assessment": None,
+            "commitment_gate": None,
+            "delivery_disposition": None,
             "planning_validation_failures": [],
             "planning_validation_failure_history_truncated": False,
             "authorization": new_workflow_authorization(
@@ -1753,8 +1838,25 @@ class Orchestrator:
         current_proposal = self._read_proposal()
         if current_proposal != clean_markdown(self.state.get("proposal", "")):
             raise WorkflowError("The proposal file changed after review; use revise to review the change before approval.")
+        ledger_snapshot = None
+        if self.state.get("traceability_required") is True:
+            try:
+                ledger = _traceability.parse_commitment_ledger(current_proposal)
+            except _traceability.TraceabilityError as exc:
+                raise WorkflowError(f"Proposal approval requires a valid, user-reviewable commitment ledger: {exc}") from exc
+            proposal_sha256 = hashlib.sha256(_persistence.read_bytes(self.proposal_path)).hexdigest()
+            ledger_snapshot = {
+                "schema_version": _traceability.LEDGER_SCHEMA_VERSION,
+                "proposal_version": self.state.get("proposal_version"),
+                "proposal_sha256": proposal_sha256,
+                "ledger": ledger,
+                "ledger_sha256": _traceability.canonical_sha256(ledger),
+                "approved_at": now(),
+            }
         self._begin_execution_trace("approve")
         self.state["implementation_approved_at"] = {"time": now(), "method": "explicit approve command"}
+        if ledger_snapshot is not None:
+            self.state["commitment_ledger_approval"] = ledger_snapshot
         self.state["status"] = "running"
         self.state["stage"] = "implementation"
         self.state["error"] = None
@@ -1808,6 +1910,403 @@ class Orchestrator:
     def _claude_skill_content_authorized(self) -> bool:
         permitted = self.state.get("authorization", {}).get("claude_aily", {}).get("permitted_data", [])
         return isinstance(permitted, list) and "relevant_skill_instructions" in permitted
+
+    def _capture_commitment_evidence(self, report: str) -> None:
+        """Bind Codex's references to the completed implementation/correction operation."""
+        if self.state.get("traceability_required") is not True:
+            return
+        approval = self.state.get("commitment_ledger_approval")
+        ledger = approval.get("ledger") if isinstance(approval, dict) else None
+        if not isinstance(ledger, dict):
+            self.state["commitment_evidence"] = {"error": "approved commitment ledger is unavailable"}
+            return
+        operation_history = self.state.get("operation_history", [])
+        if not isinstance(operation_history, list):
+            operation_history = []
+        operation = next((
+            item for item in reversed(operation_history)
+            if isinstance(item, dict) and item.get("operation_type") == "codex"
+            and item.get("stage") in {"implementation", "correction"} and item.get("status") == "completed"
+        ), None)
+        try:
+            evidence = _traceability.parse_codex_evidence(report, ledger)
+            if evidence is None:
+                raise _traceability.TraceabilityError("Codex did not return a harness-evidence block")
+            if operation is None:
+                raise _traceability.TraceabilityError("no completed implementation operation can own the evidence")
+            operation_id = operation.get("operation_id")
+            history = self.state.get("operation_history", [])
+            if (not isinstance(operation_id, str)
+                    or not isinstance(history, list)
+                    or sum(isinstance(item, dict) and item.get("operation_id") == operation_id for item in history) != 1):
+                raise _traceability.TraceabilityError("implementation operation ID is missing or ambiguous")
+            operation["target_fingerprint"] = self._fingerprint_repository(self.target)
+            receipts_by_id: dict[str, list[dict]] = {}
+            for item in operation.get("test_execution_events", []):
+                if isinstance(item, dict) and isinstance(item.get("event_id"), str):
+                    receipts_by_id.setdefault(item["event_id"], []).append(item)
+            for entry in evidence["commitments"]:
+                entry["operation_id"] = operation_id
+                for reference in entry.get("validation_refs", []):
+                    artifact_path = reference.get("artifact_path")
+                    if not artifact_path:
+                        continue
+                    event_ids = reference.get("execution_event_ids", [])
+                    if len(event_ids) != 1:
+                        reference["artifact_error"] = "one JUnit artifact must identify exactly one execution event"
+                        continue
+                    try:
+                        _tests, artifact_digest = _traceability.junit_test_results(
+                            self.target, artifact_path, reference.get("artifact_sha256"),
+                        )
+                        artifact_mtime_ns = _traceability.junit_artifact_mtime_ns(self.target, artifact_path)
+                    except _traceability.TraceabilityError as exc:
+                        reference["artifact_error"] = str(exc)
+                        continue
+                    event_id = event_ids[0]
+                    matching_receipts = receipts_by_id.get(event_id, [])
+                    receipt = matching_receipts[0] if len(matching_receipts) == 1 else None
+                    if (not isinstance(receipt, dict) or type(receipt.get("exit_code")) is not int
+                            or receipt.get("exit_code") != 0
+                            or receipt.get("runner") != "pytest"
+                            or receipt.get("junit_report_path") != artifact_path):
+                        reference["artifact_error"] = (
+                            "JUnit artifact path is not the report output of its successful pytest execution event"
+                        )
+                        continue
+                    receipt["junit_artifact"] = {
+                        "path": artifact_path,
+                        "sha256": artifact_digest,
+                        "mtime_ns": artifact_mtime_ns,
+                        "event_id": event_id,
+                        "operation_id": operation_id,
+                        "target_fingerprint": operation.get("target_fingerprint"),
+                    }
+            receipt_material = []
+            for entry in evidence["commitments"]:
+                for reference in entry.get("validation_refs", []):
+                    for event_id in reference.get("execution_event_ids", []):
+                        matching_receipts = receipts_by_id.get(event_id, [])
+                        receipt = matching_receipts[0] if len(matching_receipts) == 1 else None
+                        if isinstance(receipt, dict):
+                            receipt_material.append({
+                                "operation_id": operation_id,
+                                "operation_stdout_sha256": operation.get("stdout_sha256"),
+                                "event_id": event_id,
+                                "receipt": receipt,
+                            })
+            record = {
+                "schema_version": _traceability.EVIDENCE_SCHEMA_VERSION,
+                "proposal_version": approval.get("proposal_version"),
+                "proposal_sha256": approval.get("proposal_sha256"),
+                "ledger_sha256": approval.get("ledger_sha256"),
+                "operation_id": operation_id,
+                "operation_stdout_sha256": operation.get("stdout_sha256"),
+                "operation_target_fingerprint": operation.get("target_fingerprint"),
+                "test_receipts_sha256": _traceability.canonical_sha256(receipt_material),
+                "evidence": evidence,
+            }
+            record["evidence_sha256"] = _traceability.canonical_sha256(record)
+            self.state["commitment_evidence"] = record
+        except (_traceability.TraceabilityError, KeyError, TypeError, AttributeError) as exc:
+            self.state["commitment_evidence"] = {
+                "schema_version": _traceability.EVIDENCE_SCHEMA_VERSION,
+                "proposal_version": approval.get("proposal_version"),
+                "proposal_sha256": approval.get("proposal_sha256"),
+                "ledger_sha256": approval.get("ledger_sha256"),
+                "operation_id": operation.get("operation_id") if operation else None,
+                "operation_stdout_sha256": operation.get("stdout_sha256") if operation else None,
+                "operation_target_fingerprint": operation.get("target_fingerprint") if operation else None,
+                "test_receipts_sha256": _traceability.canonical_sha256([]),
+                "evidence": None,
+                "error": str(exc),
+            }
+            self.state["commitment_evidence"]["evidence_sha256"] = _traceability.canonical_sha256(
+                self.state["commitment_evidence"],
+            )
+
+    def _capture_commitment_assessment(self, report: str, *, purpose: str) -> None:
+        if self.state.get("traceability_required") is not True:
+            return
+        approval = self.state.get("commitment_ledger_approval")
+        ledger = approval.get("ledger") if isinstance(approval, dict) else None
+        assessment = None
+        error = None
+        if not isinstance(ledger, dict):
+            error = "approved commitment ledger is unavailable"
+        else:
+            try:
+                assessment = _traceability.parse_claude_assessment(report, ledger)
+                if assessment is None:
+                    error = "Claude report did not include a commitment-assessment block"
+            except (_traceability.TraceabilityError, KeyError, TypeError, AttributeError) as exc:
+                error = str(exc)
+        self.state["commitment_assessment"] = {
+            "schema_version": 1,
+            "purpose": purpose,
+            "proposal_version": self.state.get("proposal_version"),
+            "proposal_sha256": approval.get("proposal_sha256") if isinstance(approval, dict) else None,
+            "ledger_sha256": approval.get("ledger_sha256") if isinstance(approval, dict) else None,
+            "report_sha256": hashlib.sha256(report.encode("utf-8")).hexdigest(),
+            "assessment": assessment,
+            "error": error,
+        }
+
+    def _evaluate_commitment_delivery(self) -> dict | None:
+        if self.state.get("traceability_required") is not True:
+            return None
+        approval = self.state.get("commitment_ledger_approval")
+        if not isinstance(approval, dict) or not isinstance(approval.get("ledger"), dict):
+            result = {
+                "schema_version": 1,
+                "disposition": "blocked",
+                "rationale": "No approved commitment ledger snapshot is available.",
+                "commitments": [],
+            }
+            self.state["commitment_gate"] = result
+            self.state["delivery_disposition"] = "blocked"
+            return result
+        evidence_record = self.state.get("commitment_evidence")
+        evidence = None
+        hard_errors: list[str] = []
+        if approval.get("ledger_sha256") != _traceability.canonical_sha256(approval["ledger"]):
+            hard_errors.append("Approved commitment ledger snapshot changed after approval")
+        if approval.get("proposal_sha256") != self.state.get("proposal_artifact_sha256"):
+            hard_errors.append("Approved proposal identity changed after approval")
+        try:
+            current_proposal_sha256 = hashlib.sha256(_persistence.read_bytes(self.proposal_path)).hexdigest()
+        except (OSError, WorkflowError):
+            current_proposal_sha256 = None
+        if current_proposal_sha256 != approval.get("proposal_sha256"):
+            hard_errors.append("Proposal artifact changed or is unavailable after approval")
+        ledger_commitments = approval["ledger"].get("commitments", [])
+        if not isinstance(ledger_commitments, list):
+            hard_errors.append("Approved commitment ledger commitments are malformed")
+            ledger_commitments = []
+        has_required_commitments = any(
+            item.get("class") in _traceability.REQUIRED_CLASSES
+            for item in ledger_commitments if isinstance(item, dict)
+        )
+        operation_history = self.state.get("operation_history", [])
+        if not isinstance(operation_history, list):
+            operation_history = []
+            hard_errors.append("Operation history is malformed")
+        operations_by_id: dict[str, list[dict]] = {}
+        completed_work_operations = []
+        for operation in operation_history:
+            if not isinstance(operation, dict):
+                continue
+            operation_id = operation.get("operation_id")
+            if isinstance(operation_id, str):
+                operations_by_id.setdefault(operation_id, []).append(operation)
+            if (operation.get("operation_type") == "codex"
+                    and operation.get("stage") in {"implementation", "correction"}
+                    and operation.get("status") == "completed"):
+                completed_work_operations.append(operation)
+        duplicate_operation_ids = sorted(
+            operation_id for operation_id, matches in operations_by_id.items() if len(matches) != 1
+        )
+        if duplicate_operation_ids:
+            hard_errors.append("Duplicate operation IDs are present: " + ", ".join(duplicate_operation_ids))
+        latest_operation = completed_work_operations[-1] if completed_work_operations else None
+        if not isinstance(evidence_record, dict):
+            if has_required_commitments:
+                hard_errors.append("Codex commitment evidence record is missing")
+        else:
+            evidence_payload = dict(evidence_record)
+            saved_digest = evidence_payload.pop("evidence_sha256", None)
+            if saved_digest != _traceability.canonical_sha256(evidence_payload):
+                hard_errors.append("Codex commitment evidence digest does not match the saved record")
+            elif (evidence_record.get("ledger_sha256") != approval.get("ledger_sha256")
+                  or evidence_record.get("proposal_version") != approval.get("proposal_version")
+                  or evidence_record.get("proposal_sha256") != approval.get("proposal_sha256")):
+                hard_errors.append("Codex evidence is bound to a different approved proposal or ledger")
+            else:
+                evidence = evidence_record.get("evidence")
+                if evidence is not None and not isinstance(evidence, dict):
+                    hard_errors.append("Codex commitment evidence payload is malformed")
+                    evidence = None
+                if evidence is None and has_required_commitments and not evidence_record.get("error"):
+                    hard_errors.append("Codex commitment evidence payload is missing")
+                if isinstance(evidence, dict):
+                    evidence_operation_id = evidence_record.get("operation_id")
+                    if has_required_commitments and (
+                            not isinstance(latest_operation, dict)
+                            or evidence_operation_id != latest_operation.get("operation_id")):
+                        hard_errors.append("Codex evidence is stale; it is not bound to the latest implementation or correction operation")
+                    operation_matches = (
+                        operations_by_id.get(evidence_operation_id, [])
+                        if isinstance(evidence_operation_id, str) else []
+                    )
+                    if len(operation_matches) != 1:
+                        if has_required_commitments:
+                            hard_errors.append("Codex evidence operation ID is missing or ambiguous")
+                        bound_operation = {}
+                    else:
+                        bound_operation = operation_matches[0]
+                    if has_required_commitments and isinstance(latest_operation, dict) and bound_operation is latest_operation:
+                        if (evidence_record.get("operation_stdout_sha256") != bound_operation.get("stdout_sha256")
+                                or evidence_record.get("operation_target_fingerprint") != bound_operation.get("target_fingerprint")):
+                            hard_errors.append("Codex evidence operation output or target fingerprint changed after capture")
+                    receipt_material = []
+                    evidence_entries = evidence.get("commitments", [])
+                    if not isinstance(evidence_entries, list):
+                        hard_errors.append("Codex evidence commitments are malformed")
+                        evidence_entries = []
+                    for item in evidence_entries:
+                        if not isinstance(item, dict):
+                            hard_errors.append("Codex evidence contains a malformed commitment entry")
+                            continue
+                        operation_id = item.get("operation_id") or evidence_operation_id
+                        if has_required_commitments and operation_id != evidence_operation_id:
+                            hard_errors.append("A commitment evidence entry references a different operation")
+                            continue
+                        operation_candidates = (
+                            operations_by_id.get(operation_id, []) if isinstance(operation_id, str) else []
+                        )
+                        if len(operation_candidates) != 1:
+                            continue
+                        operation = operation_candidates[0]
+                        receipt_groups: dict[str, list[dict]] = {}
+                        receipts = operation.get("test_execution_events", [])
+                        if isinstance(receipts, list):
+                            for receipt in receipts:
+                                if isinstance(receipt, dict) and isinstance(receipt.get("event_id"), str):
+                                    receipt_groups.setdefault(receipt["event_id"], []).append(receipt)
+                        validation_refs = item.get("validation_refs", [])
+                        if not isinstance(validation_refs, list):
+                            hard_errors.append("Codex validation references are malformed")
+                            continue
+                        for reference in validation_refs:
+                            if not isinstance(reference, dict):
+                                hard_errors.append("Codex validation reference is malformed")
+                                continue
+                            event_ids = reference.get("execution_event_ids", [])
+                            if not isinstance(event_ids, list):
+                                hard_errors.append("Codex execution event references are malformed")
+                                continue
+                            for event_id in event_ids:
+                                if not isinstance(event_id, str):
+                                    hard_errors.append("Codex execution event ID is malformed")
+                                    continue
+                                matches = receipt_groups.get(event_id, [])
+                                if len(matches) == 1:
+                                    receipt_material.append({
+                                        "operation_id": operation_id,
+                                        "operation_stdout_sha256": operation.get("stdout_sha256"),
+                                        "event_id": event_id,
+                                        "receipt": matches[0],
+                                    })
+                    if (evidence_record.get("test_receipts_sha256")
+                            != _traceability.canonical_sha256(receipt_material)):
+                        hard_errors.append("Observed test execution receipts changed after capture")
+        assessment_record = self.state.get("commitment_assessment")
+        assessment = None
+        expected_assessment_purpose = "verification" if self.state.get("correction_attempts") else "initial"
+        report_text = (
+            self.state.get("verification_report")
+            if self.state.get("correction_attempts") else self.state.get("code_review")
+        )
+        if not isinstance(assessment_record, dict):
+            hard_errors.append("Claude commitment assessment record is missing")
+        elif (assessment_record.get("ledger_sha256") != approval.get("ledger_sha256")
+              or assessment_record.get("proposal_version") != approval.get("proposal_version")
+              or assessment_record.get("proposal_sha256") != approval.get("proposal_sha256")
+              or assessment_record.get("purpose") != expected_assessment_purpose
+              or assessment_record.get("report_sha256") != hashlib.sha256(str(report_text or "").encode("utf-8")).hexdigest()):
+            hard_errors.append("Claude commitment assessment is stale or bound to a different approved proposal or review report")
+        else:
+            assessment = assessment_record.get("assessment")
+            try:
+                report_assessment = _traceability.parse_claude_assessment(
+                    str(report_text or ""), approval["ledger"],
+                )
+            except (_traceability.TraceabilityError, KeyError, TypeError, AttributeError):
+                report_assessment = None
+            if assessment != report_assessment:
+                hard_errors.append("Saved Claude assessment does not match the bound review report")
+                assessment = None
+        integrity_record = self.state.get("integrity")
+        review_evidence = integrity_record.get("review_evidence", {}) if isinstance(integrity_record, dict) else {}
+        final_fingerprint = {
+            "working_tree_sha256": review_evidence.get("target_working_tree_sha256")
+            if isinstance(review_evidence, dict) else None,
+        }
+        try:
+            evaluation = _traceability.evaluate_ledger(
+                approval["ledger"], evidence, assessment,
+                target=self.target,
+                reviewed_paths=set(self.state.get("review_included_files", [])),
+                operations=self.state.get("operation_history", []),
+                final_fingerprint=final_fingerprint,
+            )
+        except Exception as exc:
+            hard_errors.append(f"Commitment evaluation failed: {type(exc).__name__}")
+            evaluation = {"schema_version": 1, "disposition": "blocked", "commitments": []}
+        if hard_errors:
+            evaluation["disposition"] = "blocked"
+            evaluation["rationale"] = "; ".join(hard_errors)
+        evaluation["workflow_status"] = self.state.get("status")
+        evaluation["approved_ledger_sha256"] = approval.get("ledger_sha256")
+        evaluation["evidence_integrity_errors"] = hard_errors
+        self.state["commitment_gate"] = evaluation
+        self.state["delivery_disposition"] = evaluation["disposition"]
+        return evaluation
+
+    def _commitment_review_context(self) -> str:
+        approval = self.state.get("commitment_ledger_approval")
+        evidence_record = self.state.get("commitment_evidence")
+        if not isinstance(approval, dict) or not isinstance(evidence_record, dict):
+            return "No approved commitment ledger or Codex evidence record is available."
+        evidence = evidence_record.get("evidence")
+        referenced_events = {
+            event_id
+            for item in (evidence or {}).get("commitments", []) if isinstance(item, dict)
+            for reference in item.get("validation_refs", []) if isinstance(reference, dict)
+            for event_id in reference.get("execution_event_ids", []) if isinstance(event_id, str)
+        }
+        operation_id = evidence_record.get("operation_id")
+        operation = next((
+            item for item in self.state.get("operation_history", [])
+            if isinstance(item, dict) and item.get("operation_id") == operation_id
+        ), {})
+        receipts = [
+            receipt for receipt in operation.get("test_execution_events", [])
+            if isinstance(receipt, dict) and receipt.get("event_id") in referenced_events
+        ]
+        ledger = approval.get("ledger") or {}
+        relevant_ids = {
+            item.get("id") for item in ledger.get("commitments", [])
+            if isinstance(item, dict) and item.get("class") in _traceability.REQUIRED_CLASSES
+        }
+        compact_ledger = [
+            {
+                key: item.get(key)
+                for key in ("id", "class", "statement", "acceptance_condition", "availability", "verification_scenarios")
+            }
+            for item in ledger.get("commitments", [])
+            if isinstance(item, dict) and item.get("id") in relevant_ids
+        ]
+        compact_evidence = [
+            {
+                "commitment_id": item.get("commitment_id"),
+                "source_refs": item.get("source_refs", []),
+                "validation_refs": item.get("validation_refs", []),
+                "disposition": item.get("disposition"),
+                "reason": item.get("reason"),
+            }
+            for item in (evidence or {}).get("commitments", [])
+            if isinstance(item, dict) and item.get("commitment_id") in relevant_ids
+        ]
+        return json.dumps({
+            "approved_ledger_sha256": approval.get("ledger_sha256"),
+            "commitments_requiring_assessment": compact_ledger,
+            "codex_evidence_references": compact_evidence,
+            "codex_evidence_error": evidence_record.get("error"),
+            "execution_operation_id": operation_id,
+            "execution_target_fingerprint": operation.get("target_fingerprint"),
+            "observed_test_execution_receipts": receipts,
+        }, sort_keys=True, ensure_ascii=False, indent=2)
 
     def reject(self, reason: str) -> dict:
         return self._execute_locked(lambda: self._reject_locked(reason))
@@ -1975,6 +2474,8 @@ class Orchestrator:
 
     def status(self) -> dict:
         self._read_state()
+        self.state.setdefault("workflow_status", self.state.get("status"))
+        self.state.setdefault("delivery_disposition", None)
         recovery = self.state.get("recovery")
         if isinstance(recovery, dict):
             recovery["target_changes"] = self._target_change_inventory()
@@ -2720,6 +3221,32 @@ class Orchestrator:
                 "assignment; do not elevate style preferences or hypothetical concerns into findings."
             ),
         }
+        approval = self.state.get("commitment_ledger_approval")
+        ledger = approval.get("ledger") if isinstance(approval, dict) else {}
+        requires_assessment = any(
+            item.get("class") in _traceability.REQUIRED_CLASSES
+            for item in ledger.get("commitments", []) if isinstance(item, dict)
+        )
+        if self.state.get("traceability_required") is True and not requires_assessment:
+            # Non-gating ledger entries need user approval, but do not add review obligations or
+            # consume scarce patch context when no commitment requires independent assessment.
+            shared["Approved proposal"] = re.sub(
+                r"(?ms)^```commitment-ledger[ \t]*\n.*?^```[ \t]*$", "", self.state["proposal"],
+            ).strip()
+        if self.state.get("traceability_required") is True and requires_assessment:
+            shared["Commitment ledger and Harness-validated evidence references"] = self._commitment_review_context()
+            shared["Commitment assessment contract"] = (
+                "Assess each required commitment independently against the source diff and observed runner receipts. "
+                "Agent assertions and metadata do not prove fulfillment; do not infer implementation from tests or "
+                "verification from source. An unfulfilled required item is a Must fix and requires "
+                "Decision: CHANGES_REQUESTED. Include one fenced `commitment-assessment` JSON block for every "
+                "required ID: {\"schema_version\":1,\"commitments\":[{\"id\":\"C-001\","
+                "\"implementation_status\":\"implemented|partial|not_started\","
+                "\"verification_status\":\"not_run|passed|failed|unverified|blocked\","
+                "\"assessment\":\"fulfilled|partially_fulfilled|not_fulfilled|insufficient_evidence\","
+                "\"explanation\":\"...\",\"evidence_refs\":{\"source\":[\"path#symbol\"],"
+                "\"validation\":[\"scenario/test ID\"]}}]}."
+            )
         if purpose == "verification":
             history = self.state.get("review_campaign_history", [])
             initial = next((
@@ -2951,8 +3478,11 @@ class Orchestrator:
                         "future production considerations, and out of scope. Do not invent product behavior. "
                         "Return a concise, readable Markdown implementation proposal with scope, approach, risks, "
                         "a requirements-to-design mapping, material architectural decisions and their trade-offs, "
-                        "relevant skills and how they were applied, and concrete validation commands. Do not modify "
+                        "relevant skills and how they were applied, and concrete validation commands. Include the "
+                        "approved-design commitment classifications and the required machine-readable ledger below. "
+                        "Do not modify "
                         "files or run tests.\n\n"
+                        f"{COMMITMENT_LEDGER_GUIDANCE}\n\n"
                         f"{skill_guidance}\n\n"
                         f"{PLANNING_PRINCIPLES}\n\nTarget: {self.target}\n\nAssignment:\n{self.state['task']}"
                     )
@@ -3013,7 +3543,8 @@ class Orchestrator:
                         "recommendations; do not turn optional production advice into assignment requirements. "
                         "Return the complete refined proposal as readable Markdown, retaining requirements mapping, "
                         "material architectural decisions and trade-offs, scope distinctions, and the relevant skills "
-                        "and their application. Put a section titled "
+                        "and their application. Preserve or update the machine-readable commitment ledger to reflect "
+                        "the refined proposal without converting optional or future advice into obligations. Put a section titled "
                         "`## Claude finding dispositions` at the end of the proposal. Use one bullet for every finding "
                         "in this format: `- Finding: ... | Decision: incorporated/rejected/deferred | Reason: ...`. "
                         "If there are none, write `- No actionable findings.` Apply Engineering Judgment & "
@@ -3021,6 +3552,7 @@ class Orchestrator:
                         "line exactly in this form: `Second plan review needed: yes` or `...: no`. Use yes only when "
                         "a material plan change needs a second independent plan review.\n\n"
                         f"{ARCHITECTURAL_DECISION_OUTPUT}\n\n{PLANNING_PRINCIPLES}\n\n{skill_guidance}\n\n"
+                        f"{COMMITMENT_LEDGER_GUIDANCE}\n\n"
                         f"Assignment:\n{self.state['task']}\n\nCurrent proposal (version "
                         f"{self.state.get('proposal_version', 1)}):\n{self.state['proposal']}\n\n"
                         f"Claude review (iteration {iteration}, proposal version {review.get('proposal_version')}):\n{report}"
@@ -3059,9 +3591,10 @@ class Orchestrator:
                         "assignment and unrelated decisions intact. Apply Engineering Judgment & Proportional Design. "
                         "Apply relevant skill instructions below, and record the skill name and how it informed the "
                         "proposal; if there are no applicable skills, state that. Distinguish must implement, should "
-                        "implement, future production considerations, and out of scope. Return the complete proposal "
+                        "implement, future production considerations, and out of scope. Preserve and update the "
+                        "machine-readable commitment ledger using the user's explicit feedback. Return the complete proposal "
                         "in readable Markdown; do not implement code.\n\n"
-                        f"{ARCHITECTURAL_DECISION_OUTPUT}\n\n{PLANNING_PRINCIPLES}\n\n{skill_guidance}\n\n"
+                        f"{ARCHITECTURAL_DECISION_OUTPUT}\n\n{PLANNING_PRINCIPLES}\n\n{COMMITMENT_LEDGER_GUIDANCE}\n\n{skill_guidance}\n\n"
                         f"Assignment:\n{self.state['task']}\n\nCurrent proposal (version "
                         f"{self.state.get('proposal_version', 1)}):\n{self.state['proposal']}\n\n"
                         f"Prior review attempts:\n{self._review_history_for_prompt()}\n\n"
@@ -3099,11 +3632,24 @@ class Orchestrator:
                         "user authorization and are not included in this workflow authorization. "
                         "Do not delete unrelated existing files. Follow Engineering Judgment & Proportional Design "
                         "and do not invent product behavior. Return a concise summary with files changed, "
-                        "commands actually run, results, and known limitations.\n\n"
-                        f"{PLANNING_PRINCIPLES}\n\n{skill_guidance}\n\n"
+                        "commands actually run, results, and known limitations. Do not use this summary to declare "
+                        "commitments fulfilled. Finish with one `harness-evidence` JSON block linking each approved "
+                        "commitment to source references and specific scenario/test IDs plus Codex execution event IDs. "
+                        "Run all required scenarios after the final code edits, prefer one combined runner invocation, "
+                        "and make it the last tool action; do not edit code afterward. Do not include raw command output "
+                        "or secrets. Use exactly one fenced block labeled "
+                        "`harness-evidence` with this JSON shape, replacing example values:\n"
+                        "```harness-evidence\n"
+                        "{\"schema_version\":1,\"commitments\":["
+                        "{\"commitment_id\":\"C-001\",\"source_refs\":[{\"path\":\"src/file.py\","
+                        "\"symbol\":\"function_name\"}],\"validation_refs\":[{\"scenario_id\":\"scenario-1\","
+                        "\"test_ids\":[\"tests/test_file.py::test_case\"],\"execution_event_ids\":[\"event-id\"]}],"
+                        "\"disposition\":null,\"reason\":null}]}\n```. Include only observed references.\n\n"
+                        f"{COMMITMENT_LEDGER_GUIDANCE}\n\n{PLANNING_PRINCIPLES}\n\n{skill_guidance}\n\n"
                         f"Assignment:\n{self.state['task']}\n\nApproved proposal:\n{self.state['proposal']}"
                     )
                     self.state["implementation_summary"] = self._run_codex(prompt, sandbox="workspace-write")
+                    self._capture_commitment_evidence(self.state["implementation_summary"])
                     self.state["stage"] = "code_review"
                     self._save()
                 elif stage in {"code_review", "verification"}:
@@ -3145,6 +3691,7 @@ class Orchestrator:
                         self.state["verification_report"] = report
                     else:
                         self.state["code_review"] = report
+                    self._capture_commitment_assessment(report, purpose=purpose)
                     if purpose == "verification":
                         self.state["verification_context_sha256"] = campaign.get("shared_context_sha256")
                     else:
@@ -3266,8 +3813,13 @@ class Orchestrator:
                         "integration report. Optional improvements are not mandatory. Modify only files necessary to "
                         "address valid findings; preserve behavior outside those findings. Do not perform unrelated "
                         "refactoring, cleanup, or scope expansion. Add or update focused tests when needed and rerun "
-                        "checks affected by the fixes. Do not repeat the review. Return a concise correction and "
-                        "validation summary.\n\n"
+                        "all required commitment validation scenarios against the corrected target. Do not repeat "
+                        "the review. Return a concise correction and validation summary plus one complete "
+                        "`harness-evidence` JSON block for every approved commitment, tied to this correction "
+                        "operation's test execution event IDs. Run all required scenarios after the final code edits, "
+                        "prefer one combined runner invocation, and make it the last tool action; do not edit code "
+                        "afterward. Do not include raw output or secrets.\n\n"
+                        f"{COMMITMENT_LEDGER_GUIDANCE}\n\n"
                         f"{PLANNING_PRINCIPLES}\n\n"
                         f"{skill_guidance}\n\n"
                         f"Assignment:\n{self.state['task']}\n\nApproved proposal:\n{self.state['proposal']}\n\n"
@@ -3276,6 +3828,7 @@ class Orchestrator:
                         f"Prior implementation summary:\n{self.state['implementation_summary']}"
                     )
                     self.state["correction_summary"] = self._run_codex(prompt, sandbox="workspace-write")
+                    self._capture_commitment_evidence(self.state["correction_summary"])
                     attempt["status"] = "completed"
                     attempt["finished_at"] = now()
                     attempt["correction_summary_sha256"] = hashlib.sha256(
@@ -3300,6 +3853,9 @@ class Orchestrator:
                         raise WorkflowError("Delivery is blocked because the target changed during final integrity checks.")
                     self.state["status"] = "complete"
                     self.state["completed_at"] = now()
+                    self._evaluate_commitment_delivery()
+                    if isinstance(self.state.get("commitment_gate"), dict):
+                        self.state["commitment_gate"]["workflow_status"] = "complete"
                     _atomic_text(self.delivery_path, self._delivery_report())
                     delivery_hash = hashlib.sha256(_persistence.read_bytes(self.delivery_path)).hexdigest()
                     self.state.setdefault("integrity", {})["delivery_artifact_sha256"] = delivery_hash

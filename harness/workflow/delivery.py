@@ -25,6 +25,8 @@ def render_delivery_report(
         "# Workflow delivery",
         "",
         f"- Workflow: `{workflow_id}`",
+        f"- Workflow status: `{state.get('workflow_status', state.get('status', 'unknown'))}`",
+        f"- Delivery disposition: `{state.get('delivery_disposition') or 'not recorded (legacy workflow)'}`",
         f"- Target: `{target}`",
         f"- Completed: {state.get('completed_at', fallback_completed_at)}",
         f"- Codex model: {state.get('codex_model') or 'Codex CLI default'}",
@@ -40,7 +42,70 @@ def render_delivery_report(
         f"Claude plan-review iterations: {valid_plan_review_count} valid of {external_authorization['max_plan_reviews']} maximum.",
         f"Invalidated plan-review attempts: {len(reviews) - valid_plan_review_count}.",
         "",
+        "## Commitment traceability",
+        "",
     ]
+    gate = state.get("commitment_gate")
+    if isinstance(gate, dict):
+        sections.extend([
+            f"Disposition: `{gate.get('disposition', 'unavailable')}`.",
+            f"Approved ledger SHA-256: `{gate.get('approved_ledger_sha256') or 'unavailable'}`.",
+            "Workflow completion and delivery disposition are recorded independently.",
+            gate.get("rationale") or "No disposition rationale was recorded.",
+            "",
+        ])
+        integrity_errors = gate.get("evidence_integrity_errors", [])
+        if isinstance(integrity_errors, list) and integrity_errors:
+            sections.append("Evidence integrity and provenance errors:")
+            sections.extend(f"- {error}" for error in integrity_errors if isinstance(error, str))
+            sections.append("")
+        elif gate.get("evidence_integrity_errors") == []:
+            sections.extend(["Evidence integrity and provenance: valid.", ""])
+        policy = gate.get("partial_delivery_policy")
+        if isinstance(policy, dict):
+            sections.extend([
+                f"Approved partial-delivery policy: {policy.get('reason') or 'reason unavailable'}",
+                "",
+            ])
+        commitments = gate.get("commitments", [])
+        if isinstance(commitments, list) and commitments:
+            for item in commitments:
+                if not isinstance(item, dict):
+                    continue
+                source_references = ", ".join(
+                    f"`{ref.get('path')}` ({ref.get('symbol')})"
+                    for ref in item.get("source_refs", []) if isinstance(ref, dict)
+                ) or "none"
+                validation_references = "; ".join(
+                    f"`{ref.get('scenario_id')}`: {', '.join(ref.get('test_ids', []))}"
+                    for ref in item.get("validation_refs", []) if isinstance(ref, dict)
+                ) or "none"
+                sections.extend([
+                    f"### {item.get('id', 'unknown')} — `{item.get('class', 'unknown')}`",
+                    "",
+                    f"- Availability: `{item.get('availability', 'unknown')}`.",
+                    f"- Acceptance condition: {item.get('acceptance_condition') or 'not recorded'}",
+                    f"- Implementation status: `{item.get('implementation_status') or 'unassessed'}`.",
+                    f"- Verification status: `{item.get('verification_status', 'unverified')}`.",
+                    f"- Claude assessment: `{item.get('claude_assessment') or 'insufficient_evidence'}`.",
+                    f"- Claude evidence references: `{'valid' if item.get('claude_evidence_refs_valid') else 'invalid or missing'}`.",
+                    f"- Source evidence: `{item.get('source_evidence_status', 'unavailable')}`.",
+                    f"- Source references: {source_references}.",
+                    f"- Validation references: {validation_references}.",
+                    f"- Independent assessment: {item.get('claude_explanation') or 'not recorded'}",
+                ])
+                sections.extend(f"- Gap: {reason}" for reason in item.get("reasons", []) if isinstance(reason, str))
+                if item.get("disposition"):
+                    sections.append(
+                        f"- Authorized disposition claim: `{item.get('disposition')}` — "
+                        f"{item.get('disposition_reason') or 'no reason recorded'}"
+                    )
+                sections.append("")
+        else:
+            sections.append("No commitment results were recorded.")
+    else:
+        sections.append("Traceability is unavailable or was not recorded for this legacy workflow.")
+    sections.append("")
     execution_fingerprint = state.get("execution_fingerprint", {})
     if not isinstance(execution_fingerprint, dict):
         execution_fingerprint = {}

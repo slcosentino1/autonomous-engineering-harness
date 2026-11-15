@@ -62,12 +62,20 @@ import json, sys
 sys.path.insert(0, {str(ROOT / 'harness')!r})
 import claude_reviewer, orchestrator
 
+ledger = "\\n```commitment-ledger\\n" + json.dumps({{"schema_version": 1, "commitments": [{{
+    "id": "C-TEST-001", "class": "optional_recommendation",
+    "statement": "Optional fixture recommendation.",
+    "acceptance_condition": "No obligation unless promoted.",
+    "implementation_expectations": ["No implementation required."],
+    "verification_scenarios": [], "availability": "active",
+}}]}}) + "\\n```\\n"
+
 class FakeCodex:
     responses = [
-        "# Proposal\\nCoordinate workflow state across processes.\\n",
+        "# Proposal\\nCoordinate workflow state across processes.\\n" + ledger,
         "# Refined proposal\\nUse a per-workflow process lock.\\n\\n"
         "## Claude finding dispositions\\n- No actionable findings.\\n\\n"
-        "Second plan review needed: no\\n",
+        + ledger + "Second plan review needed: no\\n",
     ]
     def __call__(self, command, **kwargs):
         path = command[command.index("--output-last-message") + 1]
@@ -231,11 +239,18 @@ print("DONE " + json.dumps({{"status": state["status"], "budget_unknown": state[
 
     @staticmethod
     def _fake_codex():
+        ledger = "\n```commitment-ledger\n" + json.dumps({"schema_version": 1, "commitments": [{
+            "id": "C-TEST-001", "class": "optional_recommendation",
+            "statement": "Optional fixture recommendation.",
+            "acceptance_condition": "No obligation unless promoted.",
+            "implementation_expectations": ["No implementation required."],
+            "verification_scenarios": [], "availability": "active",
+        }]}) + "\n```\n"
         responses = [
-            "# Proposal\nCoordinate workflow state across processes.\n",
+            "# Proposal\nCoordinate workflow state across processes.\n" + ledger,
             "# Refined proposal\nUse a per-workflow process lock.\n\n"
             "## Claude finding dispositions\n- No actionable findings.\n\n"
-            "Second plan review needed: no\n",
+            + ledger + "Second plan review needed: no\n",
         ]
         def run(command, **_kwargs):
             output_path = Path(command[command.index("--output-last-message") + 1])

@@ -29,6 +29,7 @@ from tools import read_documentation_url  # noqa: E402
 from workflow import review as review_contracts  # noqa: E402
 from workflow import workspace as workspace_ops  # noqa: E402
 from workflow import persistence as persistence_ops  # noqa: E402
+from workflow import codex_evidence  # noqa: E402
 
 
 def git(root: Path, *args: str) -> str:
@@ -64,6 +65,18 @@ def planning_scorecard_text(scores=None) -> str:
 
 
 class CodexGuidanceTests(unittest.TestCase):
+    def test_commitment_prompt_uses_the_canonical_partial_delivery_policy_schema(self):
+        guidance = orchestrator.COMMITMENT_LEDGER_GUIDANCE
+        self.assertIn(
+            '`partial_delivery_policy: {"reason":"non-empty policy-level reason",'
+            '"authorizations":[{"commitment_id":"C-001",'
+            '"allowed_dispositions":["externally_blocked"]}]}`',
+            guidance,
+        )
+        self.assertIn("The non-empty `reason` belongs to the `partial_delivery_policy` object itself", guidance)
+        self.assertIn("omit the `partial_delivery_policy` property entirely", guidance)
+        self.assertIn("If no partial authorizations are approved, leave the property out", guidance)
+
     def test_read_only_codex_calls_keep_user_provider_config_and_disable_user_mcp(self):
         with tempfile.TemporaryDirectory() as root:
             command = orchestrator.build_codex_command(
@@ -333,11 +346,35 @@ class FakeCodex:
 
     def __call__(self, command, **kwargs):
         self.commands.append(command)
-        self.prompts.append(kwargs["input"].decode("utf-8"))
+        prompt = kwargs["input"].decode("utf-8")
+        self.prompts.append(prompt)
         if not self.responses:
             raise AssertionError("Unexpected Codex call")
         output_path = Path(command[command.index("--output-last-message") + 1])
         response = self.responses.pop(0)
+        if ("Return a concise, readable Markdown implementation proposal" in prompt
+                or "Return the complete refined proposal" in prompt
+                or "Return the complete proposal in readable Markdown" in prompt) and "```commitment-ledger" not in response:
+            ledger = {
+                "schema_version": 1,
+                "commitments": [{
+                    "id": "C-TEST-001",
+                    "class": "optional_recommendation",
+                    "statement": "Optional fixture-only recommendation.",
+                    "acceptance_condition": "No delivery obligation unless the user promotes it.",
+                    "implementation_expectations": ["No implementation is required."],
+                    "verification_scenarios": [],
+                    "availability": "active",
+                }],
+            }
+            ledger_block = "\n\n```commitment-ledger\n" + json.dumps(ledger) + "\n```\n"
+            marker = re.search(r"(?im)^\s*##\s+Claude finding dispositions\s*$", response)
+            if marker is None:
+                marker = re.search(r"(?im)^\s*Second plan review needed:\s*(?:yes|no)\s*$", response)
+            if marker:
+                response = response[:marker.start()].rstrip() + ledger_block + "\n" + response[marker.start():]
+            else:
+                response = response.rstrip() + ledger_block
         if self.on_call is not None:
             self.on_call(len(self.commands) - 1, command, kwargs)
         output_path.write_text(response, encoding="utf-8")
@@ -1486,6 +1523,29 @@ class WorkflowTests(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(content, encoding="utf-8")
         codex.on_call = implementation
+
+    def test_proposal_approval_binds_the_user_visible_ledger_snapshot(self):
+        codex = FakeCodex("# Proposal\nPlan.\n", self.refined())
+        claude = FakeClaude(claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05))
+        runner = orchestrator.Orchestrator(
+            self.target, task="Implement a feature", budget_usd=1.0, workflow_id="ledger-approval",
+            process_runner=codex, claude_runner=claude,
+        )
+
+        state = runner.start()
+        self.assertTrue(state["traceability_required"])
+        self.assertIsNone(state["commitment_ledger_approval"])
+        self.assertIn("```commitment-ledger", (runner.workflow_dir / "proposal.md").read_text(encoding="utf-8"))
+
+        with patch.object(runner, "run_pending", side_effect=lambda: runner.state):
+            runner.approve()
+        approved = runner.state
+
+        snapshot = approved["commitment_ledger_approval"]
+        self.assertEqual(snapshot["proposal_version"], approved["proposal_version"])
+        self.assertEqual(snapshot["proposal_sha256"], approved["proposal_artifact_sha256"])
+        self.assertEqual(snapshot["ledger_sha256"], orchestrator._traceability.canonical_sha256(snapshot["ledger"]))
+        self.assertEqual(approved["workflow_status"], "running")
 
     def interrupted_implementation(self, workflow_id: str, *, preexisting: bool = False, mode: str = "during"):
         if preexisting:
@@ -3836,6 +3896,16 @@ class WorkflowTests(unittest.TestCase):
     def test_long_assignment_and_complete_proposal_reach_claude_with_audit_hashes(self):
         task = "# Full assignment\n" + ("requirement detail " * 120) + "\nASSIGNMENT_END_MARKER"
         proposal = "# Complete proposal\n" + ("architecture detail " * 120) + "\nPROPOSAL_END_MARKER"
+        proposal += "\n\n```commitment-ledger\n" + json.dumps({
+            "schema_version": 1,
+            "commitments": [{
+                "id": "C-TEST-001", "class": "optional_recommendation",
+                "statement": "Optional fixture recommendation.",
+                "acceptance_condition": "No obligation unless promoted.",
+                "implementation_expectations": ["No implementation required."],
+                "verification_scenarios": [], "availability": "active",
+            }],
+        }) + "\n```\n"
         codex = FakeCodex(proposal, self.refined())
         claude = FakeClaude(claude_reviewer.ReviewResult("Decision: CHANGES_REQUESTED\nCheck the edge cases.", 0.1))
         runner = orchestrator.Orchestrator(
@@ -4336,7 +4406,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn(secret, record["generated_output"])
         self.assertIn("[REDACTED]", record["generated_output"])
         self.assertEqual(state["proposal_version"], 1)
-        self.assertEqual(state["proposal"], proposal)
+        self.assertTrue(state["proposal"].startswith(proposal))
+        self.assertIn("```commitment-ledger", state["proposal"])
         self.assertEqual(len(claude.prompts), 1)
         with self.assertRaisesRegex(orchestrator.WorkflowError, "not waiting for implementation approval"):
             runner.approve()
@@ -4355,6 +4426,240 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual([item["proposal_version"] for item in records], [3, 4, 5])
         self.assertTrue(state["planning_validation_failure_history_truncated"])
         self.assertTrue(all(item["approval_eligible"] is False for item in records))
+
+class CommitmentLedgerIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="commitment-ledger-integration-")
+        self.root = Path(self.temp.name)
+        self.target = make_target(self.root / "target")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def exercise_delivery(self, scenario: str) -> tuple[dict, str, Path]:
+        workflow_id = f"ledger-{scenario}"
+        runner = orchestrator.Orchestrator(
+            self.target,
+            task="Implement and validate the approved processing behavior",
+            workflow_id=workflow_id,
+            process_runner=lambda *_args, **_kwargs: self.fail("provider must not be called"),
+            claude_runner=lambda *_args, **_kwargs: self.fail("provider must not be called"),
+        )
+        runner.workflow_dir.mkdir(parents=True, exist_ok=True)
+        source = self.target / "src" / "service.py"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("def process_request():\n    return True\n", encoding="utf-8")
+
+        commitment = {
+            "id": "C-001",
+            "class": "mandatory_user_requirement",
+            "statement": "Process a valid request.",
+            "acceptance_condition": "process_request returns a successful result.",
+            "implementation_expectations": ["Implement process_request."],
+            "verification_scenarios": [{"id": "scenario-process", "description": "Process a valid request."}],
+            "availability": "externally_blocked" if scenario == "external_blocker" else "active",
+        }
+        raw_ledger = {"schema_version": 1, "commitments": [commitment]}
+        if scenario == "external_blocker":
+            raw_ledger["partial_delivery_policy"] = {
+                "reason": "The user approved partial delivery while the processor dependency is unavailable.",
+                "authorizations": [{
+                    "commitment_id": "C-001", "allowed_dispositions": ["externally_blocked"],
+                }],
+            }
+        ledger = orchestrator._traceability.parse_commitment_ledger(
+            "# Approved proposal\n\n```commitment-ledger\n"
+            + json.dumps(raw_ledger) + "\n```\n",
+        )
+        proposal = "# Approved proposal\n\nImplement processing.\n\n```commitment-ledger\n" + json.dumps(
+            raw_ledger,
+        ) + "\n```\n"
+        proposal_bytes = proposal.encode("utf-8")
+        runner.proposal_path.write_bytes(proposal_bytes)
+        proposal_sha256 = hashlib.sha256(proposal_bytes).hexdigest()
+        ledger_sha256 = orchestrator._traceability.canonical_sha256(ledger)
+
+        event_id = "codex-test-event"
+        test_id = "tests/test_service.py::test_process_request"
+        event_exit_code = 1 if scenario == "failed_test" else 0
+        event_status = "FAILED" if scenario == "failed_test" else "PASSED"
+        jsonl = json.dumps({"type": "item.completed", "item": {
+            "id": event_id,
+            "type": "command_execution",
+            "command": "python -m pytest",
+            "exit_code": event_exit_code,
+            "aggregated_output": f"{test_id} {event_status}\n",
+        }}).encode("utf-8")
+        operation = {
+            "operation_id": "implementation-op-1",
+            "operation_type": "codex",
+            "stage": "implementation",
+            "status": "completed",
+            "started_at": "2026-11-15T10:00:00Z",
+            "finished_at": "2026-11-15T10:00:01Z",
+            "stdout_sha256": hashlib.sha256(jsonl).hexdigest(),
+            **codex_evidence._codex_jsonl_evidence(jsonl),
+        }
+        if scenario == "external_blocker":
+            evidence_entry = {
+                "commitment_id": "C-001", "source_refs": [], "validation_refs": [],
+                "disposition": "externally_blocked",
+                "reason": "The downstream processor dependency is unavailable.",
+            }
+        elif scenario == "missing_evidence":
+            evidence_entry = {
+                "commitment_id": "C-001", "source_refs": [], "validation_refs": [],
+                "disposition": None, "reason": None,
+            }
+        else:
+            evidence_entry = {
+                "commitment_id": "C-001",
+                "source_refs": [{"path": "src/service.py", "symbol": "process_request"}],
+                "validation_refs": [{
+                    "scenario_id": "scenario-process",
+                    "test_ids": [test_id],
+                    "execution_event_ids": [event_id],
+                }],
+                "disposition": None, "reason": None,
+            }
+        codex_report = "```harness-evidence\n" + json.dumps({
+            "schema_version": 1, "commitments": [evidence_entry],
+        }) + "\n```\n"
+
+        if scenario == "complete":
+            assessment_entry = {
+                "id": "C-001", "implementation_status": "implemented", "verification_status": "passed",
+                "assessment": "fulfilled", "explanation": "Source and scenario evidence were reviewed.",
+                "evidence_refs": {
+                    "source": ["src/service.py#process_request"],
+                    "validation": ["scenario-process", test_id],
+                },
+            }
+        elif scenario == "failed_test":
+            assessment_entry = {
+                "id": "C-001", "implementation_status": "implemented", "verification_status": "failed",
+                "assessment": "not_fulfilled", "explanation": "The required scenario failed.",
+                "evidence_refs": {
+                    "source": ["src/service.py#process_request"],
+                    "validation": ["scenario-process", test_id],
+                },
+            }
+        elif scenario == "external_blocker":
+            assessment_entry = {
+                "id": "C-001", "implementation_status": "partial", "verification_status": "blocked",
+                "assessment": "insufficient_evidence", "explanation": "The external processor is unavailable.",
+                "evidence_refs": {"source": [], "validation": []},
+            }
+        else:
+            assessment_entry = {
+                "id": "C-001", "implementation_status": "partial", "verification_status": "unverified",
+                "assessment": "insufficient_evidence", "explanation": "Required evidence is missing.",
+                "evidence_refs": {"source": [], "validation": []},
+            }
+        review_report = "Claude review report.\n\n```commitment-assessment\n" + json.dumps({
+            "schema_version": 1, "commitments": [assessment_entry],
+        }) + "\n```\n"
+        runner.state = {
+            "version": 1,
+            "workflow_id": workflow_id,
+            "target": str(self.target),
+            "task": "Implement and validate the approved processing behavior",
+            "status": "complete",
+            "workflow_status": "complete",
+            "stage": "complete",
+            "traceability_required": True,
+            "proposal": proposal,
+            "proposal_version": 1,
+            "proposal_artifact_sha256": proposal_sha256,
+            "commitment_ledger_approval": {
+                "schema_version": 1, "proposal_version": 1, "proposal_sha256": proposal_sha256,
+                "ledger": ledger, "ledger_sha256": ledger_sha256,
+            },
+            "operation_history": [operation],
+            "integrity": {"review_evidence": {}},
+            "review_included_files": ["src/service.py"],
+            "implementation_summary": "Implementation was captured from a completed operation.",
+            "code_review": review_report,
+            "correction_attempts": [],
+            "authorization": {"claude_aily": orchestrator.new_workflow_authorization(
+                self.target, workflow_id, 1.0,
+            )["claude_aily"]},
+            "plan_reviews": [],
+            "review_campaign_history": [],
+            "claude_contexts": [],
+        }
+        runner._capture_commitment_evidence(codex_report)
+        runner.state["integrity"]["review_evidence"]["target_working_tree_sha256"] = operation[
+            "target_fingerprint"
+        ]["working_tree_sha256"]
+        runner._capture_commitment_assessment(review_report, purpose="initial")
+        if scenario == "mismatched_evidence":
+            operation["stdout_sha256"] = "stale-operation-output-hash"
+        elif scenario == "mismatched_ledger":
+            runner.state["commitment_ledger_approval"]["ledger"]["commitments"][0]["statement"] = (
+                "Mutated after approval."
+            )
+        elif scenario == "stale_review_report":
+            runner.state["code_review"] += "Report changed after assessment capture.\n"
+        elif scenario == "tampered_assessment":
+            runner.state["commitment_assessment"]["assessment"]["commitments"][0]["assessment"] = (
+                "not_fulfilled"
+            )
+        elif scenario == "changed_proposal":
+            runner.proposal_path.write_text(proposal + "Changed after approval.\n", encoding="utf-8")
+        elif scenario == "malformed_ledger":
+            runner.state["commitment_ledger_approval"]["ledger"]["commitments"] = None
+        elif scenario == "malformed_integrity":
+            runner.state["integrity"] = None
+
+        runner._evaluate_commitment_delivery()
+        with runner._workflow_lock():
+            runner._save()
+        report = runner._delivery_report()
+        runner.delivery_path.write_text(report, encoding="utf-8")
+        persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        return persisted, report, runner.delivery_path
+
+    def test_orchestrator_capture_gate_persistence_and_report_scenarios(self):
+        expectations = {
+            "complete": "complete",
+            "missing_evidence": "blocked",
+            "failed_test": "blocked",
+            "external_blocker": "partial",
+            "mismatched_evidence": "blocked",
+            "mismatched_ledger": "blocked",
+            "stale_review_report": "blocked",
+            "tampered_assessment": "blocked",
+            "changed_proposal": "blocked",
+            "malformed_ledger": "blocked",
+            "malformed_integrity": "blocked",
+        }
+        for scenario, expected_disposition in expectations.items():
+            with self.subTest(scenario=scenario):
+                persisted, report, delivery_path = self.exercise_delivery(scenario)
+                self.assertEqual(persisted["workflow_status"], "complete")
+                self.assertEqual(persisted["delivery_disposition"], expected_disposition)
+                self.assertEqual(persisted["commitment_gate"]["disposition"], expected_disposition)
+                self.assertEqual(persisted["commitment_gate"]["approved_ledger_sha256"],
+                                 persisted["commitment_ledger_approval"]["ledger_sha256"])
+                self.assertIn("- Workflow status: `complete`", report)
+                self.assertIn(f"Delivery disposition: `{expected_disposition}`", report)
+                self.assertIn("Workflow completion and delivery disposition are recorded independently.", report)
+                self.assertEqual(delivery_path.read_text(encoding="utf-8"), report)
+                if scenario == "external_blocker":
+                    self.assertIn("processor dependency is unavailable", report)
+                    self.assertIn("Approved partial-delivery policy", report)
+                if scenario == "mismatched_evidence":
+                    self.assertTrue(persisted["commitment_gate"]["evidence_integrity_errors"])
+                    self.assertIn("changed after capture", report)
+                if scenario == "mismatched_ledger":
+                    self.assertIn("ledger snapshot changed after approval", report)
+                if scenario == "stale_review_report":
+                    self.assertIn("assessment is stale", report)
+                if scenario == "tampered_assessment":
+                    self.assertIn("does not match the bound review report", report)
+                if scenario == "changed_proposal":
+                    self.assertIn("Proposal artifact changed", report)
 
 
 class WorkflowExecutionFingerprintTests(unittest.TestCase):
