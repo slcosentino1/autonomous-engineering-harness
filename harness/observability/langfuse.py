@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, ContextManager, Mapping
@@ -19,6 +20,7 @@ from observability.tracer import (
     effective_base_url,
     valid_observability_scope,
 )
+from workflow import workspace
 
 
 class LangfusePreflightError(RuntimeError):
@@ -338,26 +340,24 @@ def preflight_langfuse_tracing(
             "Install the pinned optional dependency from requirements-tracing.txt. No workflow was started."
         )
 
-    child_env = os.environ.copy()
-    if environ is not None:
-        for key in tuple(child_env):
-            if key.startswith(("LANGFUSE_", "OTEL_")) and key not in env:
-                child_env.pop(key, None)
-    child_env.update(env)
-    child_env.update({
-        "LANGFUSE_PUBLIC_KEY": public_key,
-        "LANGFUSE_SECRET_KEY": secret_key,
-        "LANGFUSE_BASE_URL": url,
-    })
     try:
-        result = subprocess.run(
-            [sys.executable, "-c", _LANGFUSE_INIT_CHECK],
-            env=child_env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=15,
-            check=False,
-        )
+        with tempfile.TemporaryDirectory(prefix="harness-langfuse-preflight-") as isolated_config:
+            child_env = workspace.child_environment(
+                env, include_observability=True, isolated_github_config=isolated_config,
+            )
+            child_env.update({
+                "LANGFUSE_PUBLIC_KEY": public_key,
+                "LANGFUSE_SECRET_KEY": secret_key,
+                "LANGFUSE_BASE_URL": url,
+            })
+            result = subprocess.run(
+                [sys.executable, "-c", _LANGFUSE_INIT_CHECK],
+                env=child_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=15,
+                check=False,
+            )
     except (OSError, subprocess.SubprocessError):
         raise LangfusePreflightError(
             "Tracing was explicitly enabled, but the Langfuse client could not be initialized locally "

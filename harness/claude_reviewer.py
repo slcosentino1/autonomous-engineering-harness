@@ -10,9 +10,11 @@ import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 from workflow.process_control import process_group_options, terminate_process_group
+from workflow import workspace
 
 
 DEFAULT_AILY_EXECUTABLE = "/Users/slcosentino/.local/bin/aily"
@@ -150,8 +152,7 @@ def review(
     ]
     # Claude's file tools, if used, can see only this empty temporary directory.
     with tempfile.TemporaryDirectory(prefix="harness-claude-review-") as review_root:
-        env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-        env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"})
+        env = workspace.provider_env(Path(review_root) / "isolated-github-config")
         try:
             if process_started is not None and process_runner is subprocess.run:
                 process = subprocess.Popen(

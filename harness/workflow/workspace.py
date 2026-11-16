@@ -10,7 +10,7 @@ import stat
 import subprocess
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Callable
+from typing import Callable, MutableMapping
 
 
 class WorkspaceError(RuntimeError):
@@ -24,6 +24,14 @@ HARNESS_SKILLS_ROOT = Path(__file__).resolve().parents[2] / ".agents" / "skills"
 WORKFLOW_LOCK_NAME_RE = re.compile(r"^\.[A-Za-z0-9][A-Za-z0-9._-]{0,79}\.lock$")
 FINGERPRINT_VERSION = 1
 FINGERPRINT_ALGORITHM = "sha256-length-prefixed-head-index-worktree-v1"
+_ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_GITHUB_CLI_ENVIRONMENT = frozenset({
+    "PATH", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "GH_CONFIG_DIR",
+    "GH_HOST", "GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy",
+    "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "LANG", "LC_ALL", "LC_CTYPE",
+    "TMPDIR", "TMP", "TEMP", "SYSTEMROOT", "WINDIR",
+})
 FINGERPRINT_EXCLUDED_INTERNAL_PATHS = [".git at any depth", f"{WORKFLOW_ROOT}/**"]
 
 
@@ -31,12 +39,124 @@ SENSITIVE_NAMES = {
     ".aws", ".ssh", ".env", ".env.local", ".env.production", "credentials",
     "credentials.json", "secrets", "secrets.json", "id_rsa", "id_ed25519",
 }
+_SENSITIVE_IGNORED_PATHSPECS = tuple(
+    pathspec
+    for component in sorted(name for name in SENSITIVE_NAMES if not name.startswith(".env."))
+    for pathspec in (f":(top,glob,icase)**/{component}", f":(top,glob,icase)**/{component}/**")
+) + (
+    ":(top,glob,icase)**/.env.*", ":(top,glob,icase)**/.env.*/**",
+)
 
 
-def git_env() -> dict[str, str]:
-    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+def child_environment(
+    environ=None,
+    *,
+    include_observability: bool = False,
+    isolated_github_config: Path | str | None = None,
+) -> dict[str, str]:
+    """Build a child environment without operator GitHub credentials or Git overrides."""
+    source = os.environ if environ is None else environ
+    env = {}
+    for key, value in source.items():
+        upper = key.upper()
+        if upper.startswith(("GIT_", "GH_", "GITHUB_", "ACTIONS_", "SSH_")):
+            continue
+        if not include_observability and upper.startswith(("LANGFUSE_", "OTEL_")):
+            continue
+        env[key] = value
     env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0", "GIT_PAGER": "cat"})
+    if isolated_github_config is not None:
+        env["GH_CONFIG_DIR"] = str(isolated_github_config)
     return env
+
+
+def git_env(environ=None) -> dict[str, str]:
+    env = child_environment(environ)
+    env["GIT_PAGER"] = "cat"
+    return env
+
+
+def provider_env(isolated_github_config: Path | str, environ=None) -> dict[str, str]:
+    """Keep provider configuration while removing GitHub auth and Git credential sources."""
+    config_dir = Path(isolated_github_config)
+    config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    env = child_environment(environ, isolated_github_config=config_dir)
+    # Disable system and user Git configuration and reset any repository-local credential helpers.
+    # An empty credential.helper value resets helpers configured at lower precedence.
+    env.update({
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "credential.helper",
+        "GIT_CONFIG_VALUE_0": "",
+    })
+    return env
+
+
+def github_cli_env(environ=None) -> dict[str, str]:
+    """Pass gh only the local configuration, transport, and supported authentication variables."""
+    source = os.environ if environ is None else environ
+    return {key: value for key, value in source.items() if key.upper() in _GITHUB_CLI_ENVIRONMENT}
+
+
+def _parse_environment_value(value: str, *, line_number: int) -> str:
+    value = value.lstrip()
+    if not value:
+        return ""
+    if value[0] not in {"'", '"'}:
+        result = []
+        for index, character in enumerate(value):
+            if character == "#" and (index == 0 or value[index - 1].isspace()):
+                break
+            result.append(character)
+        return "".join(result).rstrip()
+
+    quote = value[0]
+    result = []
+    index = 1
+    while index < len(value):
+        character = value[index]
+        if character == quote:
+            trailing = value[index + 1:].strip()
+            if trailing and not trailing.startswith("#"):
+                raise WorkspaceError(f"Invalid harness environment file syntax on line {line_number}.")
+            return "".join(result)
+        if quote == '"' and character == "\\" and index + 1 < len(value):
+            index += 1
+            escaped = value[index]
+            result.append({"n": "\n", "r": "\r", "t": "\t", '"': '"', "\\": "\\", "$": "$"}.get(
+                escaped, "\\" + escaped,
+            ))
+        else:
+            result.append(character)
+        index += 1
+    raise WorkspaceError(f"Invalid harness environment file syntax on line {line_number}.")
+
+
+def load_harness_environment(path: Path | None = None, *, environ: MutableMapping[str, str] | None = None) -> None:
+    """Load optional harness/.env values without overriding the parent process or evaluating shell syntax."""
+    environment_file = path or Path(__file__).resolve().parents[1] / ".env"
+    target = os.environ if environ is None else environ
+    try:
+        contents = environment_file.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return
+    except (OSError, UnicodeDecodeError) as exc:
+        raise WorkspaceError("Could not read the local Harness environment file.") from exc
+
+    parsed: dict[str, str] = {}
+    for line_number, raw_line in enumerate(contents.splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        name, separator, value = line.partition("=")
+        name = name.strip()
+        if not separator or not _ENVIRONMENT_NAME.fullmatch(name):
+            raise WorkspaceError(f"Invalid harness environment file syntax on line {line_number}.")
+        parsed[name] = _parse_environment_value(value, line_number=line_number)
+    for name, value in parsed.items():
+        target.setdefault(name, value)
 
 
 def git(
@@ -77,6 +197,17 @@ def _fingerprint_sensitive_path(path: bytes) -> bool:
     relative = os.fsdecode(path)
     name = Path(relative).name.lower()
     return is_sensitive(relative) or name.startswith(".env.")
+
+
+def _ignored_sensitive_paths(target: Path, *, redactor: Callable[[str], str] | None = None) -> set[bytes]:
+    output = _fingerprint_git(
+        target, "ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--",
+        *_SENSITIVE_IGNORED_PATHSPECS, redactor=redactor,
+    )
+    return {
+        path for path in output.split(b"\0")
+        if path and not _fingerprint_internal_path(path) and _fingerprint_sensitive_path(path)
+    }
 
 
 def fingerprint_path_is_sensitive(path: str | bytes) -> bool:
@@ -139,6 +270,28 @@ def _status_flags(output: bytes) -> tuple[bool, bool, bool, int]:
             staged = staged or status[0:1] != b" "
             unstaged = unstaged or status[1:2] != b" "
     return staged, unstaged, untracked > 0, untracked
+
+
+def _sensitive_status_flags(output: bytes) -> tuple[bool, bool, bool]:
+    """Return staged, unstaged, and untracked flags for sensitive paths without retaining path names."""
+    staged = False
+    unstaged = False
+    untracked = False
+    for record in output.split(b"\0"):
+        if not record:
+            continue
+        if len(record) < 4 or record[2:3] != b" ":
+            raise WorkspaceError("Git returned an invalid status record during sensitive-path inspection.")
+        path = record[3:]
+        if _fingerprint_internal_path(path) or not _fingerprint_sensitive_path(path):
+            continue
+        status = record[:2]
+        if status == b"??":
+            untracked = True
+        else:
+            staged = staged or status[0:1] != b" "
+            unstaged = unstaged or status[1:2] != b" "
+    return staged, unstaged, untracked
 
 
 def _hash_worktree_path(
@@ -247,12 +400,15 @@ def repository_fingerprint(
         )
         .split(b"\0") if path
     }
+    ignored_sensitive_paths = _ignored_sensitive_paths(root, redactor=redactor)
     status = _fingerprint_git(
         root, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames",
         "--ignore-submodules=none", redactor=redactor,
     )
     # Status is repository-wide apart from generated workflow internals; sensitive paths affect these flags.
     staged_changes, unstaged_changes, has_untracked_status, _untracked_status_count = _status_flags(status)
+    sensitive_staged, sensitive_unstaged, sensitive_untracked = _sensitive_status_flags(status)
+    sensitive_untracked = sensitive_untracked or bool(ignored_sensitive_paths)
     relevant_status = []
     for record in status.split(b"\0"):
         if not record:
@@ -262,7 +418,10 @@ def repository_fingerprint(
             relevant_status.append(record)
     working_tree_clean = not relevant_status
 
-    all_paths = set(head_entries) | set(index_entries) | untracked_paths
+    all_paths = set(head_entries) | set(index_entries) | untracked_paths | ignored_sensitive_paths
+    sensitive_paths = {
+        path for path in all_paths if not _fingerprint_internal_path(path) and _fingerprint_sensitive_path(path)
+    }
     relevant_paths = sorted(
         path for path in all_paths
         if not _fingerprint_internal_path(path) and not _fingerprint_sensitive_path(path)
@@ -299,6 +458,7 @@ def repository_fingerprint(
     untracked_after = _fingerprint_git(
         root, "ls-files", "--others", "--exclude-standard", "-z", redactor=redactor,
     )
+    ignored_sensitive_after = _ignored_sensitive_paths(root, redactor=redactor)
     status_after = _fingerprint_git(
         root, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames",
         "--ignore-submodules=none", redactor=redactor,
@@ -309,6 +469,8 @@ def repository_fingerprint(
         path for path in untracked_after.split(b"\0") if path
     } != untracked_paths:
         raise WorkspaceError("Untracked repository files changed during fingerprint calculation.")
+    if ignored_sensitive_after != ignored_sensitive_paths:
+        raise WorkspaceError("Ignored sensitive repository files changed during fingerprint calculation.")
 
     return {
         "version": FINGERPRINT_VERSION,
@@ -324,11 +486,16 @@ def repository_fingerprint(
             path for path in relevant_paths if path in head_entries or path in index_entries
         }),
         "untracked_path_count": len({path for path in relevant_paths if path in untracked_paths}),
-        # A count discloses only how many excluded paths exist, not their names or contents.
-        "excluded_sensitive_path_count": len({
-            path for path in all_paths
-            if not _fingerprint_internal_path(path) and _fingerprint_sensitive_path(path)
-        }),
+        # Status flags and a path count disclose no sensitive names, contents, or per-file hashes.
+        "excluded_sensitive_path_count": len(sensitive_paths),
+        "sensitive_path_status": {
+            "status": "captured",
+            "staged_changes": sensitive_staged,
+            "unstaged_changes": sensitive_unstaged,
+            "untracked_files": sensitive_untracked,
+            "dirty": sensitive_staged or sensitive_unstaged or sensitive_untracked,
+            "path_count": len(sensitive_paths),
+        },
         "excluded_internal_paths": FINGERPRINT_EXCLUDED_INTERNAL_PATHS.copy(),
         "excluded_sensitive_paths": "known sensitive path components and .env.* basenames",
         "ignored_untracked_files_excluded": True,

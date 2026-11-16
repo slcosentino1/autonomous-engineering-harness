@@ -337,15 +337,133 @@ class DocumentationReaderTests(unittest.TestCase):
         self.assertIn("BearerAuth", filtered["components"]["securitySchemes"])
 
 
+class LocalEnvironmentTests(unittest.TestCase):
+    def test_optional_environment_file_preserves_parent_and_parses_without_shell_expansion(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / ".env"
+            path.write_text(
+                'LANGFUSE_SECRET_KEY="local-placeholder"\n'
+                "GH_TOKEN='github-placeholder'\n"
+                "UNQUOTED=value # comment\n"
+                'LITERAL="${DO_NOT_EXPAND}"\n',
+                encoding="utf-8",
+            )
+            environment = {"LANGFUSE_SECRET_KEY": "parent-value"}
+
+            workspace_ops.load_harness_environment(path, environ=environment)
+
+        self.assertEqual(environment["LANGFUSE_SECRET_KEY"], "parent-value")
+        self.assertEqual(environment["GH_TOKEN"], "github-placeholder")
+        self.assertEqual(environment["UNQUOTED"], "value")
+        self.assertEqual(environment["LITERAL"], "${DO_NOT_EXPAND}")
+
+    def test_missing_environment_file_is_optional_and_invalid_file_error_hides_values(self):
+        with tempfile.TemporaryDirectory() as root:
+            missing = Path(root) / "missing.env"
+            workspace_ops.load_harness_environment(missing, environ={})
+            malformed = Path(root) / "malformed.env"
+            malformed.write_text("API_TOKEN=must-not-appear\ninvalid-line\n", encoding="utf-8")
+            with self.assertRaises(workspace_ops.WorkspaceError) as error:
+                workspace_ops.load_harness_environment(malformed, environ={})
+
+        self.assertNotIn("must-not-appear", str(error.exception))
+
+    def test_provider_environment_keeps_operational_config_and_isolates_github_and_tracing(self):
+        with tempfile.TemporaryDirectory(prefix="provider-env-") as root:
+            isolated_config = Path(root) / "isolated-gh-config"
+            operator_config = Path(root) / "operator-gh-config"
+            operator_config.mkdir()
+            (operator_config / "hosts.yml").write_text("operator-only-sentinel\n", encoding="utf-8")
+            environment = workspace_ops.provider_env(
+                isolated_config,
+                {
+                    "PATH": "/usr/bin", "CODEX_HOME": "/tmp/codex", "HTTPS_PROXY": "http://proxy.invalid",
+                    "GH_TOKEN": "github-placeholder", "GH_ENTERPRISE_TOKEN": "enterprise-placeholder",
+                    "GITHUB_TOKEN": "actions-placeholder", "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "oidc-placeholder",
+                    "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock", "SSH_AGENT_PID": "1234",
+                    "LANGFUSE_SECRET_KEY": "trace-placeholder", "OTEL_EXPORTER_OTLP_HEADERS": "header-placeholder",
+                    "GH_CONFIG_DIR": str(operator_config), "GIT_CONFIG_GLOBAL": "/private/operator/.gitconfig",
+                    "GIT_CONFIG_COUNT": "9", "GIT_CONFIG_KEY_0": "credential.helper",
+                    "GIT_CONFIG_VALUE_0": "operator-helper",
+                },
+            )
+            self.assertTrue(isolated_config.is_dir())
+            self.assertEqual(isolated_config.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(list(isolated_config.iterdir()), [])
+            self.assertNotEqual(Path(environment["GH_CONFIG_DIR"]), operator_config)
+
+        self.assertEqual(environment["PATH"], "/usr/bin")
+        self.assertEqual(environment["CODEX_HOME"], "/tmp/codex")
+        self.assertEqual(environment["HTTPS_PROXY"], "http://proxy.invalid")
+        self.assertEqual(environment["GH_CONFIG_DIR"], str(isolated_config))
+        self.assertEqual(environment["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(environment["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertEqual(environment["GIT_CONFIG_COUNT"], "1")
+        self.assertEqual(environment["GIT_CONFIG_KEY_0"], "credential.helper")
+        self.assertEqual(environment["GIT_CONFIG_VALUE_0"], "")
+        for name in (
+            "GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+            "SSH_AUTH_SOCK", "SSH_AGENT_PID", "LANGFUSE_SECRET_KEY", "OTEL_EXPORTER_OTLP_HEADERS",
+        ):
+            self.assertNotIn(name, environment)
+
+    def test_provider_environment_disables_global_and_repository_credential_helpers(self):
+        with tempfile.TemporaryDirectory(prefix="provider-git-config-") as root:
+            root_path = Path(root)
+            target = root_path / "target"
+            target.mkdir()
+            subprocess.run(["git", "init", "-q", str(target)], check=True)
+            home = root_path / "home"
+            home.mkdir()
+            global_helper = root_path / "global-helper"
+            global_helper.write_text(
+                "#!/bin/sh\nprintf 'username=GLOBAL_HELPER_SENTINEL\\n\\n'\n", encoding="utf-8",
+            )
+            global_helper.chmod(0o700)
+            repository_helper = root_path / "repository-helper"
+            repository_helper.write_text(
+                "#!/bin/sh\nprintf 'password=REPOSITORY_HELPER_SENTINEL\\n\\n'\n", encoding="utf-8",
+            )
+            repository_helper.chmod(0o700)
+            (home / ".gitconfig").write_text(
+                f"[credential]\n\thelper = {global_helper}\n", encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "-C", str(target), "config", "credential.helper", str(repository_helper)], check=True,
+            )
+            source_env = {"PATH": os.environ["PATH"], "HOME": str(home), "GIT_CONFIG_NOSYSTEM": "1"}
+            ordinary = subprocess.run(
+                ["git", "-C", str(target), "credential", "fill"],
+                input="protocol=https\nhost=github.invalid\n\n", env=source_env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+            self.assertEqual(ordinary.returncode, 0)
+            self.assertIn("GLOBAL_HELPER_SENTINEL", ordinary.stdout)
+            self.assertIn("REPOSITORY_HELPER_SENTINEL", ordinary.stdout)
+
+            isolated = subprocess.run(
+                ["git", "-C", str(target), "credential", "fill"],
+                input="protocol=https\nhost=github.invalid\n\n",
+                env=workspace_ops.provider_env(root_path / "isolated-gh", source_env),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+        self.assertNotEqual(isolated.returncode, 0)
+        self.assertNotIn("GLOBAL_HELPER_SENTINEL", isolated.stdout)
+        self.assertNotIn("REPOSITORY_HELPER_SENTINEL", isolated.stdout)
+
+
 class FakeCodex:
     def __init__(self, *responses: str):
         self.responses = list(responses)
         self.commands: list[list[str]] = []
         self.prompts: list[str] = []
+        self.environments: list[dict[str, str]] = []
         self.on_call = None
 
     def __call__(self, command, **kwargs):
         self.commands.append(command)
+        self.environments.append(kwargs.get("env", {}))
         prompt = kwargs["input"].decode("utf-8")
         self.prompts.append(prompt)
         if not self.responses:
@@ -908,6 +1026,41 @@ class RepositoryFingerprintTests(unittest.TestCase):
         self.assertNotEqual(committed["working_tree_sha256"], clean["working_tree_sha256"])
         self.assertTrue(committed["working_tree_clean"])
         self.assertEqual(committed["excluded_sensitive_path_count"], 1)
+
+    def test_sensitive_status_detects_staged_unstaged_and_ignored_untracked_paths_without_values(self):
+        secret_file = self.target / ".env"
+        secret_file.write_text("non-secret baseline marker\n", encoding="utf-8")
+        git(self.target, "add", ".env")
+        git(self.target, "commit", "-q", "-m", "track sensitive configuration")
+
+        clean = self.fingerprint()["sensitive_path_status"]
+        self.assertEqual(clean["status"], "captured")
+        self.assertFalse(clean["dirty"])
+
+        sentinel = "UNTRACKED_SECRET_SENTINEL"
+        secret_file.write_text(sentinel + "\n", encoding="utf-8")
+        modified = self.fingerprint()["sensitive_path_status"]
+        self.assertTrue(modified["unstaged_changes"])
+        self.assertFalse(modified["staged_changes"])
+        self.assertFalse(modified["untracked_files"])
+
+        git(self.target, "add", ".env")
+        staged = self.fingerprint()["sensitive_path_status"]
+        self.assertTrue(staged["staged_changes"])
+        self.assertFalse(staged["unstaged_changes"])
+
+        (self.target / ".gitignore").write_text(".env.local\n", encoding="utf-8")
+        git(self.target, "add", ".gitignore")
+        git(self.target, "commit", "-q", "-m", "ignore local sensitive configuration")
+        ignored_file = self.target / ".env.local"
+        ignored_file.write_text(sentinel + "\n", encoding="utf-8")
+        ignored = self.fingerprint()
+
+        self.assertFalse(ignored["untracked_files"])
+        self.assertTrue(ignored["sensitive_path_status"]["untracked_files"])
+        self.assertTrue(ignored["sensitive_path_status"]["dirty"])
+        self.assertNotIn(sentinel, json.dumps(ignored))
+        self.assertNotIn(hashlib.sha256((sentinel + "\n").encode()).hexdigest(), json.dumps(ignored))
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO creation is unavailable")
     def test_fifo_fallback_is_metadata_only_and_git_omits_it_from_repository_inventory(self):
@@ -1574,6 +1727,45 @@ class WorkflowTests(unittest.TestCase):
             with self.assertRaisesRegex(orchestrator.WorkflowError, "modifying this target"):
                 runners[0].resume()
         self.assertEqual(runners[0].state_path.read_bytes(), before_unknown)
+
+    def test_approval_rejects_stale_target_baseline_after_another_workflow_changes_target(self):
+        review = lambda: FakeClaude(
+            claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05),
+            claude_reviewer.ReviewResult("Decision: APPROVED\nNo code findings.", 0.05),
+        )
+        first_codex = FakeCodex(
+            "# Proposal\n\n## Approach\nImplement the request.\n", self.refined(),
+            "Implemented the request.\nTests: `python -m unittest`; passed.\n",
+            "No valid findings required changes. Tests remain passing.\n",
+        )
+        first = orchestrator.Orchestrator(
+            self.target, task="Implement workflow A", budget_usd=1.0, workflow_id="baseline-workflow-a",
+            process_runner=first_codex, claude_runner=review(),
+        )
+        second_codex = FakeCodex("# Proposal\nPlan.\n", self.refined())
+        second = orchestrator.Orchestrator(
+            self.target, task="Implement workflow B", budget_usd=1.0, workflow_id="baseline-workflow-b",
+            process_runner=second_codex, claude_runner=review(),
+        )
+        self.assertEqual(first.start()["status"], "awaiting_approval")
+        self.assertEqual(second.start()["status"], "awaiting_approval")
+
+        def change_target(index, _command, _kwargs):
+            if index == 2:
+                generated = self.target / "src" / "workflow_a.py"
+                generated.parent.mkdir(parents=True, exist_ok=True)
+                generated.write_text("answer = 42\n", encoding="utf-8")
+
+        first_codex.on_call = change_target
+        self.assertEqual(first.approve()["status"], "complete")
+
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "target changed after this workflow started"):
+            second.approve()
+
+        persisted_second = second.status()
+        self.assertEqual(persisted_second["status"], "awaiting_approval")
+        self.assertIsNone(persisted_second.get("implementation_approved_at"))
+        self.assertEqual(len(second_codex.commands), 2)
 
     def interrupted_implementation(self, workflow_id: str, *, preexisting: bool = False, mode: str = "during"):
         if preexisting:
@@ -2402,6 +2594,37 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("commit", approved["authorization"]["restricted_operations"])
         self.assertTrue((runner.workflow_dir / "delivery.md").is_file())
         self.assertIn("python -m unittest", (runner.workflow_dir / "delivery.md").read_text())
+
+    def test_codex_process_receives_no_github_or_langfuse_credentials(self):
+        codex = FakeCodex("# Proposal\nPlan.\n", self.refined())
+        claude = FakeClaude(claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05))
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add a feature", workflow_id="codex-env-isolation",
+            process_runner=codex, claude_runner=claude,
+        )
+        with patch.dict(os.environ, {
+            "GH_TOKEN": "github-placeholder", "GH_ENTERPRISE_TOKEN": "enterprise-placeholder",
+            "GITHUB_TOKEN": "actions-placeholder", "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "oidc-placeholder",
+            "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock", "SSH_AGENT_PID": "1234",
+            "LANGFUSE_SECRET_KEY": "trace-placeholder", "OTEL_EXPORTER_OTLP_HEADERS": "header-placeholder",
+            "CODEX_HOME": "/tmp/codex-home", "HTTPS_PROXY": "http://proxy.invalid",
+        }):
+            self.assertEqual(runner.start()["status"], "awaiting_approval")
+
+        self.assertTrue(codex.environments)
+        for environment in codex.environments:
+            for name in (
+                "GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+                "SSH_AUTH_SOCK", "SSH_AGENT_PID", "LANGFUSE_SECRET_KEY", "OTEL_EXPORTER_OTLP_HEADERS",
+            ):
+                self.assertNotIn(name, environment)
+            self.assertEqual(environment["CODEX_HOME"], "/tmp/codex-home")
+            self.assertEqual(environment["HTTPS_PROXY"], "http://proxy.invalid")
+            self.assertNotIn("/private/operator", environment["GH_CONFIG_DIR"])
+            self.assertEqual(environment["GIT_CONFIG_GLOBAL"], os.devnull)
+            self.assertEqual(environment["GIT_CONFIG_COUNT"], "1")
+            self.assertEqual(environment["GIT_CONFIG_KEY_0"], "credential.helper")
+            self.assertEqual(environment["GIT_CONFIG_VALUE_0"], "")
 
     def test_plan_review_is_limited_to_two_iterations(self):
         first_finding = (
@@ -4328,6 +4551,7 @@ class WorkflowTests(unittest.TestCase):
         def process_runner(command, **kwargs):
             observed["command"] = command
             observed["cwd"] = kwargs["cwd"]
+            observed["env"] = kwargs["env"]
             envelope = {"type": "result", "subtype": "success", "is_error": False,
                         "result": "Decision: APPROVED", "total_cost_usd": 0.25}
             return subprocess.CompletedProcess(command, 0, json.dumps(envelope).encode(), b"")
@@ -4335,12 +4559,33 @@ class WorkflowTests(unittest.TestCase):
         with patch.dict(os.environ, {
             "AILY_EXECUTABLE": str(configured_executable),
             "PATH": str(path_dir),
+            "CODEX_HOME": "/tmp/codex-home",
+            "GH_TOKEN": "github-placeholder",
+            "GH_ENTERPRISE_TOKEN": "enterprise-placeholder",
+            "GITHUB_TOKEN": "actions-placeholder",
+            "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "oidc-placeholder",
+            "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock",
+            "SSH_AGENT_PID": "1234",
+            "LANGFUSE_SECRET_KEY": "trace-placeholder",
+            "OTEL_EXPORTER_OTLP_HEADERS": "header-placeholder",
         }):
             self.assertEqual(shutil.which("aily"), str(incompatible_aily))
             result = claude_reviewer.review(prompt, budget_usd=0.5, process_runner=process_runner)
 
         self.assertEqual(result.text, "Decision: APPROVED")
         self.assertEqual(result.cost_usd, 0.25)
+        self.assertEqual(observed["env"]["PATH"], str(path_dir))
+        self.assertEqual(observed["env"]["CODEX_HOME"], "/tmp/codex-home")
+        for name in (
+            "GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+            "SSH_AUTH_SOCK", "SSH_AGENT_PID", "LANGFUSE_SECRET_KEY", "OTEL_EXPORTER_OTLP_HEADERS",
+        ):
+            self.assertNotIn(name, observed["env"])
+        self.assertEqual(observed["env"]["GH_CONFIG_DIR"], str(Path(observed["cwd"]) / "isolated-github-config"))
+        self.assertEqual(observed["env"]["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertEqual(observed["env"]["GIT_CONFIG_COUNT"], "1")
+        self.assertEqual(observed["env"]["GIT_CONFIG_KEY_0"], "credential.helper")
+        self.assertEqual(observed["env"]["GIT_CONFIG_VALUE_0"], "")
         command = observed["command"]
         self.assertEqual(command[:4], [str(configured_executable), "claude", "-p", prompt])
         self.assertEqual(command[command.index("--output-format") + 1], "json")
@@ -4935,6 +5180,91 @@ class WorkflowExecutionFingerprintTests(unittest.TestCase):
             self.assertEqual(initial[repository]["error_category"], "WorkspaceError")
             self.assertNotIn("hidden", json.dumps(initial[repository]))
 
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "no usable initial target fingerprint"):
+            runner.approve()
+        persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["status"], "awaiting_approval")
+
+    def test_sensitive_modified_env_at_start_blocks_approval_without_persisting_value(self):
+        secret_file = self.target / ".env"
+        secret_file.write_text("non-secret baseline marker\n", encoding="utf-8")
+        git(self.target, "add", ".env")
+        git(self.target, "commit", "-q", "-m", "track local configuration")
+        sentinel = "DIRTY_ENV_SECRET_SENTINEL"
+        secret_file.write_text(sentinel + "\n", encoding="utf-8")
+
+        runner, _codex, _claude = self.make_runner("sensitive-modified-at-start")
+        state = runner.start()
+        initial_status = state["execution_fingerprint"]["initial"]["target"]["sensitive_path_status"]
+        self.assertTrue(initial_status["unstaged_changes"])
+        self.assertTrue(initial_status["dirty"])
+        before = runner.state_path.read_bytes()
+        serialized = before.decode("utf-8")
+        self.assertNotIn(sentinel, serialized)
+        self.assertNotIn(hashlib.sha256((sentinel + "\n").encode()).hexdigest(), serialized)
+
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "already modified, staged, or untracked"):
+            runner.approve()
+
+        self.assertEqual(runner.state_path.read_bytes(), before)
+
+    def test_ignored_untracked_env_at_start_blocks_approval(self):
+        (self.target / ".gitignore").write_text(".env\n", encoding="utf-8")
+        git(self.target, "add", ".gitignore")
+        git(self.target, "commit", "-q", "-m", "ignore local environment file")
+        (self.target / ".env").write_text("UNTRACKED_ENV_SENTINEL\n", encoding="utf-8")
+
+        runner, _codex, _claude = self.make_runner("sensitive-untracked-at-start")
+        state = runner.start()
+        fingerprint = state["execution_fingerprint"]["initial"]["target"]
+        self.assertFalse(fingerprint["untracked_files"])
+        self.assertTrue(fingerprint["sensitive_path_status"]["untracked_files"])
+        self.assertTrue(fingerprint["sensitive_path_status"]["dirty"])
+        before = runner.state_path.read_bytes()
+
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "already modified, staged, or untracked"):
+            runner.approve()
+
+        self.assertEqual(runner.state_path.read_bytes(), before)
+        self.assertNotIn(b"UNTRACKED_ENV_SENTINEL", before)
+
+    def test_sensitive_env_changed_between_start_and_approval_is_rejected_unchanged(self):
+        secret_file = self.target / ".env"
+        secret_file.write_text("non-secret baseline marker\n", encoding="utf-8")
+        git(self.target, "add", ".env")
+        git(self.target, "commit", "-q", "-m", "track local configuration")
+        runner, _codex, _claude = self.make_runner("sensitive-changed-after-start")
+        state = runner.start()
+        self.assertFalse(state["execution_fingerprint"]["initial"]["target"]["sensitive_path_status"]["dirty"])
+        secret_file.write_text("CHANGED_ENV_SECRET_SENTINEL\n", encoding="utf-8")
+        before = runner.state_path.read_bytes()
+
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "Sensitive files changed after this workflow started"):
+            runner.approve()
+
+        self.assertEqual(runner.state_path.read_bytes(), before)
+        self.assertNotIn(b"CHANGED_ENV_SECRET_SENTINEL", before)
+
+    def test_unknown_sensitive_path_status_blocks_approval(self):
+        runner, _codex, _claude = self.make_runner("sensitive-status-unavailable")
+        real_fingerprint_git = workspace_ops._fingerprint_git
+
+        def fail_sensitive_inventory(repository, *args, **kwargs):
+            if Path(repository).resolve() == self.target.resolve() and "--ignored" in args:
+                raise workspace_ops.WorkspaceError("private path diagnostic")
+            return real_fingerprint_git(repository, *args, **kwargs)
+
+        with patch.object(workspace_ops, "_fingerprint_git", side_effect=fail_sensitive_inventory):
+            state = runner.start()
+
+        initial = state["execution_fingerprint"]["initial"]["target"]
+        self.assertEqual(initial["status"], "unavailable")
+        self.assertNotIn("private path diagnostic", json.dumps(initial))
+        before = runner.state_path.read_bytes()
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "no usable initial target fingerprint"):
+            runner.approve()
+        self.assertEqual(runner.state_path.read_bytes(), before)
+
     def test_final_fingerprint_failure_blocks_delivery_without_discarding_evidence(self):
         def implement(_index, _command, _kwargs):
             generated = self.target / "generated.py"
@@ -4942,7 +5272,18 @@ class WorkflowExecutionFingerprintTests(unittest.TestCase):
 
         runner, _codex, _claude = self.make_runner("final-fingerprint-error", on_implementation=implement)
         runner.start()
-        with patch.object(workspace_ops, "repository_fingerprint", side_effect=workspace_ops.WorkspaceError("hidden")):
+
+        real_fingerprint = workspace_ops.repository_fingerprint
+        calls = 0
+
+        def fail_after_approval_baseline(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return real_fingerprint(*args, **kwargs)
+            raise workspace_ops.WorkspaceError("hidden")
+
+        with patch.object(workspace_ops, "repository_fingerprint", side_effect=fail_after_approval_baseline):
             with self.assertRaisesRegex(orchestrator.WorkflowError, "Could not capture the target fingerprint"):
                 orchestrator.Orchestrator(
                     self.target, workflow_id="final-fingerprint-error", process_runner=runner.process_runner,
@@ -4999,6 +5340,10 @@ class WorkflowExecutionFingerprintTests(unittest.TestCase):
 
         self.assertEqual(resumed["status"], "awaiting_approval")
         self.assertNotIn("execution_fingerprint", resumed)
+        before_approval = runner.state_path.read_bytes()
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "no initial target fingerprint"):
+            orchestrator.Orchestrator(self.target, workflow_id="legacy-no-fingerprints").approve()
+        self.assertEqual(runner.state_path.read_bytes(), before_approval)
 
 
 if __name__ == "__main__":

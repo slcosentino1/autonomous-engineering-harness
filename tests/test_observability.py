@@ -97,6 +97,12 @@ class ObservabilityTests(unittest.TestCase):
             authorization.pop("observability")
             authorization["scope_sha256"] = orchestrator.authorization_scope_digest(authorization)
         proposal = "# Proposal\n\nA saved proposal for this test.\n"
+        baseline_commit = subprocess.check_output(
+            ["git", "-C", str(target), "rev-parse", "HEAD"], text=True,
+        ).strip()
+        target_fingerprint = orchestrator._workspace.repository_fingerprint(
+            target, expected_commit=baseline_commit,
+        )
         state = {
             "version": 1,
             "workflow_id": workflow_id,
@@ -109,6 +115,17 @@ class ObservabilityTests(unittest.TestCase):
             "project_guidance": {},
             "plan_reviews": [],
             "authorization": authorization,
+            "execution_fingerprint": {
+                "version": orchestrator._workspace.FINGERPRINT_VERSION,
+                "algorithm": orchestrator._workspace.FINGERPRINT_ALGORITHM,
+                "initial": {
+                    "target": {
+                        "status": "captured",
+                        "captured_at": "2026-11-16T00:00:00Z",
+                        **target_fingerprint,
+                    },
+                },
+            },
         }
         runner.state_path.write_text(json.dumps(state), encoding="utf-8")
         runner.proposal_path.write_text(proposal, encoding="utf-8")
@@ -442,6 +459,7 @@ class ObservabilityTests(unittest.TestCase):
         with patch.dict(os.environ, {
             "LANGFUSE_PUBLIC_KEY": "public", "LANGFUSE_SECRET_KEY": "secret",
             "LANGFUSE_BASE_URL": "https://trace.example.test",
+            "GH_TOKEN": "github-placeholder", "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock",
         }, clear=True):
             with patch.object(langfuse.importlib, "import_module", return_value=SDK()):
                 with patch.object(
@@ -465,6 +483,9 @@ class ObservabilityTests(unittest.TestCase):
         self.assertTrue(created[0].tracing_enabled)
         self.assertEqual(initialization[0][0][0], sys.executable)
         self.assertEqual(initialization[0][1]["env"]["LANGFUSE_BASE_URL"], "https://trace.example.test")
+        self.assertEqual(initialization[0][1]["env"]["LANGFUSE_SECRET_KEY"], "secret")
+        self.assertNotIn("GH_TOKEN", initialization[0][1]["env"])
+        self.assertNotIn("SSH_AUTH_SOCK", initialization[0][1]["env"])
         self.assertIn("shutdown()", initialization[0][0][-1])
 
     def test_disabled_scope_returns_noop_without_importing_langfuse(self):

@@ -23,6 +23,10 @@ from decimal import Decimal, ROUND_DOWN, localcontext
 from pathlib import Path
 from typing import Callable
 
+from workflow import workspace as _workspace
+
+_workspace.load_harness_environment()
+
 import claude_reviewer
 from tools.read_documentation_url import canonicalize_documentation_url, authorized_url_sha256
 from observability.tracer import (
@@ -39,7 +43,6 @@ from workflow import planning_review as _planning_review
 from workflow import review_input as _review_input
 from workflow import skills as _skills
 from workflow import traceability as _traceability
-from workflow import workspace as _workspace
 from workflow.delivery import render_delivery_report
 from workflow.codex_evidence import (
     MAX_CODEX_TOOL_NAMES,
@@ -1053,6 +1056,70 @@ class Orchestrator:
             "target": self._fingerprint_repository(self.target, expected_commit=baseline_commit),
         }
 
+    def _require_current_approval_baseline(self) -> None:
+        def sensitive_status_is_valid(value: object) -> bool:
+            if not isinstance(value, dict) or value.get("status") != "captured":
+                return False
+            flag_names = ("staged_changes", "unstaged_changes", "untracked_files")
+            if not all(type(value.get(name)) is bool for name in (*flag_names, "dirty")):
+                return False
+            path_count = value.get("path_count")
+            return (
+                type(path_count) is int and path_count >= 0
+                and value["dirty"] == any(value[name] for name in flag_names)
+            )
+
+        execution = self.state.get("execution_fingerprint")
+        if not isinstance(execution, dict) or "initial" not in execution:
+            raise WorkflowError(
+                "The workflow has no initial target fingerprint; reconcile the target and start a new workflow."
+            )
+        initial = execution.get("initial")
+        expected = initial.get("target") if isinstance(initial, dict) else None
+        if (not isinstance(expected, dict) or expected.get("status") != "captured"
+                or not isinstance(expected.get("commit_sha"), str)):
+            raise WorkflowError(
+                "The workflow has no usable initial target fingerprint; reconcile the target and start a new workflow."
+            )
+
+        expected_sensitive = expected.get("sensitive_path_status")
+        if not sensitive_status_is_valid(expected_sensitive):
+            raise WorkflowError(
+                "The workflow has no usable initial sensitive-path status; reconcile the target and start a new workflow."
+            )
+        if expected_sensitive["dirty"] or any(expected_sensitive[key] for key in (
+                "staged_changes", "unstaged_changes", "untracked_files")):
+            raise WorkflowError(
+                "Sensitive files were already modified, staged, or untracked when the workflow started. "
+                "Clean or reconcile them, then start a new workflow."
+            )
+
+        current = self._fingerprint_repository(self.target, expected_commit=expected["commit_sha"])
+        if current.get("status") != "captured":
+            raise WorkflowError(
+                "The target fingerprint is unavailable; approval was not granted. "
+                "Reconcile the target and start a new workflow."
+            )
+        current_sensitive = current.get("sensitive_path_status")
+        if not sensitive_status_is_valid(current_sensitive):
+            raise WorkflowError(
+                "Sensitive-path status is unavailable; approval was not granted. "
+                "Reconcile the target and start a new workflow."
+            )
+        if current_sensitive["dirty"] or any(current_sensitive[key] for key in (
+                "staged_changes", "unstaged_changes", "untracked_files")):
+            raise WorkflowError(
+                "Sensitive files changed after this workflow started; approval was not granted. "
+                "Clean or reconcile them, then start a new workflow."
+            )
+        stable_expected = {key: value for key, value in expected.items() if key != "captured_at"}
+        stable_current = {key: value for key, value in current.items() if key != "captured_at"}
+        if stable_current != stable_expected:
+            raise WorkflowError(
+                "The target changed after this workflow started; approval was not granted. "
+                "Reconcile the target and start a new workflow."
+            )
+
     def _execution_change_summary(self, initial_target: dict | None) -> dict:
         if not isinstance(initial_target, dict) or initial_target.get("status") != "captured":
             return {
@@ -1820,6 +1887,7 @@ class Orchestrator:
         self._load(preflight_tracing=True)
         if self.state.get("status") != "awaiting_approval":
             raise WorkflowError("This workflow is not waiting for implementation approval.")
+        self._require_current_approval_baseline()
         current_proposal = self._read_proposal()
         if current_proposal != clean_markdown(self.state.get("proposal", "")):
             raise WorkflowError("The proposal file changed after review; use revise to review the change before approval.")
@@ -2615,16 +2683,17 @@ class Orchestrator:
         if self.process_runner is not subprocess.run:
             return None
         try:
-            result = subprocess.run(
-                [self.codex, "--version"],
-                cwd=str(self.target),
-                env=_git_env(),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                timeout=3,
-                check=False,
-            )
+            with tempfile.TemporaryDirectory(prefix="harness-codex-version-") as isolated_config:
+                result = subprocess.run(
+                    [self.codex, "--version"],
+                    cwd=str(self.target),
+                    env=_workspace.provider_env(isolated_config),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    timeout=3,
+                    check=False,
+                )
         except (OSError, subprocess.SubprocessError, ValueError):
             return None
         if result.returncode != 0:
@@ -2770,7 +2839,7 @@ class Orchestrator:
                     stderr=subprocess.PIPE,
                     timeout=call_timeout,
                     check=False,
-                    env=_git_env(),
+                    env=_workspace.provider_env(Path(output_dir) / "isolated-github-config"),
                 )
             except subprocess.TimeoutExpired as exc:
                 invocation_finished = time.monotonic()

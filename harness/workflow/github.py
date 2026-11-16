@@ -14,7 +14,7 @@ from typing import Callable
 from urllib.parse import urlparse
 
 import claude_reviewer
-from workflow import persistence, process_locks
+from workflow import persistence, process_locks, workspace
 
 
 ALLOWED_REPOSITORIES_ENV = "HARNESS_GITHUB_ALLOWED_REPOSITORIES"
@@ -183,6 +183,7 @@ def _api(
             command,
             input=json.dumps(body, ensure_ascii=False) if body is not None else None,
             stdin=None if body is not None else subprocess.DEVNULL,
+            env=workspace.github_cli_env(),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -297,7 +298,13 @@ def _lock(target: Path, name: str, busy: str):
     return process_locks.named_process_lock(target, name, busy_message=busy)
 
 
-def _load_existing_workflow(target: Path, workflow_id: str, runner_factory: Callable) -> dict | None:
+def _load_existing_workflow(
+    target: Path,
+    workflow_id: str,
+    runner_factory: Callable,
+    *,
+    expected_content_sha256: str | None = None,
+) -> dict | None:
     runner = runner_factory(target, workflow_id=workflow_id)
     if runner.workflow_dir.is_symlink():
         raise GithubError("Reserved workflow directory is partial or invalid; manual reconciliation is required.")
@@ -312,6 +319,11 @@ def _load_existing_workflow(target: Path, workflow_id: str, runner_factory: Call
                 or state.get("target") != str(runner.target)
                 or not isinstance(state.get("status"), str)):
             raise ValueError("workflow identity or status does not match")
+        task = state.get("task")
+        if expected_content_sha256 is not None and (
+                not isinstance(task, str)
+                or hashlib.sha256(task.encode("utf-8")).hexdigest() != expected_content_sha256):
+            raise ValueError("workflow task does not match the GitHub Issue snapshot")
     except Exception as exc:
         raise GithubError("Reserved workflow state could not be validated; manual reconciliation is required.") from exc
     return state
@@ -355,7 +367,10 @@ def import_issue(
                 record = dict(record) if record is not None else None
 
             workflow_id = record["workflow_id"] if record is not None else "github-" + uuid.uuid4().hex
-            saved_state = _load_existing_workflow(target_path, workflow_id, runner_factory)
+            saved_state = _load_existing_workflow(
+                target_path, workflow_id, runner_factory,
+                expected_content_sha256=record.get("content_sha256") if record is not None else None,
+            )
             if saved_state is not None:
                 if record is None:
                     raise GithubError("Workflow state has no GitHub correlation; manual reconciliation is required.")
@@ -514,7 +529,10 @@ def report_workflow(
                     pass
             except process_locks.ProcessLockError as exc:
                 raise GithubError("GitHub Issue import is in progress; retry report later.") from exc
-            state = _load_existing_workflow(target_path, workflow_id, runner_factory)
+            state = _load_existing_workflow(
+                target_path, workflow_id, runner_factory,
+                expected_content_sha256=record.get("content_sha256"),
+            )
             if state is None:
                 if record.get("state") == "reserved":
                     raise GithubError("The GitHub Issue import is reserved but the workflow has not started.")
