@@ -747,6 +747,59 @@ class PublicationGateTests(unittest.TestCase):
         runner.publish_github_pr = lambda: self.fail("legacy workflow must not publish automatically")
         self.assertIs(runner._maybe_publish_github_pr(runner.state), runner.state)
 
+
+class ReviewEvidenceCompatibilityTests(unittest.TestCase):
+    def test_legacy_workflow_exclusions_restore_only_matching_campaign_hash(self):
+        workflow_path = f"{orchestrator._workspace.WORKFLOW_ROOT}/legacy-workflow/state.json"
+        reason = "workflow state is not part of the implementation diff"
+        diff = orchestrator.ReviewDiff(
+            text="reviewed patch", included_paths=("SMOKE_TEST.md",), excluded_files=(),
+            file_patches=(("SMOKE_TEST.md", "reviewed patch"),),
+        )
+        expected_hash = orchestrator._ReviewCampaign._campaign_source_hash(
+            diff, preserved_exclusions=((workflow_path, reason),),
+        )
+        state = {"review_campaign": {
+            "campaign_id": "campaign-1", "source_patch_sha256": expected_hash,
+            "excluded_files": [
+                {"path": workflow_path, "reason": reason},
+                {"path": "src/unrelated.py", "reason": "must not be restored"},
+            ],
+        }}
+        evidence = {"campaign_id": "campaign-1", "source_patch_sha256": expected_hash}
+
+        self.assertNotEqual(orchestrator._ReviewCampaign._campaign_source_hash(diff), expected_hash)
+        self.assertEqual(
+            orchestrator._review_source_hash_matching_evidence(state, diff, evidence), expected_hash,
+        )
+        self.assertIsNone(orchestrator._review_source_hash_matching_evidence(
+            {"review_campaign": {**state["review_campaign"], "campaign_id": "another-campaign"}},
+            diff, evidence,
+        ))
+
+    def test_actual_reviewed_source_change_does_not_match_legacy_hash(self):
+        workflow_path = f"{orchestrator._workspace.WORKFLOW_ROOT}/legacy-workflow/state.json"
+        reason = "workflow state is not part of the implementation diff"
+        original = orchestrator.ReviewDiff(
+            text="original", included_paths=("SMOKE_TEST.md",), excluded_files=(),
+            file_patches=(("SMOKE_TEST.md", "original patch"),),
+        )
+        expected_hash = orchestrator._ReviewCampaign._campaign_source_hash(
+            original, preserved_exclusions=((workflow_path, reason),),
+        )
+        state = {"review_campaign": {
+            "campaign_id": "campaign-1", "source_patch_sha256": expected_hash,
+            "excluded_files": [{"path": workflow_path, "reason": reason}],
+        }}
+        evidence = {"campaign_id": "campaign-1", "source_patch_sha256": expected_hash}
+        changed = orchestrator.ReviewDiff(
+            text="modified", included_paths=("SMOKE_TEST.md",), excluded_files=(),
+            file_patches=(("SMOKE_TEST.md", "modified patch"),),
+        )
+
+        self.assertIsNone(orchestrator._review_source_hash_matching_evidence(state, changed, evidence))
+
+
 class FakePublicationApi:
     def __init__(self, baseline, base_tree, base_blobs):
         self.baseline = baseline

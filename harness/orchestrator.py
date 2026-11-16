@@ -488,6 +488,37 @@ def _review_diff(state: dict, target: Path) -> ReviewDiff:
         raise WorkflowError(str(exc)) from exc
 
 
+def _review_source_hash_matching_evidence(state: dict, review_diff: ReviewDiff, evidence: dict) -> str | None:
+    """Match current review input to saved evidence, preserving legacy workflow exclusions safely."""
+    expected_hash = evidence.get("source_patch_sha256")
+    current_hash = _ReviewCampaign._campaign_source_hash(review_diff)
+    if current_hash == expected_hash:
+        return current_hash
+
+    campaign = state.get("review_campaign")
+    historical_workflow_exclusions = []
+    if (isinstance(campaign, dict)
+            and campaign.get("campaign_id") == evidence.get("campaign_id")
+            and campaign.get("source_patch_sha256") == expected_hash
+            and isinstance(campaign.get("excluded_files"), list)):
+        workflow_prefix = _workspace.WORKFLOW_ROOT + "/"
+        historical_workflow_exclusions = [
+            (item["path"], item["reason"])
+            for item in campaign["excluded_files"]
+            if isinstance(item, dict)
+            and isinstance(item.get("path"), str)
+            and (item["path"] == _workspace.WORKFLOW_ROOT
+                 or item["path"].startswith(workflow_prefix))
+            and isinstance(item.get("reason"), str)
+        ]
+    historical_hash = (
+        _ReviewCampaign._campaign_source_hash(
+            review_diff, preserved_exclusions=tuple(historical_workflow_exclusions),
+        ) if historical_workflow_exclusions else None
+    )
+    return historical_hash if historical_hash == expected_hash else None
+
+
 def _format_context_prompt(header: str, sections: dict[str, str]) -> str:
     blocks = [header.strip()]
     for name, value in sections.items():
@@ -1959,36 +1990,9 @@ class Orchestrator:
                 != evidence.get("correction_summary_sha256")):
             raise WorkflowError("Delivery is blocked because implementation or correction evidence changed after verification.")
         current_diff = _review_diff(self.state, self.target)
-        current_patch_hash = _ReviewCampaign._campaign_source_hash(current_diff)
-        expected_patch_hash = evidence.get("source_patch_sha256")
-        if current_patch_hash != expected_patch_hash:
-            # Older campaigns hashed internal workflow artifacts as exclusions. Reconstruct only those
-            # exclusions recorded by the same completed campaign; all current implementation inputs and
-            # non-internal exclusions still come from the live diff above.
-            campaign = self.state.get("review_campaign")
-            historical_workflow_exclusions = []
-            if (isinstance(campaign, dict)
-                    and campaign.get("campaign_id") == evidence.get("campaign_id")
-                    and campaign.get("source_patch_sha256") == expected_patch_hash
-                    and isinstance(campaign.get("excluded_files"), list)):
-                workflow_prefix = _workspace.WORKFLOW_ROOT + "/"
-                historical_workflow_exclusions = [
-                    (item["path"], item["reason"])
-                    for item in campaign["excluded_files"]
-                    if isinstance(item, dict)
-                    and isinstance(item.get("path"), str)
-                    and (item["path"] == _workspace.WORKFLOW_ROOT
-                         or item["path"].startswith(workflow_prefix))
-                    and isinstance(item.get("reason"), str)
-                ]
-            historical_hash = (
-                _ReviewCampaign._campaign_source_hash(
-                    current_diff, preserved_exclusions=tuple(historical_workflow_exclusions),
-                ) if historical_workflow_exclusions else None
-            )
-            if historical_hash != expected_patch_hash:
-                raise WorkflowError("Delivery is blocked because target code changed after its final review.")
-            current_patch_hash = historical_hash
+        current_patch_hash = _review_source_hash_matching_evidence(self.state, current_diff, evidence)
+        if current_patch_hash is None:
+            raise WorkflowError("Delivery is blocked because target code changed after its final review.")
         execution_fingerprint = self.state.get("execution_fingerprint")
         initial_target = (
             execution_fingerprint.get("initial", {}).get("target", {})
@@ -2773,7 +2777,7 @@ class Orchestrator:
                 "Pull Request publication is blocked because the reviewed commit is not the saved workflow baseline."
             )
         review_diff = _review_diff(self.state, self.target)
-        if _ReviewCampaign._campaign_source_hash(review_diff) != evidence.get("source_patch_sha256"):
+        if _review_source_hash_matching_evidence(self.state, review_diff, evidence) is None:
             raise WorkflowError("Pull Request publication is blocked because review evidence no longer matches the source.")
         try:
             reviewed_files = _github.reviewed_files_from_diff(self.target, review_diff)
