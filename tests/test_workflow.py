@@ -1547,6 +1547,34 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(snapshot["ledger_sha256"], orchestrator._traceability.canonical_sha256(snapshot["ledger"]))
         self.assertEqual(approved["workflow_status"], "running")
 
+    def test_target_lock_contention_leaves_approval_state_unchanged(self):
+        runners = []
+        for workflow_id in ("target-lock-first", "target-lock-second"):
+            runner = orchestrator.Orchestrator(
+                self.target, task="Add an approved feature", budget_usd=1.0, workflow_id=workflow_id,
+                process_runner=FakeCodex("# Proposal\nPlan.\n", self.refined()),
+                claude_runner=FakeClaude(claude_reviewer.ReviewResult("No actionable findings.", 0.1)),
+            )
+            self.assertEqual(runner.start()["status"], "awaiting_approval")
+            runners.append(runner)
+        before = [runner.state_path.read_bytes() for runner in runners]
+        with orchestrator._target_process_lock(self.target):
+            with self.assertRaisesRegex(orchestrator.WorkflowError, "modifying this target"):
+                runners[1].approve()
+            with self.assertRaisesRegex(orchestrator.WorkflowError, "modifying this target"):
+                runners[0].resume()
+        self.assertEqual([runner.state_path.read_bytes() for runner in runners], before)
+
+        saved = json.loads(runners[0].state_path.read_text(encoding="utf-8"))
+        saved["status"] = "failed"
+        saved["stage"] = "unexpected_stage"
+        runners[0].state_path.write_text(json.dumps(saved), encoding="utf-8")
+        before_unknown = runners[0].state_path.read_bytes()
+        with orchestrator._target_process_lock(self.target):
+            with self.assertRaisesRegex(orchestrator.WorkflowError, "modifying this target"):
+                runners[0].resume()
+        self.assertEqual(runners[0].state_path.read_bytes(), before_unknown)
+
     def interrupted_implementation(self, workflow_id: str, *, preexisting: bool = False, mode: str = "during"):
         if preexisting:
             (self.target / "README.md").write_text("user change before workflow\n", encoding="utf-8")
@@ -2287,10 +2315,16 @@ class WorkflowTests(unittest.TestCase):
             capture_output=True, text=True, check=False,
         )
         self.assertEqual(help_result.returncode, 0, help_result.stderr)
-        for command in ("start", "approve", "resume", "status", "recover-review", "revise", "reject"):
+        for command in ("start", "approve", "resume", "status", "recover-review", "revise", "reject", "github"):
             self.assertIn(command, help_result.stdout)
             command_help = subprocess.run(
                 [sys.executable, str(script), command, "--help"], cwd=ROOT,
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(command_help.returncode, 0, command_help.stderr)
+        for command in ("import", "report"):
+            command_help = subprocess.run(
+                [sys.executable, str(script), "github", command, "--help"], cwd=ROOT,
                 capture_output=True, text=True, check=False,
             )
             self.assertEqual(command_help.returncode, 0, command_help.stderr)
@@ -4408,6 +4442,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(state["proposal_version"], 1)
         self.assertTrue(state["proposal"].startswith(proposal))
         self.assertIn("```commitment-ledger", state["proposal"])
+        self.assertTrue(all(
+            operation.get("result_text") is None
+            for operation in state["operation_history"]
+            if operation.get("operation_type") == "codex" and operation.get("stage") == "plan_refine_1"
+        ))
         self.assertEqual(len(claude.prompts), 1)
         with self.assertRaisesRegex(orchestrator.WorkflowError, "not waiting for implementation approval"):
             runner.approve()
@@ -4426,6 +4465,108 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual([item["proposal_version"] for item in records], [3, 4, 5])
         self.assertTrue(state["planning_validation_failure_history_truncated"])
         self.assertTrue(all(item["approval_eligible"] is False for item in records))
+
+    def test_refinement_failure_record_does_not_consume_human_revision_result(self):
+        runner = object.__new__(orchestrator.Orchestrator)
+        operation = {
+            "status": "completed", "operation_type": "codex", "stage": "human_revision",
+            "result_text": "human revision result",
+        }
+        runner.state = {"operation_history": [operation]}
+        runner._save = lambda: None
+
+        runner._record_unvalidated_planning_output(
+            "invalid human revision", orchestrator.WorkflowError("invalid proposal"),
+            stage="human_revision", proposal_version=2,
+        )
+
+        self.assertEqual(operation["result_text"], "human revision result")
+        self.assertNotIn("result_rejected_at", operation)
+
+    def test_invalid_refinement_ledgers_preserve_last_valid_proposal_and_resume_same_stage(self):
+        ledger = {
+            "schema_version": 1,
+            "commitments": [{
+                "id": "C-001", "class": "mandatory_user_requirement", "statement": "Keep the approved behavior.",
+                "acceptance_condition": "The saved proposal remains valid.",
+                "implementation_expectations": ["Validate before replacing state."],
+                "verification_scenarios": [{"id": "scenario-1", "description": "Preserve prior proposal."}],
+                "availability": "active",
+            }],
+        }
+        ledger_block = "```commitment-ledger\n" + json.dumps(ledger) + "\n```"
+        initial = "# Last valid proposal\n\nKeep the original content.\n\n" + ledger_block + "\n"
+        valid_refined = (
+            "# Recovered proposal\n\n## Claude finding dispositions\n"
+            "- No actionable findings.\n\n" + ledger_block + "\n\nSecond plan review needed: no\n"
+        )
+        invalid_variants = {
+            "missing": "# Candidate missing ledger\n\n## Claude finding dispositions\n"
+            "- No actionable findings.\n\nSecond plan review needed: no\n",
+            "duplicate": (
+                "# Candidate duplicate ledger\n\n" + ledger_block + "\n\n" + ledger_block
+                + "\n\n## Claude finding dispositions\n- No actionable findings.\n\nSecond plan review needed: no\n"
+            ),
+            "empty": (
+                "# Candidate empty commitments\n\n```commitment-ledger\n"
+                + json.dumps({"schema_version": 1, "commitments": []})
+                + "\n```\n\n## Claude finding dispositions\n- No actionable findings.\n\nSecond plan review needed: no\n"
+            ),
+        }
+
+        class RawCodex:
+            def __init__(self, *responses):
+                self.responses = list(responses)
+                self.prompts = []
+
+            def __call__(self, command, **kwargs):
+                self.prompts.append(kwargs["input"].decode("utf-8"))
+                output_path = Path(command[command.index("--output-last-message") + 1])
+                output_path.write_text(self.responses.pop(0), encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, b"", b"")
+
+        for scenario, invalid in invalid_variants.items():
+            with self.subTest(scenario=scenario):
+                workflow_id = f"refine-ledger-{scenario}"
+                codex = RawCodex(initial, invalid)
+                claude = FakeClaude(claude_reviewer.ReviewResult("No actionable findings.", 0.1))
+                runner = orchestrator.Orchestrator(
+                    self.target, task="Preserve a validated proposal", budget_usd=1.0,
+                    workflow_id=workflow_id, process_runner=codex, claude_runner=claude,
+                )
+                with self.assertRaisesRegex(orchestrator.WorkflowError, "Workflow stopped at plan_refine_1"):
+                    runner.start()
+
+                state_path = runner.workflow_dir / "state.json"
+                proposal_path = runner.workflow_dir / "proposal.md"
+                saved = json.loads(state_path.read_text(encoding="utf-8"))
+                retained_proposal = saved["proposal"]
+                retained_artifact = proposal_path.read_text(encoding="utf-8")
+                self.assertEqual(saved["status"], "failed")
+                self.assertEqual(saved["stage"], "plan_refine_1")
+                self.assertEqual(saved["proposal_version"], 1)
+                self.assertEqual(retained_proposal, initial)
+                self.assertEqual(retained_artifact, initial)
+                self.assertEqual(runner.state["proposal"], retained_proposal)
+                self.assertEqual(runner.state["proposal_version"], 1)
+                self.assertNotIn("Candidate", retained_proposal)
+                self.assertEqual(saved["planning_validation_failures"][0]["stage"], "plan_refine_1")
+                self.assertTrue(all(
+                    operation.get("result_text") is None
+                    for operation in saved["operation_history"]
+                    if operation.get("operation_type") == "codex" and operation.get("stage") == "plan_refine_1"
+                ))
+
+                resumed_codex = RawCodex(valid_refined)
+                resumed = orchestrator.Orchestrator(
+                    self.target, workflow_id=workflow_id, process_runner=resumed_codex,
+                    claude_runner=FakeClaude(),
+                ).resume()
+                self.assertEqual(resumed["status"], "awaiting_approval")
+                self.assertEqual(resumed["proposal_version"], 2)
+                self.assertIn(retained_proposal, resumed_codex.prompts[0])
+                self.assertNotIn("Candidate", resumed_codex.prompts[0])
+                self.assertEqual(len(resumed_codex.prompts), 1)
 
 class CommitmentLedgerIntegrationTests(unittest.TestCase):
     def setUp(self):

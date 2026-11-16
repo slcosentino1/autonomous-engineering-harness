@@ -6,13 +6,11 @@ from __future__ import annotations
 import argparse
 import contextlib
 import copy
-import errno
 import hashlib
 import json
 import math
 import os
 import re
-import stat
 import subprocess
 import sys
 import tempfile
@@ -25,11 +23,6 @@ from decimal import Decimal, ROUND_DOWN, localcontext
 from pathlib import Path
 from typing import Callable
 
-if os.name == "nt":
-    import msvcrt
-else:
-    import fcntl
-
 import claude_reviewer
 from tools.read_documentation_url import canonicalize_documentation_url, authorized_url_sha256
 from observability.tracer import (
@@ -40,6 +33,7 @@ from observability.tracer import (
 from workflow import authorization as _authorization
 from workflow import cli as _cli
 from workflow import persistence as _persistence
+from workflow import process_locks as _process_locks
 from workflow import process_control as _process_control
 from workflow import planning_review as _planning_review
 from workflow import review_input as _review_input
@@ -320,32 +314,6 @@ def _check_plain_directories(root: Path, relative: str, *, create: bool = False)
     return current
 
 
-def _lock_workflow_fd(fd: int) -> None:
-    if os.name == "nt":
-        if os.fstat(fd).st_size == 0:
-            os.lseek(fd, 0, os.SEEK_SET)
-            os.write(fd, b"\0")
-            os.fsync(fd)
-        os.lseek(fd, 0, os.SEEK_SET)
-        try:
-            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-        except OSError as exc:
-            busy_errnos = {errno.EACCES, errno.EAGAIN, getattr(errno, "EDEADLK", -1)}
-            if exc.errno in busy_errnos:
-                raise BlockingIOError(errno.EWOULDBLOCK, "workflow lock is held") from exc
-            raise
-    else:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-
-def _unlock_workflow_fd(fd: int) -> None:
-    if os.name == "nt":
-        os.lseek(fd, 0, os.SEEK_SET)
-        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-    else:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-
-
 @contextlib.contextmanager
 def _workflow_process_lock(target: Path, workflow_id: str):
     """Exclusively coordinate mutating commands for one workflow across processes.
@@ -355,35 +323,25 @@ def _workflow_process_lock(target: Path, workflow_id: str):
     a stale lock that blocks future recovery.
     """
 
-    workflows_dir = _check_plain_directories(target, WORKFLOW_ROOT, create=True)
-    lock_path = workflows_dir / f".{workflow_id}.lock"
-    _safe_artifact(lock_path)
-    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(lock_path, flags, 0o600)
-    except OSError as exc:
-        raise WorkflowError(f"Could not open workflow process lock: {redact(str(exc))}") from exc
+        with _process_locks.named_process_lock(
+            target, f".{workflow_id}.lock",
+            busy_message=f"Workflow {workflow_id} is already being modified by another process.",
+        ):
+            yield
+    except _process_locks.ProcessLockError as exc:
+        raise WorkflowError(redact(str(exc))) from exc
 
-    acquired = False
+
+@contextlib.contextmanager
+def _target_process_lock(target: Path):
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise WorkflowError(f"Workflow process lock is not a regular file: {lock_path}")
-        try:
-            _lock_workflow_fd(fd)
-        except BlockingIOError as exc:
-            raise WorkflowError(
-                f"Workflow {workflow_id} is already being modified by another process."
-            ) from exc
-        except OSError as exc:
-            raise WorkflowError(f"Could not acquire workflow process lock: {redact(str(exc))}") from exc
-        acquired = True
-        yield
-    finally:
-        try:
-            if acquired:
-                _unlock_workflow_fd(fd)
-        finally:
-            os.close(fd)
+        with _process_locks.named_process_lock(
+            target, ".target.lock", busy_message="Another workflow is modifying this target; retry later.",
+        ):
+            yield
+    except _process_locks.ProcessLockError as exc:
+        raise WorkflowError(redact(str(exc))) from exc
 
 
 MAX_PROMPT_FILE_INVENTORY_CHARS = 32_000
@@ -1336,6 +1294,13 @@ class Orchestrator:
     ) -> None:
         """Keep bounded, redacted diagnostics without making output approval eligible."""
         safe_output = redact(output)
+        operation = next((item for item in reversed(self.state.get("operation_history", []))
+                          if item.get("status") == "completed" and item.get("operation_type") == "codex"
+                          and item.get("stage") == stage and item.get("result_text") is not None), None)
+        if operation is not None and stage in {"plan_refine_1", "plan_refine_2"}:
+            operation["result_text"] = None
+            operation["result_consumed"] = True
+            operation["result_rejected_at"] = now()
         records = self.state.setdefault("planning_validation_failures", [])
         records.append({
             "validation_status": "failed_unvalidated",
@@ -1545,18 +1510,25 @@ class Orchestrator:
             raise WorkflowError("Saved proposal is empty.")
         return clean_markdown(proposal)
 
-    def _write_proposal(self, proposal: str) -> None:
-        if self.state.get("traceability_required") is True:
-            try:
-                _traceability.parse_commitment_ledger(proposal)
-            except _traceability.TraceabilityError as exc:
-                raise WorkflowError(f"Proposal must preserve a valid commitment ledger before review or approval: {exc}") from exc
+    def _write_proposal(self, proposal: str, *, validated_ledger: dict | None = None) -> None:
+        if self.state.get("traceability_required") is True and validated_ledger is None:
+            self._validate_proposal_ledger(proposal)
         _atomic_text(self.proposal_path, proposal)
         content = _persistence.read_bytes(self.proposal_path)
         digest = hashlib.sha256(content).hexdigest()
         version = str(self.state.get("proposal_version", 1))
         self.state.setdefault("proposal_version_hashes", {})[version] = digest
         self.state["proposal_artifact_sha256"] = digest
+
+    def _validate_proposal_ledger(self, proposal: str) -> dict | None:
+        if self.state.get("traceability_required") is not True:
+            return None
+        try:
+            return _traceability.parse_commitment_ledger(proposal)
+        except _traceability.TraceabilityError as exc:
+            raise WorkflowError(
+                f"Proposal must preserve a valid commitment ledger before review or approval: {exc}"
+            ) from exc
 
     def _record_review_snapshot(self, campaign: dict, review_diff: ReviewDiff, *, purpose: str) -> dict:
         current_review_diff = _review_diff(self.state, self.target)
@@ -1764,8 +1736,10 @@ class Orchestrator:
             raise WorkflowError("--budget-usd must be at least 0.01.")
         if budget != budget.quantize(Decimal("0.01")):
             raise WorkflowError("--budget-usd must use at most two decimal places.")
-        baseline = git(self.target, "rev-parse", "HEAD").decode("ascii", "strict").strip()
-        initial_fingerprints = self._capture_initial_fingerprints(baseline)
+        with _target_process_lock(self.target):
+            baseline = git(self.target, "rev-parse", "HEAD").decode("ascii", "strict").strip()
+            initial_fingerprints = self._capture_initial_fingerprints(baseline)
+            preexisting_paths = _protected_paths(self.target, baseline)
         self.workflow_dir = _check_plain_directories(self.target, WORKFLOW_ROOT, create=True) / self.workflow_id
         if self.workflow_dir.exists() or self.workflow_dir.is_symlink():
             raise WorkflowError(f"Workflow already exists: {self.workflow_id}")
@@ -1791,7 +1765,7 @@ class Orchestrator:
                 "excluded_sensitive_paths": "known sensitive path components and .env.* basenames",
                 "initial": initial_fingerprints,
             },
-            "preexisting_paths": _protected_paths(self.target, baseline),
+            "preexisting_paths": preexisting_paths,
             "project_guidance": _project_guidance(self.target, self.task.strip()),
             "proposal_version": 0,
             "traceability_required": True,
@@ -1840,7 +1814,7 @@ class Orchestrator:
         return self.run_pending()
 
     def approve(self) -> dict:
-        return self._execute_locked(self._approve_locked)
+        return self._execute_locked(self._approve_locked, target_lock=True)
 
     def _approve_locked(self) -> dict:
         self._load(preflight_tracing=True)
@@ -2353,7 +2327,7 @@ class Orchestrator:
             confirm_target_reviewed=confirm_target_reviewed,
             extend_budget=extend_budget,
             set_budget_limit=set_budget_limit,
-        ))
+        ), target_lock="resume")
 
     def _resume_locked(
         self,
@@ -2445,10 +2419,25 @@ class Orchestrator:
         self._save()
         return self.run_pending()
 
-    def _execute_locked(self, operation: Callable[[], dict]) -> dict:
+    def _execute_locked(self, operation: Callable[[], dict], *, target_lock: bool | str = False) -> dict:
         try:
             with self._workflow_lock():
-                result = operation()
+                acquire_target = target_lock is True
+                if target_lock == "resume":
+                    saved = self._read_state()
+                    planning_stages = {
+                        "planning", "plan_review_1", "plan_review_2", "plan_refine_1", "plan_refine_2",
+                        "human_revision",
+                    }
+                    acquire_target = (
+                        saved.get("status") == "recovery_required"
+                        or saved.get("stage") not in planning_stages
+                    )
+                if acquire_target:
+                    with _target_process_lock(self.target):
+                        result = operation()
+                else:
+                    result = operation()
         except BaseException as exc:
             self._finish_execution_trace(exc)
             raise
@@ -3627,6 +3616,7 @@ class Orchestrator:
                     next_proposal_version = int(self.state.get("proposal_version", 1)) + 1
                     try:
                         proposal, review_again, dispositions = self._refined_proposal(refined)
+                        validated_ledger = self._validate_proposal_ledger(proposal)
                     except WorkflowError as exc:
                         self._record_unvalidated_planning_output(
                             refined, exc, stage=stage, proposal_version=next_proposal_version,
@@ -3639,7 +3629,7 @@ class Orchestrator:
                         "proposal_version": self.state["proposal_version"],
                         "dispositions": dispositions,
                     })
-                    self._write_proposal(proposal)
+                    self._write_proposal(proposal, validated_ledger=validated_ledger)
                     if iteration == 1 and review_again:
                         self.state["stage"] = "plan_review_2"
                     else:

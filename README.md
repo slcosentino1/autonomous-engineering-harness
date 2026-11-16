@@ -55,6 +55,32 @@ python /path/to/autonomous-engineering-harness/harness/orchestrator.py start \
 
 For example, `--budget-usd 0.75` overrides the budget, and `--model MODEL_NAME` selects a Codex model explicitly. The selected model is saved with the workflow and reused on approval/resume. If omitted, no `--model` argument is passed to Codex.
 
+## GitHub collaboration (Phase 1)
+
+GitHub Issues can supply task text to the local Harness. The Harness remains responsible for planning, local approval, implementation, review, recovery, and delivery. Install and authenticate the GitHub CLI (`gh auth login`), then configure an operator-controlled repository allowlist before importing:
+
+```sh
+export HARNESS_GITHUB_ALLOWED_REPOSITORIES="github.com/OWNER/REPO"
+python /path/to/autonomous-engineering-harness/harness/orchestrator.py github import 42 \
+  --target /absolute/path/to/local-repository \
+  --repository OWNER/REPO
+```
+
+For GitHub Enterprise, use `HOST/OWNER/REPO` in both the allowlist and `--repository`. Multiple allowed repositories are comma-separated. The selected repository must match the allowlist before the Issue is queried. Import requires an absolute local Git repository target and accepts the same budget, model, tracing, and execution-limit options as `start`.
+
+Import fetches one Issue through fixed `gh api` operations, validates its repository and Issue metadata, and places its title and body into untrusted task input. Issue text matching the Harness credential redaction patterns is rejected rather than stored or sent for planning. The Issue cannot select the local target or approve work. The command creates a normal workflow and reports only its workflow ID and status; use the local `approve` command after reviewing its proposal. Repeating an import returns its correlated workflow. If a process exits during import, retry uses the reserved workflow ID; partial or invalid workflow state fails closed and requires manual reconciliation. Later Issue edits do not alter the imported workflow.
+
+To explicitly publish a status comment for an imported workflow, run:
+
+```sh
+python /path/to/autonomous-engineering-harness/harness/orchestrator.py github report WORKFLOW_ID \
+  --target /absolute/path/to/local-repository
+```
+
+Reporting is a GitHub comment write. It requires the correlated repository to remain allowlisted and verifies the authenticated `gh` login before updating a comment. It publishes only workflow ID, an enumerated status, stage, and delivery value. It does not start, approve, or resume a workflow. Retry the report command after publication errors. GitHub comment listings can lag after an uncertain create, so duplicate comments are possible in that case.
+
+The local `.engineering/workflows/github-registry.json` stores Issue/workflow identity, snapshot time and content hash, reservation state, and an optional comment ID hint; it never stores GitHub credentials. Same-target and per-Issue OS locks prevent overlapping target changes and duplicate imports on this machine. The start lock covers baseline capture only: the target may change during planning, and Phase 1 does not reject approval based on a stale baseline. Later Issue edits do not synchronize into the imported workflow. Phase 1 has no cross-machine registry, MCP server, polling, webhook, or GitHub-driven approval. Revisit MCP for direct ChatGPT access or unattended Issue intake. The adapter operations are kept in a module behind the CLI so a future MCP interface can reuse them without adding another workflow authority. The separate `human_revision` proposal validation ordering remains unchanged; revisit it before the next change to that path.
+
 ## Optional Langfuse tracing
 
 Tracing is disabled by default. Enable it for a new workflow with `start --trace` or set `HARNESS_TRACING_ENABLED=true` before `start`; either setting enables tracing. Credentials come from `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY`; `LANGFUSE_BASE_URL` is optional and defaults to `https://cloud.langfuse.com`.

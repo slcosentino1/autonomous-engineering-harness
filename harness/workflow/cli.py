@@ -21,6 +21,7 @@ from workflow.authorization import (
     MAX_WORKFLOW_TIMEOUT_SECONDS,
 )
 from workflow.review import _validated_campaign_reports, render_review_feedback
+from workflow import github as _github
 
 
 DEFAULT_CLAUDE_BUDGET_USD = 2.00
@@ -231,6 +232,46 @@ def main(
     start.add_argument("--model", help="Optional Codex model; omit to use the CLI's configured default")
     start.add_argument("--trace", action="store_true", help="Enable metadata-only Langfuse tracing for this workflow")
 
+    github = commands.add_parser("github", help="Exchange imported workflow tasks and status with GitHub")
+    github_commands = github.add_subparsers(dest="github_command", required=True)
+    github_import = github_commands.add_parser("import", help="Import one allowlisted GitHub Issue as a proposal")
+    github_import.add_argument("issue_number", type=int, help="Positive GitHub Issue number")
+    github_import.add_argument("--target", required=True, help="Absolute local Git repository root")
+    github_import.add_argument("--repository", required=True, help="Allowlisted OWNER/REPO or HOST/OWNER/REPO")
+    github_import.add_argument("--budget-usd", type=float, default=DEFAULT_CLAUDE_BUDGET_USD)
+    github_import.add_argument(
+        "--max-code-review-calls",
+        type=lambda value: code_review_calls_arg(value, maximum=max_authorized_code_review_calls),
+        default=DEFAULT_MAX_CODE_REVIEW_CALLS,
+    )
+    github_import.add_argument(
+        "--max-codex-calls",
+        type=lambda value: bounded_integer_arg(value, name="Codex calls", maximum=MAX_AUTHORIZED_CODEX_CALLS),
+        default=DEFAULT_MAX_CODEX_CALLS,
+    )
+    github_import.add_argument(
+        "--codex-timeout-seconds",
+        type=lambda value: bounded_integer_arg(value, name="Codex timeout", maximum=MAX_PROVIDER_TIMEOUT_SECONDS),
+        default=DEFAULT_CODEX_TIMEOUT_SECONDS,
+    )
+    github_import.add_argument(
+        "--claude-timeout-seconds",
+        type=lambda value: bounded_integer_arg(value, name="Claude timeout", maximum=MAX_PROVIDER_TIMEOUT_SECONDS),
+        default=DEFAULT_CLAUDE_TIMEOUT_SECONDS,
+    )
+    github_import.add_argument(
+        "--workflow-timeout-seconds",
+        type=lambda value: bounded_integer_arg(value, name="workflow timeout", maximum=MAX_WORKFLOW_TIMEOUT_SECONDS),
+        default=DEFAULT_WORKFLOW_TIMEOUT_SECONDS,
+    )
+    github_import.add_argument("--codex", default=CODEX_EXECUTABLE)
+    github_import.add_argument("--aily", default=claude_reviewer.AILY_EXECUTABLE)
+    github_import.add_argument("--model")
+    github_import.add_argument("--trace", action="store_true")
+    github_report = github_commands.add_parser("report", help="Publish the saved workflow status to its Issue")
+    github_report.add_argument("workflow_id")
+    github_report.add_argument("--target", required=True, help="Absolute local Git repository root")
+
     for name, help_text in (
         ("approve", "Explicitly approve the saved proposal and start implementation"),
         ("resume", "Resume a failed stage or explicitly resolve an interrupted operation"),
@@ -324,6 +365,40 @@ def main(
                 f"Codex {args.codex_timeout_seconds}s/call; Claude/Aily {args.claude_timeout_seconds}s/call"
             )
             state = runner.start()
+        elif args.command == "github":
+            if args.github_command == "import":
+                if args.trace:
+                    from observability.langfuse import LangfusePreflightError, preflight_langfuse_tracing
+
+                    try:
+                        preflight_langfuse_tracing()
+                    except LangfusePreflightError as exc:
+                        raise workflow_error(str(exc)) from exc
+                result = _github.import_issue(
+                    args.target,
+                    args.repository,
+                    args.issue_number,
+                    runner_factory=runner_factory,
+                    runner_options={
+                        "budget_usd": args.budget_usd,
+                        "max_code_review_calls": args.max_code_review_calls,
+                        "max_codex_calls": args.max_codex_calls,
+                        "timeout_seconds": args.codex_timeout_seconds,
+                        "claude_timeout_seconds": args.claude_timeout_seconds,
+                        "workflow_timeout_seconds": args.workflow_timeout_seconds,
+                        "codex": args.codex,
+                        "aily": args.aily,
+                        "model": args.model,
+                        "tracing_enabled": args.trace or tracing_enabled_from_environment(),
+                    },
+                )
+                print(json.dumps({"workflow_id": result["workflow_id"], "status": result["status"]}))
+                # A successfully reconciled workflow can be failed and need `resume`;
+                # that is its saved state, not a failure to execute this CLI command.
+                return 0
+            result = _github.report_workflow(args.target, args.workflow_id, runner_factory=runner_factory)
+            print(json.dumps({"workflow_id": result["workflow_id"], "status": result["status"], "reported": True}))
+            return 0
         elif args.command == "recover-review":
             result = recover_review(args.target, args.workflow_id, apply=args.apply)
             print(json.dumps(result, indent=2, ensure_ascii=False))
@@ -367,6 +442,6 @@ def main(
                 state = runner.status()
         print_summary(state, workflow_root=workflow_root)
         return 0 if state.get("status") in {"awaiting_approval", "complete", "rejected"} else 1
-    except (workflow_error, claude_reviewer.ReviewError) as exc:
+    except (workflow_error, claude_reviewer.ReviewError, _github.GithubError) as exc:
         print(f"workflow error: {claude_reviewer.redact(str(exc))}", file=sys.stderr)
         return 2

@@ -259,6 +259,35 @@ print("DONE " + json.dumps({{"status": state["status"], "budget_unknown": state[
 
         return run
 
+    def test_target_lock_blocks_another_process_for_a_distinct_workflow(self):
+        script = f"""
+import sys
+from pathlib import Path
+sys.path.insert(0, {str(ROOT / 'harness')!r})
+import orchestrator
+try:
+    with orchestrator._target_process_lock(Path({str(self.target)!r})):
+        print('acquired')
+except orchestrator.WorkflowError as exc:
+    print('blocked' if 'modifying this target' in str(exc) else 'unexpected')
+"""
+        with orchestrator._target_process_lock(self.target):
+            result = subprocess.run(
+                [sys.executable, "-c", script], cwd=ROOT, capture_output=True, text=True, check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "blocked")
+
+    def test_start_snapshot_lock_contention_precedes_workflow_directory_creation(self):
+        runner = orchestrator.Orchestrator(
+            self.target, task="Create a proposal", workflow_id="snapshot-lock-contention",
+        )
+        with orchestrator._target_process_lock(self.target):
+            with self.assertRaisesRegex(orchestrator.WorkflowError, "modifying this target"):
+                runner.start()
+        self.assertFalse(runner.workflow_dir.exists())
+        self.assertFalse(runner.state_path.exists())
+
     def test_lock_releases_after_normal_exit_exception_and_process_termination(self):
         workflow_id = "lock-lifecycle"
         runner = orchestrator.Orchestrator(self.target, workflow_id=workflow_id)
