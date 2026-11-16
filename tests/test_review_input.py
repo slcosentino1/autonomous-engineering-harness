@@ -88,6 +88,47 @@ class ReviewInputTests(unittest.TestCase):
         changed = set(packet.included_paths) | {path for path, _reason in packet.excluded_files}
         self.assertEqual(changed, set(expected))
 
+    def test_workflow_artifacts_do_not_change_review_hash_or_hide_adjacent_changes(self):
+        self.add_baseline_files({"src/app.py": "value = 0\n"})
+        snapshot = self.capture_snapshot([])
+        (self.target / "src/app.py").write_text("value = 1\n", encoding="utf-8")
+        (self.target / ".engineering" / "notes.md").parent.mkdir(parents=True)
+        (self.target / ".engineering" / "notes.md").write_text("application note\n", encoding="utf-8")
+
+        workflow = self.target / workspace.WORKFLOW_ROOT / "workflow-1"
+        (workflow / "verification").mkdir(parents=True)
+        (workflow / "proposal.md").write_text("proposal\n", encoding="utf-8")
+        (workflow / "state.json").write_text("initial state\n", encoding="utf-8")
+        (workflow / "verification" / "test_scope.py").write_text("pass\n", encoding="utf-8")
+        registry = self.target / workspace.WORKFLOW_ROOT / "github-registry.json"
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        registry.write_text("registry\n", encoding="utf-8")
+
+        before_delivery = review_input.build_review_diff(
+            self.target, self.baseline, [], baseline_snapshot=snapshot,
+            review_scope_paths={"src/app.py"},
+        )
+        before_hash = orchestrator.Orchestrator._campaign_source_hash(before_delivery)
+
+        (workflow / "delivery.md").write_text("delivery report\n", encoding="utf-8")
+        (workflow / "state.json").write_text("updated state\n", encoding="utf-8")
+        (self.target / workspace.WORKFLOW_ROOT / "another-workflow").mkdir()
+        (self.target / workspace.WORKFLOW_ROOT / "another-workflow" / "state.json").write_text(
+            "other workflow state\n", encoding="utf-8",
+        )
+
+        after_delivery = review_input.build_review_diff(
+            self.target, self.baseline, [], baseline_snapshot=snapshot,
+            review_scope_paths={"src/app.py"},
+        )
+        after_hash = orchestrator.Orchestrator._campaign_source_hash(after_delivery)
+
+        self.assertEqual(before_delivery.included_paths, (".engineering/notes.md", "src/app.py"))
+        self.assertEqual(after_delivery.included_paths, before_delivery.included_paths)
+        self.assertEqual(after_delivery.workflow_paths, before_delivery.workflow_paths)
+        self.assertEqual(after_delivery.excluded_files, ())
+        self.assertEqual(after_hash, before_hash)
+
     def test_preexisting_sensitive_metadata_binary_and_redaction_filters_are_preserved(self):
         self.add_baseline_files({"src/preexisting.py": "before = True\n"})
         (self.target / "src" / "preexisting.py").write_text("after = True\n", encoding="utf-8")

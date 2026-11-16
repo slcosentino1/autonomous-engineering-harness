@@ -656,6 +656,44 @@ class PartReviewParserTests(unittest.TestCase):
         )
         self.assertTrue(any("explicitly say None" in error for error in parsed["errors"]))
 
+    def test_accepts_preserved_report_with_empty_marker_under_findings_heading(self):
+        report = self.report(
+            findings="Findings: None",
+            final=(
+                "No finding blocks acceptance. Findings are summarized above.\n"
+                "> ## Findings\n\n```markdown\n## Findings\n```."
+            ),
+        )
+
+        parsed = orchestrator.parse_part_review_report(report, "part-000001", [self.segment])
+
+        self.assertTrue(parsed["valid"], parsed["errors"])
+        self.assertEqual(parsed["findings"], [])
+
+    def test_accepts_a_single_findings_section(self):
+        parsed = orchestrator.parse_part_review_report(
+            self.report(findings="None"), "part-000001", [self.segment],
+        )
+
+        self.assertTrue(parsed["valid"], parsed["errors"])
+        self.assertEqual(parsed["findings"], [])
+
+    def test_rejects_genuinely_duplicated_findings_sections(self):
+        report = self.report().replace("## Findings\n", "## Findings\n\n## Findings\n", 1)
+
+        parsed = orchestrator.parse_part_review_report(report, "part-000001", [self.segment])
+
+        self.assertFalse(parsed["valid"])
+        self.assertIn("expected exactly one 'Findings' section; found 2", parsed["errors"])
+
+    def test_rejects_missing_findings_section(self):
+        report = self.report().replace("## Findings\nNone\n\n", "")
+
+        parsed = orchestrator.parse_part_review_report(report, "part-000001", [self.segment])
+
+        self.assertFalse(parsed["valid"])
+        self.assertIn("expected exactly one 'Findings' section; found 0", parsed["errors"])
+
     def test_rejects_ambiguous_duplicate_fields_parts_and_decisions(self):
         finding = self.finding("F1") + "\n- **Category:** Another category"
         report = self.report(findings=finding).replace(
@@ -706,6 +744,42 @@ class ReviewContractExtractionTests(unittest.TestCase):
         self.assertIs(orchestrator.ReviewSegment, review_contracts.ReviewSegment)
         self.assertIs(orchestrator.parse_part_review_report, review_contracts.parse_part_review_report)
         self.assertIs(orchestrator.render_review_feedback, review_contracts.render_review_feedback)
+
+    def test_legacy_review_hash_is_reconstructible_without_hiding_new_code_changes(self):
+        patch = "diff --git a/SMOKE_TEST.md b/SMOKE_TEST.md\n+content\n"
+        workflow_exclusions = tuple(sorted((
+            (".engineering/workflows/wf/proposal.md", "workflow state is not part of the implementation diff"),
+            (".engineering/workflows/wf/state.json", "workflow state is not part of the implementation diff"),
+            (".engineering/workflows/wf/verification/test_scope.py", "workflow state is not part of the implementation diff"),
+            (".engineering/workflows/github-registry.json", "workflow state is not part of the implementation diff"),
+        )))
+        historical = review_contracts.ReviewDiff(
+            patch, ("SMOKE_TEST.md",), workflow_exclusions, (("SMOKE_TEST.md", patch),),
+            ("SMOKE_TEST.md",), (("SMOKE_TEST.md", "not present", "(file absent)", "content\n"),),
+        )
+        current = review_contracts.ReviewDiff(
+            patch, ("SMOKE_TEST.md",), (), (("SMOKE_TEST.md", patch),),
+            ("SMOKE_TEST.md",), (("SMOKE_TEST.md", "not present", "(file absent)", "content\n"),),
+        )
+        recorded_hash = review_contracts.ReviewCampaign._campaign_source_hash(historical)
+
+        self.assertEqual(
+            review_contracts.ReviewCampaign._campaign_source_hash(
+                current, preserved_exclusions=workflow_exclusions,
+            ),
+            recorded_hash,
+        )
+        changed_patch = patch + "+later application change\n"
+        changed = review_contracts.ReviewDiff(
+            changed_patch, ("SMOKE_TEST.md",), (), (("SMOKE_TEST.md", changed_patch),),
+            ("SMOKE_TEST.md",), (("SMOKE_TEST.md", "not present", "(file absent)", "later content\n"),),
+        )
+        self.assertNotEqual(
+            review_contracts.ReviewCampaign._campaign_source_hash(
+                changed, preserved_exclusions=workflow_exclusions,
+            ),
+            recorded_hash,
+        )
 
     def test_partition_validation_keeps_workflow_error_and_message(self):
         patch = "first line\nsecond line\n"
@@ -3110,14 +3184,6 @@ class WorkflowTests(unittest.TestCase):
         ])
         self.assertEqual(state["review_exclusions"], [
             {"path": ".DS_Store", "reason": "operating-system metadata"},
-            {
-                "path": ".engineering/workflows/file-coverage-review/proposal.md",
-                "reason": "workflow state is not part of the implementation diff",
-            },
-            {
-                "path": ".engineering/workflows/file-coverage-review/state.json",
-                "reason": "workflow state is not part of the implementation diff",
-            },
         ])
         code_context = state["claude_contexts"][-1]
         self.assertEqual(code_context["call_state"], "completed")

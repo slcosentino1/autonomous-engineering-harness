@@ -42,6 +42,10 @@ def _os_metadata_reason(relative: str) -> str | None:
     return None
 
 
+def _is_workflow_state_path(relative: str) -> bool:
+    return relative == workspace.WORKFLOW_ROOT or relative.startswith(workspace.WORKFLOW_ROOT + "/")
+
+
 def _binary_content_reason(content: bytes) -> str | None:
     if b"\x00" in content:
         return "contains a NUL byte"
@@ -347,8 +351,9 @@ def _legacy_review_diff(
 ) -> ReviewDiff:
     """Retain the exact v1 patch contract for persisted workflows without baseline snapshots."""
     tracked, untracked = workspace.changed_paths(target, baseline, redactor=redactor)
-    protected = set(preexisting_paths)
-    workflow_prefix = workspace.WORKFLOW_ROOT + "/"
+    tracked = [path for path in tracked if not _is_workflow_state_path(path)]
+    untracked = [path for path in untracked if not _is_workflow_state_path(path)]
+    protected = {path for path in preexisting_paths if not _is_workflow_state_path(path)}
     chunks: list[str] = []
     file_patches: list[tuple[str, str]] = []
     included: list[str] = []
@@ -358,8 +363,6 @@ def _legacy_review_diff(
         reason = _os_metadata_reason(relative)
         if reason is None and relative in protected:
             reason = "pre-existing target change is protected from review"
-        if reason is None and relative.startswith(workflow_prefix):
-            reason = "workflow state is not part of the implementation diff"
         if reason is None and workspace.is_sensitive(relative):
             reason = "sensitive path is excluded from external review"
         if reason is None and ".git" in Path(relative).parts:
@@ -449,7 +452,9 @@ def build_review_diff(
         if not _snapshot_integrity(baseline_snapshot):
             raise ReviewInputError("Saved baseline snapshot integrity check failed; review attribution is inconclusive.")
     tracked, untracked = workspace.changed_paths(target, baseline, redactor=redactor)
-    protected = set(preexisting_paths)
+    tracked = [path for path in tracked if not _is_workflow_state_path(path)]
+    untracked = [path for path in untracked if not _is_workflow_state_path(path)]
+    protected = {path for path in preexisting_paths if not _is_workflow_state_path(path)}
     workflow_prefix = workspace.WORKFLOW_ROOT + "/"
     chunks: list[str] = []
     file_patches: list[tuple[str, str]] = []
@@ -462,8 +467,6 @@ def build_review_diff(
 
     for relative in sorted(candidates):
         reason = _os_metadata_reason(relative)
-        if reason is None and relative.startswith(workflow_prefix):
-            reason = "workflow state is not part of the implementation diff"
         if reason is None and workspace.is_sensitive(relative):
             reason = "sensitive path is excluded from external review"
         if reason is None and ".git" in Path(relative).parts:
@@ -567,10 +570,14 @@ def build_review_diff(
             + ", ".join(json.dumps(path, ensure_ascii=True) for path in missing)
         )
 
-    scope_paths = set(review_scope_paths)
-    dependency_paths = _direct_python_dependencies(
-        target, baseline, scope_paths, protected, entries,
-    ) - scope_paths
+    scope_paths = {
+        path for path in review_scope_paths
+        if isinstance(path, str) and not _is_workflow_state_path(path)
+    }
+    dependency_paths = {
+        path for path in _direct_python_dependencies(target, baseline, scope_paths, protected, entries)
+        if path not in scope_paths and not _is_workflow_state_path(path)
+    }
     context_files = []
     context_exclusions = []
     context_total = 0

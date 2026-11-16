@@ -116,11 +116,42 @@ def parse_part_review_report(report: str, expected_part_id: str, segments: list[
         return [(i, m.group(1).strip()) for i, line in enumerate(candidates)
                 if (m := re.match(pattern, line, re.I))]
 
-    section_line_re = re.compile(
-        r"^\s{0,3}(?:#{1,6}\s*)?(?:\*\*)?(?:Files reviewed|Findings|Cross-component concerns|"
-        r"Overall assessment)(?:\*\*)?(?:[ \t]*:.*|[ \t]*)$", re.I,
+    section_re = re.compile(
+        r"^\s{0,3}(?P<markdown>#{1,6}[ \t]+)?(?:\*\*)?"
+        r"(?P<section>Files reviewed|Findings|Cross-component concerns|Overall assessment)"
+        r"(?:\*\*)?(?:[ \t]*:[ \t]*(?:\*\*)?(?P<inline>.*?)|[ \t]*)$", re.I,
     )
-    section_starts = [i for i, line in enumerate(lines) if section_line_re.match(line)]
+    canonical = {name.casefold(): name for name in PART_REVIEW_SECTIONS}
+    section_headings: list[tuple[int, str, str]] = []
+    fence: tuple[str, int] | None = None
+    for index, line in enumerate(lines):
+        fence_match = re.match(r"^\s{0,3}(`{3,}|~{3,})", line)
+        if fence is not None:
+            if (fence_match and fence_match.group(1)[0] == fence[0]
+                    and len(fence_match.group(1)) >= fence[1]):
+                fence = None
+            continue
+        if fence_match:
+            marker = fence_match.group(1)
+            fence = (marker[0], len(marker))
+            continue
+
+        match = section_re.match(line)
+        if not match:
+            continue
+        name = canonical[match.group("section").casefold()]
+        inline = (match.group("inline") or "").strip()
+        is_markdown_heading = match.group("markdown") is not None
+        if (not is_markdown_heading and name == "Findings" and section_headings
+                and section_headings[-1][1] == "Findings"
+                and not any(item.strip() for item in lines[section_headings[-1][0] + 1:index])
+                and re.fullmatch(r"(?i)(?:none|no findings\.?|n/?a)", inline)):
+            # A repeated label with an explicit empty marker is common beneath `## Findings`.
+            # Keep it as body content; a second actual section heading remains an error.
+            continue
+        section_headings.append((index, name, inline))
+
+    section_starts = [index for index, _name, _inline in section_headings]
     header_lines = lines[:min(section_starts)] if section_starts else lines
 
     decisions = values_for(
@@ -147,15 +178,8 @@ def parse_part_review_report(report: str, expected_part_id: str, segments: list[
             errors.append(f"Part ID is {actual_part_id!r}; expected {expected_part_id!r}")
 
     heading_positions: dict[str, list[tuple[int, str]]] = {name: [] for name in PART_REVIEW_SECTIONS}
-    section_re = re.compile(
-        r"^\s{0,3}(?:#{1,6}\s*)?(?:\*\*)?(Files reviewed|Findings|Cross-component concerns|Overall assessment)"
-        r"(?:\*\*)?\s*:?\s*(?:\*\*)?[ \t]*(.*?)\s*$", re.I,
-    )
-    canonical = {name.casefold(): name for name in PART_REVIEW_SECTIONS}
-    for index, line in enumerate(lines):
-        match = section_re.match(line)
-        if match:
-            heading_positions[canonical[match.group(1).casefold()]].append((index, match.group(2).strip()))
+    for index, name, inline in section_headings:
+        heading_positions[name].append((index, inline))
     for name, positions in heading_positions.items():
         if len(positions) != 1:
             errors.append(f"expected exactly one {name!r} section; found {len(positions)}")
@@ -175,6 +199,12 @@ def parse_part_review_report(report: str, expected_part_id: str, segments: list[
                           if items and items[0][0] > start]
         end = min(next_positions) if next_positions else len(lines)
         body = "\n".join(lines[start + 1:end]).strip()
+        if name == "Findings":
+            repeated_empty_marker = re.fullmatch(
+                r"(?is)Findings\s*:\s*(None|No findings\.?|N/?A)", body,
+            )
+            if repeated_empty_marker:
+                body = repeated_empty_marker.group(1)
         sections[name] = "\n".join(part for part in (inline, body) if part).strip()
         if not sections[name]:
             errors.append(f"{name!r} section is empty")
@@ -822,11 +852,15 @@ class ReviewCampaign:
             raise ReviewCampaignError(error)
 
     @staticmethod
-    def _campaign_source_hash(review_diff: ReviewDiff) -> str:
+    def _campaign_source_hash(
+        review_diff: ReviewDiff, *, preserved_exclusions: tuple[tuple[str, str], ...] = (),
+    ) -> str:
         content = {
             "patches": list(review_diff.file_patches),
             "exclusions": list(review_diff.excluded_files),
         }
+        if preserved_exclusions:
+            content["exclusions"] = sorted(set(review_diff.excluded_files) | set(preserved_exclusions))
         if (review_diff.workflow_paths or review_diff.context_files or review_diff.context_exclusions
                 or review_diff.operation_diffs):
             content.update({
