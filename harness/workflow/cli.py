@@ -242,6 +242,15 @@ def main(
         command.add_argument("--codex", default=CODEX_EXECUTABLE)
         command.add_argument("--aily", default=claude_reviewer.AILY_EXECUTABLE)
         if name == "resume":
+            budget = command.add_mutually_exclusive_group()
+            budget.add_argument(
+                "--extend-budget", metavar="AMOUNT",
+                help="Add a positive USD amount (up to cents) to the saved total Claude/Aily limit",
+            )
+            budget.add_argument(
+                "--set-budget-limit", metavar="AMOUNT",
+                help="Set the absolute total Claude/Aily limit, including accumulated spend",
+            )
             command.add_argument(
                 "--recovery-action", choices=("retry", "accept-implementation"),
                 help="Explicitly resolve a detected crash recovery after inspecting status and target changes",
@@ -336,6 +345,10 @@ def main(
                     "confirm_process_inactive": args.confirm_process_inactive,
                     "confirm_target_reviewed": args.confirm_target_reviewed,
                 }
+                if args.extend_budget is not None:
+                    recovery_arguments["extend_budget"] = args.extend_budget
+                if args.set_budget_limit is not None:
+                    recovery_arguments["set_budget_limit"] = args.set_budget_limit
                 if any(value not in (None, False) for value in recovery_arguments.values()):
                     state = runner.resume(**recovery_arguments)
                 else:

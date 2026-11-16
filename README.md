@@ -104,6 +104,22 @@ python /path/to/autonomous-engineering-harness/harness/orchestrator.py resume \
   --target /absolute/path/to/target-repository --workflow-id WORKFLOW_ID
 ```
 
+### Explicit budget changes on resume
+
+An explicitly authorized resume can also change the saved Claude/Aily total budget:
+
+```sh
+python /path/to/autonomous-engineering-harness/harness/orchestrator.py resume \
+  --target /absolute/path/to/target-repository --workflow-id WORKFLOW_ID \
+  --extend-budget 2.00
+
+python /path/to/autonomous-engineering-harness/harness/orchestrator.py resume \
+  --target /absolute/path/to/target-repository --workflow-id WORKFLOW_ID \
+  --set-budget-limit 3.71
+```
+
+Use one option per command. `--extend-budget` adds a positive finite USD amount with at most two decimal places to the current total; `--set-budget-limit` supplies the new absolute total, including prior spend. The absolute limit may be lowered or set equal to the current limit, but cannot be below accumulated spend. A saved change is recorded under `authorization.claude_aily.budget_changes` in `state.json`, including its timestamp, operation, old and new limits, requested amount, spend, remaining budget, workflow and authorization IDs, command, and failed stage. The resume command prints the applied limit and remaining amount before retrying. If less than one cent remains, the change stays authorized and the failed stage remains untried. Changes also remain saved if the stage retry fails; a later plain `resume` uses the saved limit without extending it again. Check the applied summary or saved history before repeating an extension, since each repeated extension is a new addition. Omitting both options preserves the existing resume behavior.
+
 Workflow files are stored under `.engineering/workflows/WORKFLOW_ID/` in the target: `state.json`, `proposal.md`, and, on completion, `delivery.md`.
 
 Each Codex operation record in `state.json` includes the exact UTF-8 input hash and size, raw captured stdout/stderr hashes and sizes, the final-message file hash when available, exit status, timestamps, and monotonic duration. Stream hashes cover the bytes captured by the subprocess pipes; when a test runner supplies text instead of bytes, the harness hashes its UTF-8 encoding and records that representation. `result_sha256` remains the hash of the trimmed, normalized final response used by workflow recovery, so it is distinct from the raw stdout and final-message file hashes. Timeouts are marked partial, while streams unavailable after interruption are marked unavailable or not captured.

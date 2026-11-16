@@ -7,7 +7,7 @@ import json
 import re
 import uuid
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 
 from observability.tracer import observability_scope, valid_observability_scope
@@ -53,6 +53,186 @@ RESTRICTED_OPERATIONS = [
 
 class AuthorizationError(RuntimeError):
     """A workflow authorization is invalid or unsupported."""
+
+
+_RESUMABLE_STAGES = {
+    "planning", "plan_review_1", "plan_review_2", "plan_refine_1", "plan_refine_2",
+    "human_revision", "implementation", "code_review", "correction", "verification",
+}
+_BUDGET_CHANGE_FIELDS = {
+    "timestamp", "operation", "previous_limit_usd", "requested_amount_usd", "new_limit_usd",
+    "spent_usd", "remaining_usd", "workflow_id", "authorization_id", "command", "stage",
+}
+_BUDGET_AMOUNT_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
+
+
+def parse_budget_amount(value: str) -> Decimal:
+    """Parse a positive, cent-precision amount representable by saved JSON numbers."""
+    if not isinstance(value, str) or not value.strip():
+        raise AuthorizationError("Budget amount must be a positive finite amount with at most two decimal places.")
+    value = value.strip()
+    if not _BUDGET_AMOUNT_RE.fullmatch(value):
+        raise AuthorizationError("Budget amount must be a positive finite amount with at most two decimal places.")
+    try:
+        amount = Decimal(value)
+    except Exception as exc:
+        raise AuthorizationError(
+            "Budget amount must be a positive finite amount with at most two decimal places."
+        ) from exc
+    if not amount.is_finite() or amount <= 0:
+        raise AuthorizationError("Budget amount must be positive, finite, and use at most two decimal places.")
+    _json_money_number(amount)
+    if not _has_cent_precision(amount):
+        raise AuthorizationError("Budget amount must be positive, finite, and use at most two decimal places.")
+    return amount
+
+
+def _has_cent_precision(amount: Decimal) -> bool:
+    if amount.as_tuple().exponent >= -2:
+        return True
+    try:
+        with localcontext() as context:
+            context.prec = 1000
+            return amount == amount.quantize(Decimal("0.01"))
+    except InvalidOperation:
+        return False
+
+
+def _json_money_number(value: Decimal) -> float:
+    """Use the existing JSON-number money representation without losing cent value."""
+    try:
+        number = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise AuthorizationError("Budget amount cannot be represented as a finite JSON number.") from exc
+    if not number == number or number in (float("inf"), float("-inf")):
+        raise AuthorizationError("Budget amount cannot be represented as a finite JSON number.")
+    if Decimal(str(number)) != value:
+        raise AuthorizationError("Budget amount cannot be represented without losing its cent precision.")
+    return number
+
+
+def _json_decimal_number(value: Decimal) -> float:
+    """Serialize a non-negative spend or balance without changing its decimal value."""
+    try:
+        number = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise AuthorizationError("Budget history amount cannot be represented as a finite JSON number.") from exc
+    if number != number or number in (float("inf"), float("-inf")):
+        raise AuthorizationError("Budget history amount cannot be represented as a finite JSON number.")
+    if Decimal(str(number)) != value:
+        raise AuthorizationError("Budget history amount cannot be represented without rounding.")
+    return number
+
+
+def authorize_budget_change(
+    authorization: dict,
+    amount_text: str,
+    operation: str,
+    *,
+    workflow_id: str,
+    stage: str,
+    timestamp: str,
+) -> dict:
+    """Append a budget authorization event and update the effective limit."""
+    if operation not in {"extend", "set_limit"}:
+        raise AuthorizationError("Unsupported budget authorization operation.")
+    if stage not in _RESUMABLE_STAGES:
+        raise AuthorizationError("Budget changes require a saved, resumable workflow stage.")
+    external = authorization.get("claude_aily")
+    if not isinstance(external, dict):
+        raise AuthorizationError("Saved Claude/Aily authorization is missing.")
+    amount = parse_budget_amount(amount_text)
+    try:
+        previous = Decimal(str(external.get("budget_usd")))
+        spent = Decimal(str(external.get("spent_usd")))
+    except Exception as exc:
+        raise AuthorizationError("Saved Claude/Aily budget is invalid.") from exc
+    if not previous.is_finite() or not spent.is_finite() or previous < Decimal("0.01") or spent < 0:
+        raise AuthorizationError("Saved Claude/Aily budget or spending is invalid.")
+    with localcontext() as context:
+        context.prec = 1000
+        new_limit = previous + amount if operation == "extend" else amount
+        remaining = new_limit - spent
+    if new_limit < spent:
+        raise AuthorizationError("New Claude/Aily budget limit cannot be below accumulated spending.")
+    _json_money_number(new_limit)
+    spent_number = _json_decimal_number(spent)
+    remaining_number = _json_decimal_number(remaining)
+    changes = external.get("budget_changes", [])
+    if not isinstance(changes, list):
+        raise AuthorizationError("Saved Claude/Aily budget history is invalid.")
+    entry = {
+        "timestamp": timestamp,
+        "operation": operation,
+        "previous_limit_usd": _json_money_number(previous),
+        "requested_amount_usd": _json_money_number(amount),
+        "new_limit_usd": _json_money_number(new_limit),
+        "spent_usd": spent_number,
+        "remaining_usd": remaining_number,
+        "workflow_id": workflow_id,
+        "authorization_id": authorization.get("authorization_id"),
+        "command": "resume",
+        "stage": stage,
+    }
+    changes.append(entry)
+    external["budget_changes"] = changes
+    external["budget_usd"] = _json_money_number(new_limit)
+    return entry
+
+
+def _validate_budget_change_history(authorization: dict, external: dict, workflow_id: str) -> None:
+    if "budget_changes" not in external:
+        return
+    changes = external.get("budget_changes")
+    if not isinstance(changes, list) or not changes:
+        raise AuthorizationError("Saved Claude/Aily budget history is invalid.")
+    prior_limit: Decimal | None = None
+    prior_spent: Decimal | None = None
+    for entry in changes:
+        if not isinstance(entry, dict) or set(entry) != _BUDGET_CHANGE_FIELDS:
+            raise AuthorizationError("Saved Claude/Aily budget history is invalid.")
+        try:
+            timestamp = datetime.fromisoformat(str(entry["timestamp"]).replace("Z", "+00:00"))
+            previous = Decimal(str(entry["previous_limit_usd"]))
+            requested = Decimal(str(entry["requested_amount_usd"]))
+            new_limit = Decimal(str(entry["new_limit_usd"]))
+            spent = Decimal(str(entry["spent_usd"]))
+            remaining = Decimal(str(entry["remaining_usd"]))
+        except Exception as exc:
+            raise AuthorizationError("Saved Claude/Aily budget history is invalid.") from exc
+        amounts = (previous, requested, new_limit, spent, remaining)
+        if (timestamp.tzinfo is None or timestamp.utcoffset() is None
+                or timestamp.utcoffset().total_seconds() != 0
+                or any(not amount.is_finite() for amount in amounts)
+                or previous < Decimal("0.01") or requested <= 0 or new_limit < Decimal("0.01")
+                or spent < 0 or remaining < 0
+                or any(not _has_cent_precision(amount) for amount in (previous, requested, new_limit))
+                or entry.get("workflow_id") != workflow_id
+                or entry.get("authorization_id") != authorization.get("authorization_id")
+                or entry.get("command") != "resume"
+                or not isinstance(entry.get("stage"), str)
+                or entry.get("stage") not in _RESUMABLE_STAGES
+                or not isinstance(entry.get("operation"), str)
+                or entry.get("operation") not in {"extend", "set_limit"}):
+            raise AuthorizationError("Saved Claude/Aily budget history is invalid.")
+        if prior_limit is not None and previous != prior_limit:
+            raise AuthorizationError("Saved Claude/Aily budget history limit chain is invalid.")
+        if prior_spent is not None and spent < prior_spent:
+            raise AuthorizationError("Saved Claude/Aily budget history spending decreased.")
+        with localcontext() as context:
+            context.prec = 1000
+            expected_limit = previous + requested if entry["operation"] == "extend" else requested
+            expected_remaining = new_limit - spent
+        if new_limit != expected_limit or remaining != expected_remaining:
+            raise AuthorizationError("Saved Claude/Aily budget history arithmetic is invalid.")
+        prior_limit, prior_spent = new_limit, spent
+    try:
+        current_limit = Decimal(str(external.get("budget_usd")))
+        current_spent = Decimal(str(external.get("spent_usd")))
+    except Exception as exc:
+        raise AuthorizationError("Saved Claude/Aily budget is invalid.") from exc
+    if prior_limit != current_limit or prior_spent > current_spent:
+        raise AuthorizationError("Saved Claude/Aily budget history does not match current authorization state.")
 
 
 def _authorization_now() -> str:
@@ -234,9 +414,10 @@ def validate_workflow_authorization(state: dict, target: Path, workflow_id: str)
     except Exception as exc:
         raise AuthorizationError("Saved Claude/Aily budget is invalid.") from exc
     if (not budget.is_finite() or budget < Decimal("0.01")
-            or budget != budget.quantize(Decimal("0.01"))
+            or not _has_cent_precision(budget)
             or not spent.is_finite() or spent < 0):
         raise AuthorizationError("Saved Claude/Aily budget or spending is invalid.")
+    _validate_budget_change_history(authorization, external, workflow_id)
     if authorization.get("scope_sha256") != authorization_scope_digest(authorization):
         raise AuthorizationError("Saved workflow authorization changed after initialization.")
     return authorization

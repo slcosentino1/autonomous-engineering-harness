@@ -21,7 +21,7 @@ import tomllib
 import uuid
 from collections import Counter
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, localcontext
 from pathlib import Path
 from typing import Callable
 
@@ -704,6 +704,17 @@ def authorization_scope_digest(authorization: dict) -> str:
 def validate_workflow_authorization(state: dict, target: Path, workflow_id: str) -> dict:
     try:
         return _authorization.validate_workflow_authorization(state, target, workflow_id)
+    except _authorization.AuthorizationError as exc:
+        raise WorkflowError(str(exc)) from exc
+
+
+def authorize_budget_change(
+    authorization: dict, amount: str, operation: str, *, workflow_id: str, stage: str,
+) -> dict:
+    try:
+        return _authorization.authorize_budget_change(
+            authorization, amount, operation, workflow_id=workflow_id, stage=stage, timestamp=now(),
+        )
     except _authorization.AuthorizationError as exc:
         raise WorkflowError(str(exc)) from exc
 
@@ -2331,6 +2342,8 @@ class Orchestrator:
         confirm_provider_inactive: bool = False,
         confirm_process_inactive: bool = False,
         confirm_target_reviewed: bool = False,
+        extend_budget: str | None = None,
+        set_budget_limit: str | None = None,
     ) -> dict:
         return self._execute_locked(lambda: self._resume_locked(
             recovery_action=recovery_action,
@@ -2338,6 +2351,8 @@ class Orchestrator:
             confirm_provider_inactive=confirm_provider_inactive,
             confirm_process_inactive=confirm_process_inactive,
             confirm_target_reviewed=confirm_target_reviewed,
+            extend_budget=extend_budget,
+            set_budget_limit=set_budget_limit,
         ))
 
     def _resume_locked(
@@ -2348,14 +2363,24 @@ class Orchestrator:
         confirm_provider_inactive: bool = False,
         confirm_process_inactive: bool = False,
         confirm_target_reviewed: bool = False,
+        extend_budget: str | None = None,
+        set_budget_limit: str | None = None,
     ) -> dict:
+        budget_change_requested = extend_budget is not None or set_budget_limit is not None
+        if extend_budget is not None and set_budget_limit is not None:
+            raise WorkflowError("Choose only one of --extend-budget or --set-budget-limit.")
         self._load(preflight_tracing=True)
         if self.state.get("status") == "awaiting_approval":
+            if budget_change_requested:
+                raise WorkflowError("Budget changes are available only when resuming a saved failed stage.")
             return self.state
         if self.state.get("status") == "complete":
             self._verify_delivery_integrity()
             self._verify_delivery_artifact_hash()
+            if budget_change_requested:
+                raise WorkflowError("Budget changes are available only when resuming a saved failed stage.")
             return self.state
+        recovery_resolved = False
         if self.state.get("status") == "recovery_required":
             self._resolve_recovery(
                 recovery_action,
@@ -2364,6 +2389,7 @@ class Orchestrator:
                 confirm_process_inactive=confirm_process_inactive,
                 confirm_target_reviewed=confirm_target_reviewed,
             )
+            recovery_resolved = True
         elif self.state.get("status") == "running":
             if recovery_action is not None:
                 raise WorkflowError("No recovery action is pending for this workflow.")
@@ -2375,6 +2401,44 @@ class Orchestrator:
         if (authorization["claude_aily"]["budget_unknown"]
                 and self.state.get("stage", "").startswith(("plan_review", "code_review", "verification"))):
             raise WorkflowError(self.state.get("error") or "Claude review stopped because spend is unknown.")
+        if budget_change_requested:
+            if not (self.state.get("status") == "failed" or recovery_resolved):
+                raise WorkflowError("Budget changes are available only when resuming a saved failed stage.")
+            external = authorization["claude_aily"]
+            if external.get("budget_unknown") is True:
+                raise WorkflowError(self.state.get("error") or "Claude review stopped because spend is unknown.")
+            stage = self.state.get("stage")
+            if not isinstance(stage, str):
+                raise WorkflowError("The saved failed stage is invalid; no budget change was applied.")
+            operation, amount = (
+                ("extend", extend_budget) if extend_budget is not None else ("set_limit", set_budget_limit)
+            )
+            entry = authorize_budget_change(
+                authorization, amount, operation, workflow_id=self.workflow_id, stage=stage,
+            )
+            self._save()
+            print(
+                f"Claude/Aily budget authorization saved: ${entry['previous_limit_usd']:.2f} to "
+                f"${entry['new_limit_usd']:.2f}; remaining ${entry['remaining_usd']:.4f} "
+                f"for workflow {self.workflow_id} at stage {stage}.",
+                file=sys.stderr,
+            )
+            with localcontext() as context:
+                context.prec = 1000
+                remaining = (
+                    Decimal(str(external["budget_usd"])) - Decimal(str(external["spent_usd"]))
+                )
+            with localcontext() as context:
+                context.prec = 1000
+                available = remaining.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            if available < Decimal("0.01"):
+                self.state["status"] = "failed"
+                self.state["error"] = (
+                    "The saved budget change was authorized, but less than USD 0.01 remains; "
+                    "the failed stage was not retried."
+                )
+                self._save()
+                raise WorkflowError(self.state["error"])
         self._begin_execution_trace("resume")
         self.state["status"] = "running"
         self.state["error"] = None
@@ -3069,8 +3133,10 @@ class Orchestrator:
             file=sys.stderr,
         )
 
-        remaining_amount = Decimal(str(external["budget_usd"])) - Decimal(str(external["spent_usd"]))
-        remaining = float(remaining_amount.quantize(Decimal("0.01"), rounding=ROUND_DOWN))
+        with localcontext() as context:
+            context.prec = 1000
+            remaining_amount = Decimal(str(external["budget_usd"])) - Decimal(str(external["spent_usd"]))
+            remaining = float(remaining_amount.quantize(Decimal("0.01"), rounding=ROUND_DOWN))
         if remaining < 0.01:
             raise WorkflowError("The authorized Claude budget is exhausted.")
         usage = self._resource_usage()
