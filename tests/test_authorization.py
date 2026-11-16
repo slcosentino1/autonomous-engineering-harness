@@ -37,6 +37,42 @@ class AuthorizationModuleTests(unittest.TestCase):
             authorization.authorization_scope_digest(changed),
         )
 
+    def test_github_publication_scope_is_optional_bound_and_digest_protected(self):
+        scope = {
+            "version": 1,
+            "repository": "github.com/acme/widget",
+            "issue_number": 42,
+            "operations": ["create_reviewed_commit", "create_branch", "create_pull_request"],
+        }
+        saved = authorization.new_workflow_authorization(
+            Path("/target"), "github-publication", 2.0, github_publication=scope,
+        )
+        authorization.validate_workflow_authorization(
+            {"authorization": saved}, Path("/target"), "github-publication",
+        )
+        changed = copy.deepcopy(saved)
+        changed["github_publication"]["repository"] = "github.com/acme/other"
+        with self.assertRaisesRegex(authorization.AuthorizationError, "changed after initialization"):
+            authorization.validate_workflow_authorization(
+                {"authorization": changed}, Path("/target"), "github-publication",
+            )
+        self.assertNotIn(
+            "github_publication",
+            authorization.new_workflow_authorization(Path("/target"), "no-publication", 2.0),
+        )
+
+    def test_github_publication_scope_rejects_unscoped_or_broadened_operations(self):
+        scope = {
+            "version": 1,
+            "repository": "github.com/acme/widget",
+            "issue_number": 42,
+            "operations": ["commit", "push", "publish"],
+        }
+        with self.assertRaisesRegex(authorization.AuthorizationError, "scope is invalid"):
+            authorization.new_workflow_authorization(
+                Path("/target"), "invalid-github-publication", 2.0, github_publication=scope,
+            )
+
     def test_new_authorization_validates_without_mutating_its_contract(self):
         target = Path("/target")
         created = authorization.new_workflow_authorization(target, "valid-test", 1.25, 3)

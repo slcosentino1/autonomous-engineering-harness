@@ -49,6 +49,11 @@ RESTRICTED_OPERATIONS = [
     "publish",
     "change_shared_infrastructure",
 ]
+GITHUB_PUBLICATION_OPERATIONS = [
+    "create_reviewed_commit",
+    "create_branch",
+    "create_pull_request",
+]
 
 
 class AuthorizationError(RuntimeError):
@@ -239,6 +244,25 @@ def _authorization_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def _validate_github_publication_scope(value: object) -> dict:
+    repository = value.get("repository") if isinstance(value, dict) else None
+    issue_number = value.get("issue_number") if isinstance(value, dict) else None
+    if (not isinstance(value, dict)
+            or set(value) != {"version", "repository", "issue_number", "operations"}
+            or type(value.get("version")) is not int or value.get("version") != 1
+            or not isinstance(repository, str)
+            or not re.fullmatch(r"[a-z0-9.-]+/[a-z0-9_.-]+/[a-z0-9_.-]+", repository)
+            or type(issue_number) is not int or issue_number <= 0
+            or value.get("operations") != GITHUB_PUBLICATION_OPERATIONS):
+        raise AuthorizationError("GitHub publication authorization scope is invalid.")
+    return {
+        "version": 1,
+        "repository": repository,
+        "issue_number": issue_number,
+        "operations": GITHUB_PUBLICATION_OPERATIONS.copy(),
+    }
+
+
 def new_workflow_authorization(
     target: Path, workflow_id: str, budget_usd: float,
     max_code_review_calls: int = DEFAULT_MAX_CODE_REVIEW_CALLS,
@@ -247,6 +271,7 @@ def new_workflow_authorization(
     codex_timeout_seconds: int = DEFAULT_CODEX_TIMEOUT_SECONDS,
     claude_timeout_seconds: int = DEFAULT_CLAUDE_TIMEOUT_SECONDS,
     workflow_timeout_seconds: int = DEFAULT_WORKFLOW_TIMEOUT_SECONDS,
+    github_publication: dict | None = None,
 ) -> dict:
     """Create the single persistent authorization attached to a new workflow."""
     if (isinstance(max_code_review_calls, bool) or not isinstance(max_code_review_calls, int)
@@ -310,6 +335,8 @@ def new_workflow_authorization(
         "observability": observability_scope(tracing_enabled),
         "restricted_operations": RESTRICTED_OPERATIONS.copy(),
     }
+    if github_publication is not None:
+        authorization["github_publication"] = _validate_github_publication_scope(github_publication)
     authorization["scope_sha256"] = authorization_scope_digest(authorization)
     return authorization
 
@@ -336,6 +363,12 @@ def validate_workflow_authorization(state: dict, target: Path, workflow_id: str)
         raise AuthorizationError("Saved Codex authorization is missing, changed, or broader than the supported stages.")
     if authorization.get("restricted_operations") != RESTRICTED_OPERATIONS:
         raise AuthorizationError("Saved protected-operation boundaries are missing or changed.")
+    github_publication = authorization.get("github_publication")
+    if github_publication is not None:
+        try:
+            _validate_github_publication_scope(github_publication)
+        except AuthorizationError as exc:
+            raise AuthorizationError("Saved GitHub publication scope is invalid or changed.")
     observability = authorization.get("observability")
     if observability is not None:
         enabled = observability.get("enabled") if isinstance(observability, dict) else None

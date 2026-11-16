@@ -28,11 +28,13 @@ _UNSET = object()
 class FakeRunner:
     starts: list[str] = []
     tasks: dict[str, str] = {}
+    options: dict[str, dict] = {}
 
     def __init__(self, target, *, task=None, workflow_id=None, **_options):
         self.target = Path(target).resolve()
         self.workflow_id = workflow_id or "unused"
         self.task = task
+        self.options[self.workflow_id] = _options
         self.workflow_dir = self.target / ".engineering" / "workflows" / self.workflow_id
         self.state_path = self.workflow_dir / "state.json"
 
@@ -71,6 +73,7 @@ class GithubBridgeTests(unittest.TestCase):
         self.target.mkdir()
         FakeRunner.starts = []
         FakeRunner.tasks = {}
+        FakeRunner.options = {}
         self.api_calls = []
 
     def tearDown(self):
@@ -85,10 +88,11 @@ class GithubBridgeTests(unittest.TestCase):
 
         return api
 
-    def import_issue(self, *, response=_UNSET, repository="acme/widget", api=None):
+    def import_issue(self, *, response=_UNSET, repository="acme/widget", api=None, publish_pr=False):
         return github.import_issue(
             self.target, repository, 42, runner_factory=FakeRunner,
             allowlist="github.com/acme/widget", api=api or self.api_for_issue(response),
+            publish_pr=publish_pr,
         )
 
     def write_reservation(self, workflow_id="reserved-workflow", *, state="reserved", target=None):
@@ -137,6 +141,21 @@ class GithubBridgeTests(unittest.TestCase):
         self.assertEqual(record["state"], "started")
         self.assertEqual(len(record["content_sha256"]), 64)
         self.assertNotIn("token", json.dumps(registry).lower())
+
+    def test_publish_pr_import_opt_in_is_bound_to_the_selected_issue(self):
+        result = self.import_issue(publish_pr=True)
+        scope = FakeRunner.options[result["workflow_id"]]["github_publication"]
+        self.assertEqual(scope, {
+            "version": 1,
+            "repository": "github.com/acme/widget",
+            "issue_number": 42,
+            "operations": ["create_reviewed_commit", "create_branch", "create_pull_request"],
+        })
+
+    def test_existing_workflow_authorization_cannot_be_broadened_by_reimport(self):
+        self.import_issue()
+        with self.assertRaisesRegex(github.GithubError, "already has a saved authorization"):
+            self.import_issue(publish_pr=True, api=lambda *_args, **_kwargs: self.fail("must not query GitHub"))
 
     def test_unauthorized_repository_is_rejected_before_issue_query(self):
         with self.assertRaisesRegex(github.GithubError, "allowlist"):
@@ -537,6 +556,298 @@ class GithubBridgeTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(len(writes), 1)
 
+
+class GithubPublicationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="github-publication-")
+        self.target = Path(self.temp.name) / "target"
+        self.target.mkdir()
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.name", "Harness Test")
+        self.git("config", "user.email", "harness@example.invalid")
+        (self.target / "README.md").write_text("baseline\n", encoding="utf-8")
+        self.git("add", "README.md")
+        self.git("commit", "-q", "-m", "baseline")
+        self.git("remote", "add", "origin", "https://github.com/acme/widget.git")
+        self.baseline = self.git("rev-parse", "HEAD")
+        self.base_tree = self.git("rev-parse", "HEAD^{tree}")
+        blob_sha = hashlib.sha1(b"blob 9\0baseline\n").hexdigest()
+        self.base_blobs = {"README.md": (blob_sha, "100644")}
+        self.api = FakePublicationApi(self.baseline, self.base_tree, self.base_blobs)
+        self.publication = {}
+        self.scope = {
+            "version": 1,
+            "repository": "github.com/acme/widget",
+            "issue_number": 42,
+            "operations": ["create_reviewed_commit", "create_branch", "create_pull_request"],
+        }
+        self.reviewed_files = [{"path": "src/feature.py", "content": "value = 1\n", "mode": "100644"}]
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def git(self, *args):
+        return subprocess.check_output(["git", "-C", str(self.target), *args], text=True).strip()
+
+    def publish(self):
+        return github.publish_pull_request(
+            self.target, "workflow-1", task=github.normalize_issue(
+                issue(), host="github.com", owner="acme", repository="widget",
+            ),
+            scope=self.scope, baseline_commit=self.baseline,
+            source_patch_sha256="a" * 64, reviewed_files=self.reviewed_files,
+            publication=self.publication, save=lambda: None, api=self.api,
+            allowlist="github.com/acme/widget",
+        )
+
+    @staticmethod
+    def publish_task():
+        return github.normalize_issue(issue(), host="github.com", owner="acme", repository="widget")
+
+    def test_publishes_and_verifies_exact_reviewed_files(self):
+        result = self.publish()
+        self.assertEqual(result["status"], "published")
+        self.assertEqual(result["pull_request_number"], 43)
+        self.assertEqual(result["pull_request_url"], "https://github.com/acme/widget/pull/43")
+        self.assertEqual(result["branch"], "harness/workflow-1")
+        self.assertEqual(result["commit_sha"], self.api.commit_sha)
+        creation = next(call for call in self.api.calls if call[1].endswith("/pulls") and call[2].get("method") == "POST")
+        self.assertEqual(creation[2]["body"]["base"], "main")
+        self.assertIn("Closes #42", creation[2]["body"]["body"])
+        self.assertEqual(self.api.pull_files, ["src/feature.py"])
+        self.assertEqual(self.api.tree_posts, 1)
+        self.assertEqual(self.api.commit_posts, 1)
+        self.assertEqual(self.api.ref_posts, 1)
+
+    def test_retry_and_duplicate_publication_reuse_same_commit_branch_and_pull_request(self):
+        self.api.fail_before_pull = True
+        with self.assertRaisesRegex(github.GithubError, "mocked Pull Request create failure"):
+            self.publish()
+        first_commit_sha = self.publication["commit_sha"]
+        result = self.publish()
+        self.assertEqual(result["status"], "published")
+        self.assertEqual(result["commit_sha"], first_commit_sha)
+        commit_posts = self.api.commit_posts
+        ref_posts = self.api.ref_posts
+        pull_posts = self.api.pull_posts
+        again = self.publish()
+        self.assertEqual(again["pull_request_number"], result["pull_request_number"])
+        self.assertEqual(self.api.commit_posts, commit_posts)
+        self.assertEqual(self.api.ref_posts, ref_posts)
+        self.assertEqual(self.api.pull_posts, pull_posts)
+
+    def test_uncertain_push_and_pull_creation_reconcile_without_duplicate_branch_or_pr(self):
+        self.api.fail_after_ref = True
+        self.api.fail_after_pull = True
+        result = self.publish()
+        self.assertEqual(result["status"], "published")
+        self.assertEqual(self.api.ref_posts, 1)
+        self.assertEqual(self.api.pull_posts, 1)
+        self.assertEqual(result["commit_sha"], self.api.commit_sha)
+
+    def test_target_origin_allowlist_and_secret_content_are_enforced(self):
+        with self.assertRaisesRegex(github.GithubError, "allowlist"):
+            github.publish_pull_request(
+                self.target, "workflow-1", task=self.publish_task(), scope=self.scope,
+                baseline_commit=self.baseline, source_patch_sha256="a" * 64,
+                reviewed_files=self.reviewed_files, publication={}, save=lambda: None,
+                api=self.api, allowlist="github.com/acme/other",
+            )
+        self.assertEqual(self.api.calls, [])
+        with self.assertRaisesRegex(github.GithubError, "redacted content"):
+            github._reviewed_tree_entries([{
+                "path": "src/secret.py", "content": 'TOKEN = "ghp_123456789012345678901234"\n',
+                "mode": "100644",
+            }])
+
+    def test_publication_saves_branch_and_pull_request_metadata(self):
+        saves = []
+        self.publication = {}
+        self.api.fail_after_pull = True
+        result = github.publish_pull_request(
+            self.target, "workflow-1", task=self.publish_task(), scope=self.scope,
+            baseline_commit=self.baseline, source_patch_sha256="a" * 64,
+            reviewed_files=self.reviewed_files, publication=self.publication,
+            save=lambda: saves.append(json.loads(json.dumps(self.publication))), api=self.api,
+            allowlist="github.com/acme/widget",
+        )
+        self.assertEqual(result["status"], "published")
+        self.assertTrue(any(item.get("commit_sha") == self.api.commit_sha for item in saves))
+        self.assertEqual(self.publication["pull_request_number"], 43)
+        self.assertEqual(self.publication["branch"], "harness/workflow-1")
+
+    def test_retry_rejects_pull_request_with_changed_title_or_issue_description(self):
+        self.publish()
+        self.api.pull["title"] = "Unrelated PR"
+        with self.assertRaisesRegex(github.GithubError, "identity or review branch"):
+            self.publish()
+        self.api.pull["title"] = "Fix reported defect (#42)"
+        self.api.pull["body"] = "No Issue or workflow reference"
+        with self.assertRaisesRegex(github.GithubError, "description does not match"):
+            self.publish()
+
+    def test_retry_rejects_pull_request_if_default_branch_advanced(self):
+        self.publish()
+        self.api.pull["base"]["sha"] = "e" * 40
+        with self.assertRaisesRegex(github.GithubError, "identity or review branch"):
+            self.publish()
+
+
+class PublicationGateTests(unittest.TestCase):
+    def runner(self, *, gate="complete", initial_clean=True, authorization=None):
+        runner = object.__new__(orchestrator.Orchestrator)
+        runner.target = Path("/tmp/unused-publication-target")
+        runner.workflow_id = "workflow-gate-test"
+        runner.state = {
+            "status": "complete",
+            "task": "task",
+            "authorization": {"github_publication": authorization} if authorization else {},
+            "commitment_gate": {"disposition": gate},
+            "execution_fingerprint": {"initial": {"target": {"working_tree_clean": initial_clean}}},
+        }
+        runner._load = lambda: None
+        runner._verify_delivery_integrity = lambda: None
+        runner._verify_delivery_artifact_hash = lambda: None
+        return runner
+
+    def test_failed_code_review_and_failed_delivery_block_before_github_access(self):
+        runner = self.runner()
+        runner._verify_delivery_integrity = lambda: (_ for _ in ()).throw(
+            orchestrator.WorkflowError("Delivery is blocked because no completed review provenance was recorded."),
+        )
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "no completed review provenance"):
+            runner._publish_github_pr_locked(explicitly_authorized=True)
+        runner._verify_delivery_integrity = lambda: (_ for _ in ()).throw(
+            orchestrator.WorkflowError("Delivery is blocked because the target fingerprint changed."),
+        )
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "target fingerprint changed"):
+            runner._publish_github_pr_locked(explicitly_authorized=True)
+
+    def test_commitment_gate_and_preexisting_uncommitted_target_changes_block(self):
+        runner = self.runner(gate="blocked")
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "commitment gate"):
+            runner._publish_github_pr_locked(explicitly_authorized=True)
+        runner = self.runner(initial_clean=False, authorization={"scope": True})
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "pre-existing uncommitted changes"):
+            runner._publish_github_pr_locked(explicitly_authorized=False)
+
+    def test_legacy_workflow_needs_explicit_publication_authorization(self):
+        runner = self.runner()
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "does not permit GitHub publication"):
+            runner._publish_github_pr_locked(explicitly_authorized=False)
+
+    def test_completed_opted_in_workflow_triggers_publication_but_legacy_does_not(self):
+        runner = self.runner(authorization={"scope": True})
+        calls = []
+        runner.publish_github_pr = lambda: calls.append("published") or {"status": "published"}
+        self.assertEqual(runner._maybe_publish_github_pr(runner.state), {"status": "published"})
+        self.assertEqual(calls, ["published"])
+
+        runner = self.runner()
+        runner.publish_github_pr = lambda: self.fail("legacy workflow must not publish automatically")
+        self.assertIs(runner._maybe_publish_github_pr(runner.state), runner.state)
+
+class FakePublicationApi:
+    def __init__(self, baseline, base_tree, base_blobs):
+        self.baseline = baseline
+        self.base_tree = base_tree
+        self.base_blobs = dict(base_blobs)
+        self.commit_sha = "c" * 40
+        self.new_tree_sha = "d" * 40
+        self.calls = []
+        self.branch_sha = None
+        self.new_blobs = None
+        self.pull = None
+        self.pull_files = []
+        self.tree_posts = 0
+        self.commit_posts = 0
+        self.ref_posts = 0
+        self.pull_posts = 0
+        self.fail_before_ref = False
+        self.fail_after_ref = False
+        self.fail_before_pull = False
+        self.fail_after_pull = False
+
+    def __call__(self, host, route, **kwargs):
+        self.calls.append((host, route, kwargs))
+        method = kwargs.get("method", "GET")
+        if route == "repos/acme/widget":
+            return {"full_name": "acme/widget", "default_branch": "main", "permissions": {"push": True}}
+        if route.endswith("/git/ref/heads/main"):
+            return {"object": {"sha": self.baseline}}
+        if route.endswith("/git/ref/heads/harness%2Fworkflow-1"):
+            if self.branch_sha is None:
+                raise github.GithubError("mocked missing ref")
+            return {"object": {"sha": self.branch_sha}}
+        if route == f"repos/acme/widget/git/commits/{self.baseline}":
+            return {"sha": self.baseline, "tree": {"sha": self.base_tree}, "parents": []}
+        if route == f"repos/acme/widget/git/commits/{self.commit_sha}":
+            return {"sha": self.commit_sha, "tree": {"sha": self.new_tree_sha},
+                    "parents": [{"sha": self.baseline}]}
+        if route == f"repos/acme/widget/git/trees/{self.base_tree}?recursive=1":
+            return {"truncated": False, "tree": [
+                {"path": path, "sha": blob, "mode": mode, "type": "blob"}
+                for path, (blob, mode) in self.base_blobs.items()
+            ]}
+        if route == f"repos/acme/widget/git/trees/{self.new_tree_sha}?recursive=1":
+            tree = dict(self.base_blobs)
+            for item in self.new_blobs or []:
+                if item.get("sha") is None and "content" not in item:
+                    tree.pop(item["path"], None)
+                else:
+                    content = item["content"].encode("utf-8")
+                    blob = hashlib.sha1(b"blob " + str(len(content)).encode("ascii") + b"\0" + content).hexdigest()
+                    tree[item["path"]] = (blob, item["mode"])
+            return {"truncated": False, "tree": [
+                {"path": path, "sha": blob, "mode": mode, "type": "blob"}
+                for path, (blob, mode) in tree.items()
+            ]}
+        if route == "repos/acme/widget/git/trees" and method == "POST":
+            self.tree_posts += 1
+            self.new_blobs = kwargs["body"]["tree"]
+            return {"sha": self.new_tree_sha}
+        if route == "repos/acme/widget/git/commits" and method == "POST":
+            self.commit_posts += 1
+            return {"sha": self.commit_sha}
+        if route == "repos/acme/widget/git/refs" and method == "POST":
+            self.ref_posts += 1
+            if self.fail_before_ref:
+                self.fail_before_ref = False
+                raise github.GithubError("mocked push failure before ref creation")
+            self.branch_sha = kwargs["body"]["sha"]
+            if self.fail_after_ref:
+                self.fail_after_ref = False
+                raise github.GithubError("mocked push timeout after ref creation")
+            return {"object": {"sha": self.branch_sha}}
+        if "/pulls?head=" in route and kwargs.get("paginate"):
+            return [[self.pull]] if self.pull else [[]]
+        if route == "repos/acme/widget/pulls" and method == "POST":
+            self.pull_posts += 1
+            if self.fail_before_pull:
+                self.fail_before_pull = False
+                raise github.GithubError("mocked Pull Request create failure")
+            self.pull_files = [item["path"] for item in (self.new_blobs or [])]
+            self.pull = {
+                "number": 43,
+                "html_url": "https://github.com/acme/widget/pull/43",
+                "title": kwargs["body"]["title"],
+                "body": kwargs["body"]["body"],
+                "state": "open",
+                "merged": False,
+                "head": {"ref": "harness/workflow-1", "sha": self.commit_sha,
+                         "repo": {"full_name": "acme/widget"}},
+                "base": {"ref": "main", "sha": self.baseline, "repo": {"full_name": "acme/widget"}},
+            }
+            if self.fail_after_pull:
+                self.fail_after_pull = False
+                raise github.GithubError("mocked Pull Request timeout after creation")
+            return self.pull
+        if route == "repos/acme/widget/pulls/43":
+            return self.pull
+        if route == "repos/acme/widget/pulls/43/files" and kwargs.get("paginate"):
+            return [[{"filename": path} for path in self.pull_files]]
+        raise AssertionError((host, route, kwargs))
+
     def test_hostile_allowlisted_values_render_unknown(self):
         rendered = github.render_report("workflow-1", {
             "status": "secret", "stage": "../../private", "delivery_disposition": "token=secret",
@@ -698,6 +1009,34 @@ class GithubBridgeTests(unittest.TestCase):
         registry = json.loads((self.target / github.REGISTRY_PATH).read_text(encoding="utf-8"))
         self.assertEqual(registry["issues"][identity]["state"], "started")
 
+    def test_cli_publish_passes_explicit_authorization_and_reports_metadata(self):
+        observed = {}
+
+        class Runner:
+            def publish_github_pr(self, *, explicitly_authorized=False):
+                observed["explicitly_authorized"] = explicitly_authorized
+                return {"github_publication": {
+                    "status": "published", "pull_request_number": 43,
+                    "pull_request_url": "https://github.com/acme/widget/pull/43",
+                    "branch": "harness/workflow-1", "commit_sha": "c" * 40,
+                }}
+
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            exit_code = cli.main(
+                ["github", "publish", "workflow-1", "--target", str(self.target), "--authorize"],
+                runner_factory=lambda *_args, **_kwargs: Runner(), recover_review=lambda *_args, **_kwargs: {},
+                workflow_error=orchestrator.WorkflowError, workflow_root=".engineering/workflows",
+                max_authorized_code_review_calls=64,
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(observed["explicitly_authorized"])
+        self.assertEqual(json.loads(stdout.getvalue()), {
+            "workflow_id": "workflow-1", "status": "published", "pull_request_number": 43,
+            "pull_request_url": "https://github.com/acme/widget/pull/43",
+            "branch": "harness/workflow-1", "commit_sha": "c" * 40,
+        })
+
     def test_real_orchestrator_import_fails_at_target_lock_before_workflow_state(self):
         subprocess.run(["git", "init", "-q", "-b", "main", str(self.target)], check=True)
         subprocess.run(["git", "-C", str(self.target), "config", "user.name", "Harness Test"], check=True)
@@ -768,6 +1107,7 @@ class GithubBridgeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("import", result.stdout)
         self.assertIn("report", result.stdout)
+        self.assertIn("publish", result.stdout)
         self.assertNotIn("poll", result.stdout.lower())
         self.assertNotIn("webhook", result.stdout.lower())
         self.assertNotIn("mcp", result.stdout.lower())
@@ -777,7 +1117,8 @@ class GithubBridgeTests(unittest.TestCase):
         for required in (
             "HARNESS_GITHUB_ALLOWED_REPOSITORIES", "gh auth login", "github import 42", "github report WORKFLOW_ID",
             "local `approve` command", "does not start, approve, or resume", "cross-machine registry",
-            "future MCP interface", "before the next change to that path",
+            "github publish WORKFLOW_ID", "--publish-pr", "future MCP interface",
+            "before the next change to that path",
         ):
             self.assertIn(required, readme)
 

@@ -43,6 +43,7 @@ from workflow import planning_review as _planning_review
 from workflow import review_input as _review_input
 from workflow import skills as _skills
 from workflow import traceability as _traceability
+from workflow import github as _github
 from workflow.delivery import render_delivery_report
 from workflow.codex_evidence import (
     MAX_CODEX_TOOL_NAMES,
@@ -693,6 +694,7 @@ def new_workflow_authorization(
     codex_timeout_seconds: int = DEFAULT_CODEX_TIMEOUT_SECONDS,
     claude_timeout_seconds: int = DEFAULT_CLAUDE_TIMEOUT_SECONDS,
     workflow_timeout_seconds: int = DEFAULT_WORKFLOW_TIMEOUT_SECONDS,
+    github_publication: dict | None = None,
 ) -> dict:
     try:
         return _authorization.new_workflow_authorization(
@@ -701,6 +703,7 @@ def new_workflow_authorization(
             codex_timeout_seconds=codex_timeout_seconds,
             claude_timeout_seconds=claude_timeout_seconds,
             workflow_timeout_seconds=workflow_timeout_seconds,
+            github_publication=github_publication,
         )
     except _authorization.AuthorizationError as exc:
         raise WorkflowError(str(exc)) from exc
@@ -749,6 +752,7 @@ class Orchestrator:
         process_runner: Callable = subprocess.run,
         claude_runner: Callable = claude_reviewer.review,
         tracing_enabled: bool = False,
+        github_publication: dict | None = None,
     ):
         if (isinstance(max_code_review_calls, bool) or not isinstance(max_code_review_calls, int)
                 or not 1 <= max_code_review_calls <= MAX_AUTHORIZED_CODE_REVIEW_CALLS):
@@ -790,6 +794,7 @@ class Orchestrator:
         self.process_runner = process_runner
         self.claude_runner = claude_runner
         self.tracing_enabled = bool(tracing_enabled)
+        self.github_publication = github_publication
         self._tracer = None
         self._active_trace_context = None
         self._trace_started_at: float | None = None
@@ -2100,6 +2105,7 @@ class Orchestrator:
                 codex_timeout_seconds=self.timeout_seconds,
                 claude_timeout_seconds=self.claude_timeout_seconds,
                 workflow_timeout_seconds=self.workflow_timeout_seconds,
+                github_publication=self.github_publication,
             ),
             "plan_reviews": [],
             "claude_contexts": [],
@@ -2131,7 +2137,8 @@ class Orchestrator:
         return self.run_pending()
 
     def approve(self) -> dict:
-        return self._execute_locked(self._approve_locked, target_lock=True)
+        state = self._execute_locked(self._approve_locked, target_lock=True)
+        return self._maybe_publish_github_pr(state)
 
     def _approve_locked(self) -> dict:
         self._load(preflight_tracing=True)
@@ -2700,7 +2707,7 @@ class Orchestrator:
         extend_budget: str | None = None,
         set_budget_limit: str | None = None,
     ) -> dict:
-        return self._execute_locked(lambda: self._resume_locked(
+        state = self._execute_locked(lambda: self._resume_locked(
             recovery_action=recovery_action,
             verified_claude_cost_usd=verified_claude_cost_usd,
             confirm_provider_inactive=confirm_provider_inactive,
@@ -2709,6 +2716,97 @@ class Orchestrator:
             extend_budget=extend_budget,
             set_budget_limit=set_budget_limit,
         ), target_lock="resume")
+        return self._maybe_publish_github_pr(state)
+
+    def _maybe_publish_github_pr(self, state: dict) -> dict:
+        authorization = state.get("authorization") if isinstance(state, dict) else None
+        if (isinstance(state, dict) and state.get("status") == "complete"
+                and isinstance(authorization, dict)
+                and isinstance(authorization.get("github_publication"), dict)):
+            return self.publish_github_pr()
+        return state
+
+    def publish_github_pr(self, *, explicitly_authorized: bool = False) -> dict:
+        if type(explicitly_authorized) is not bool:
+            raise WorkflowError("Publication authorization must be an explicit boolean.")
+        return self._execute_locked(
+            lambda: self._publish_github_pr_locked(explicitly_authorized=explicitly_authorized),
+            target_lock=True,
+        )
+
+    def _publish_github_pr_locked(self, *, explicitly_authorized: bool) -> dict:
+        self._load()
+        if self.state.get("status") != "complete":
+            raise WorkflowError("Pull Request publication requires a completed workflow.")
+        self._verify_delivery_integrity()
+        self._verify_delivery_artifact_hash()
+        gate = self.state.get("commitment_gate")
+        if not isinstance(gate, dict) or gate.get("disposition") != "complete":
+            raise WorkflowError("Pull Request publication is blocked because the commitment gate is not complete.")
+        authorization = self.state.get("authorization", {})
+        saved_scope = authorization.get("github_publication") if isinstance(authorization, dict) else None
+        if saved_scope is None and not explicitly_authorized:
+            raise WorkflowError(
+                "This workflow authorization does not permit GitHub publication; rerun `github publish` with explicit authorization."
+            )
+        initial_target = (
+            self.state.get("execution_fingerprint", {}).get("initial", {}).get("target", {})
+            if isinstance(self.state.get("execution_fingerprint"), dict) else {}
+        )
+        if initial_target.get("working_tree_clean") is not True:
+            raise WorkflowError(
+                "Pull Request publication is blocked because the target had pre-existing uncommitted changes."
+            )
+        try:
+            scope = _github.publication_scope_for_workflow(
+                self.target, self.workflow_id, self.state.get("task", ""),
+            )
+        except _github.GithubError as exc:
+            raise WorkflowError(str(exc)) from exc
+        if saved_scope is not None and saved_scope != scope:
+            raise WorkflowError("Saved GitHub publication authorization does not match the Issue correlation.")
+        if saved_scope is None and not explicitly_authorized:
+            raise WorkflowError("GitHub publication requires explicit authorization.")
+        evidence = self.state.get("integrity", {}).get("review_evidence", {})
+        if evidence.get("target_commit_sha") != self.state.get("baseline_commit"):
+            raise WorkflowError(
+                "Pull Request publication is blocked because the reviewed commit is not the saved workflow baseline."
+            )
+        review_diff = _review_diff(self.state, self.target)
+        if _ReviewCampaign._campaign_source_hash(review_diff) != evidence.get("source_patch_sha256"):
+            raise WorkflowError("Pull Request publication is blocked because review evidence no longer matches the source.")
+        try:
+            reviewed_files = _github.reviewed_files_from_diff(self.target, review_diff)
+        except _github.GithubError as exc:
+            raise WorkflowError(str(exc)) from exc
+        publication = self.state.setdefault("github_publication", {})
+        if not isinstance(publication, dict):
+            raise WorkflowError("Saved GitHub publication state is invalid.")
+        if saved_scope is None:
+            publication.setdefault("authorization_source", "explicit_cli_confirmation")
+            publication.setdefault("authorized_at", now())
+        else:
+            publication.setdefault("authorization_source", "workflow_authorization")
+        try:
+            _github.publish_pull_request(
+                self.target,
+                self.workflow_id,
+                task=self.state.get("task", ""),
+                scope=scope,
+                baseline_commit=self.state.get("baseline_commit"),
+                source_patch_sha256=evidence["source_patch_sha256"],
+                reviewed_files=reviewed_files,
+                publication=publication,
+                save=self._save,
+            )
+        except Exception as exc:
+            message = str(exc) if isinstance(exc, _github.GithubError) else "GitHub publication failed; retry the publication command."
+            publication["status"] = "failed"
+            publication["error"] = redact(message)
+            publication["updated_at"] = now()
+            self._save()
+            raise WorkflowError(message) from exc
+        return self.state
 
     def _resume_locked(
         self,

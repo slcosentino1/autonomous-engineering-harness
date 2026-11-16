@@ -72,6 +72,15 @@ For GitHub Enterprise, use `HOST/OWNER/REPO` in both the allowlist and `--reposi
 
 Import fetches one Issue through fixed `gh api` operations, validates its repository and Issue metadata, and places its title and body into untrusted task input. Issue text matching the Harness credential redaction patterns is rejected rather than stored or sent for planning. The Issue cannot select the local target or approve work. The command creates a normal workflow and reports only its workflow ID and status; use the local `approve` command after reviewing its proposal. Repeating an import returns its correlated workflow. If a process exits during import, retry uses the reserved workflow ID; partial or invalid workflow state fails closed and requires manual reconciliation. Later Issue edits do not alter the imported workflow.
 
+To authorize a new Issue workflow for Pull Request publication, add `--publish-pr` when importing it. This binds the saved workflow authorization to that allowlisted repository and Issue. After the normal human approval, implementation, approved code review, delivery verification, and completed commitment gate, `approve` or `resume` publishes the reviewed changes. Publication is opt-in and does not merge the Pull Request. It requires a clean target at workflow start, an unchanged default branch, a matching GitHub origin, and push permission for the authenticated `gh` account. The publisher uses only files in the verified final review scope and creates the commit and branch through GitHub's Git API; it does not stage or commit local target files. Existing completed workflows without this saved authorization require a separate, explicit one-time authorization:
+
+```sh
+python /path/to/autonomous-engineering-harness/harness/orchestrator.py github publish WORKFLOW_ID \
+  --target /absolute/path/to/local-repository --authorize
+```
+
+The command rechecks saved review and delivery evidence, the commitment gate, repository allowlist, origin, default-branch baseline, and current file contents before publishing. The workflow state records publication status, repository, Issue, branch, commit SHA, Pull Request number, and URL. Retries reuse the deterministic workflow branch and commit, reconcile uncertain branch or Pull Request creation, and verify the final Pull Request file set; conflicting existing publication data fails closed. `github publish` never merges. Set `HARNESS_GITHUB_ALLOWED_REPOSITORIES` and authenticate `gh` with push permission before running it. The origin must identify the same repository using a canonical HTTPS URL or SSH URL; custom SSH host aliases are not resolved by the Harness.
+
 To explicitly publish a status comment for an imported workflow, run:
 
 ```sh

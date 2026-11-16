@@ -2590,7 +2590,7 @@ class WorkflowTests(unittest.TestCase):
                 capture_output=True, text=True, check=False,
             )
             self.assertEqual(command_help.returncode, 0, command_help.stderr)
-        for command in ("import", "report"):
+        for command in ("import", "report", "publish"):
             command_help = subprocess.run(
                 [sys.executable, str(script), "github", command, "--help"], cwd=ROOT,
                 capture_output=True, text=True, check=False,

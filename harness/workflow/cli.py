@@ -70,6 +70,7 @@ def print_summary(state: dict, *, workflow_root: str) -> None:
         "workflow_status": state.get("workflow_status", state.get("status")),
         "delivery_disposition": state.get("delivery_disposition"),
         "commitment_gate": state.get("commitment_gate"),
+        "github_publication": state.get("github_publication"),
         "stage": state.get("stage"),
         "proposal": f"{workflow_root}/{state.get('workflow_id')}/proposal.md",
         "delivery": f"{workflow_root}/{state.get('workflow_id')}/delivery.md" if state.get("status") == "complete" else None,
@@ -268,9 +269,22 @@ def main(
     github_import.add_argument("--aily", default=claude_reviewer.AILY_EXECUTABLE)
     github_import.add_argument("--model")
     github_import.add_argument("--trace", action="store_true")
+    github_import.add_argument(
+        "--publish-pr", action="store_true",
+        help="Authorize automatic PR publication after implementation, review, and delivery verification",
+    )
     github_report = github_commands.add_parser("report", help="Publish the saved workflow status to its Issue")
     github_report.add_argument("workflow_id")
     github_report.add_argument("--target", required=True, help="Absolute local Git repository root")
+    github_publish = github_commands.add_parser(
+        "publish", help="Publish a completed, reviewed workflow as a GitHub Pull Request",
+    )
+    github_publish.add_argument("workflow_id")
+    github_publish.add_argument("--target", required=True, help="Absolute local Git repository root")
+    github_publish.add_argument(
+        "--authorize", action="store_true",
+        help="Explicitly authorize this one-time publication when the workflow has no saved publication scope",
+    )
 
     for name, help_text in (
         ("approve", "Explicitly approve the saved proposal and start implementation"),
@@ -391,14 +405,28 @@ def main(
                         "model": args.model,
                         "tracing_enabled": args.trace or tracing_enabled_from_environment(),
                     },
+                    publish_pr=args.publish_pr,
                 )
                 print(json.dumps({"workflow_id": result["workflow_id"], "status": result["status"]}))
                 # A successfully reconciled workflow can be failed and need `resume`;
                 # that is its saved state, not a failure to execute this CLI command.
                 return 0
-            result = _github.report_workflow(args.target, args.workflow_id, runner_factory=runner_factory)
-            print(json.dumps({"workflow_id": result["workflow_id"], "status": result["status"], "reported": True}))
-            return 0
+            if args.github_command == "report":
+                result = _github.report_workflow(args.target, args.workflow_id, runner_factory=runner_factory)
+                print(json.dumps({"workflow_id": result["workflow_id"], "status": result["status"], "reported": True}))
+                return 0
+            runner = runner_factory(args.target, workflow_id=args.workflow_id)
+            state = runner.publish_github_pr(explicitly_authorized=args.authorize)
+            publication = state.get("github_publication", {})
+            print(json.dumps({
+                "workflow_id": args.workflow_id,
+                "status": publication.get("status"),
+                "pull_request_number": publication.get("pull_request_number"),
+                "pull_request_url": publication.get("pull_request_url"),
+                "branch": publication.get("branch"),
+                "commit_sha": publication.get("commit_sha"),
+            }))
+            return 0 if publication.get("status") == "published" else 1
         elif args.command == "recover-review":
             result = recover_review(args.target, args.workflow_id, apply=args.apply)
             print(json.dumps(result, indent=2, ensure_ascii=False))
