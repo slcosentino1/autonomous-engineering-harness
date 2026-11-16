@@ -86,10 +86,16 @@ def render_delivery_report(
                     f"- Availability: `{item.get('availability', 'unknown')}`.",
                     f"- Acceptance condition: {item.get('acceptance_condition') or 'not recorded'}",
                     f"- Implementation status: `{item.get('implementation_status') or 'unassessed'}`.",
+                    f"- Implementation attribution: `{item.get('implementation_evidence_status', 'unavailable')}`.",
+                    f"- Implementation operation: `{item.get('implementation_operation_id') or 'unavailable'}`.",
                     f"- Verification status: `{item.get('verification_status', 'unverified')}`.",
                     f"- Claude assessment: `{item.get('claude_assessment') or 'insufficient_evidence'}`.",
                     f"- Claude evidence references: `{'valid' if item.get('claude_evidence_refs_valid') else 'invalid or missing'}`.",
                     f"- Source evidence: `{item.get('source_evidence_status', 'unavailable')}`.",
+                    "- Source provenance: " + ("; ".join(
+                        f"`{ref.get('path')}#{ref.get('symbol')}` = `{ref.get('origin')}`"
+                        for ref in item.get("source_provenance", []) if isinstance(ref, dict)
+                    ) or "unavailable") + ".",
                     f"- Source references: {source_references}.",
                     f"- Validation references: {validation_references}.",
                     f"- Independent assessment: {item.get('claude_explanation') or 'not recorded'}",

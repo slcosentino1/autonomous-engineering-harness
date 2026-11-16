@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import base64
+import json
 import os
 import re
 import shlex
@@ -33,6 +35,8 @@ _GITHUB_CLI_ENVIRONMENT = frozenset({
     "TMPDIR", "TMP", "TEMP", "SYSTEMROOT", "WINDIR",
 })
 FINGERPRINT_EXCLUDED_INTERNAL_PATHS = [".git at any depth", f"{WORKFLOW_ROOT}/**"]
+BASELINE_SNAPSHOT_FILE_LIMIT = 2 * 1024 * 1024
+BASELINE_SNAPSHOT_TOTAL_LIMIT = 16 * 1024 * 1024
 
 
 SENSITIVE_NAMES = {
@@ -585,6 +589,120 @@ def protected_paths(
 ) -> list[str]:
     tracked, untracked = changed_paths(target, baseline, redactor=redactor)
     return sorted(set(tracked + untracked))
+
+
+def capture_preexisting_snapshot(
+    target: Path, paths: Iterable[str], *, redactor: Callable[[str], str] | None = None,
+) -> dict:
+    """Save exact content for reviewable pre-existing files without exposing sensitive paths."""
+    entries = []
+    captured_bytes = 0
+    for relative in sorted(set(paths)):
+        if fingerprint_path_is_sensitive(relative):
+            continue
+        path = target / relative
+        if has_symlink_component(target, relative):
+            entries.append({"path": relative, "kind": "unavailable", "reason": "symlink path"})
+            continue
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            entries.append({
+                "path": relative, "kind": "missing", "index_entries": _path_index_entries(target, relative),
+            })
+            continue
+        except OSError as exc:
+            raise WorkspaceError("Pre-existing file metadata could not be captured.") from exc
+
+        if stat.S_ISLNK(metadata.st_mode):
+            link = os.fsencode(os.readlink(path))
+            entries.append({
+                "path": relative, "kind": "symlink", "mode": stat.S_IMODE(metadata.st_mode),
+                "sha256": hashlib.sha256(link).hexdigest(),
+                "index_entries": _path_index_entries(target, relative),
+            })
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            entries.append({
+                "path": relative, "kind": "non_regular", "mode": stat.S_IMODE(metadata.st_mode),
+                "index_entries": _path_index_entries(target, relative),
+            })
+            continue
+
+        retain_content = (
+            metadata.st_size <= BASELINE_SNAPSHOT_FILE_LIMIT
+            and captured_bytes + metadata.st_size <= BASELINE_SNAPSHOT_TOTAL_LIMIT
+        )
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise WorkspaceError("A pre-existing file could not be snapshotted safely.") from exc
+        digest = hashlib.sha256()
+        chunks = [] if retain_content else None
+        size = 0
+        try:
+            before = os.fstat(descriptor)
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                digest.update(chunk)
+                if chunks is not None:
+                    chunks.append(chunk)
+            after_fd = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        try:
+            after_path = path.lstat()
+        except OSError as exc:
+            raise WorkspaceError("A pre-existing file changed while its baseline snapshot was captured.") from exc
+        if (before.st_ino != metadata.st_ino or before.st_dev != metadata.st_dev
+                or before.st_size != after_fd.st_size or before.st_mtime_ns != after_fd.st_mtime_ns
+                or before.st_ctime_ns != after_fd.st_ctime_ns or size != after_fd.st_size
+                or after_path.st_ino != after_fd.st_ino or after_path.st_dev != after_fd.st_dev
+                or after_path.st_mtime_ns != after_fd.st_mtime_ns or after_path.st_ctime_ns != after_fd.st_ctime_ns):
+            raise WorkspaceError("A pre-existing file changed while its baseline snapshot was captured.")
+        entry = {
+            "path": relative, "kind": "file", "mode": stat.S_IMODE(metadata.st_mode),
+            "sha256": digest.hexdigest(), "size": size,
+            "index_entries": _path_index_entries(target, relative),
+        }
+        if chunks is not None:
+            content = b"".join(chunks)
+            entry["content_base64"] = base64.b64encode(content).decode("ascii")
+            captured_bytes += size
+        else:
+            entry["content_unavailable_reason"] = "baseline snapshot size limit exceeded"
+        entries.append(entry)
+
+    return {
+        "schema_version": 1,
+        "captured_content_bytes": captured_bytes,
+        "entries": entries,
+        "sha256": hashlib.sha256(json.dumps(
+            {"schema_version": 1, "captured_content_bytes": captured_bytes, "entries": entries},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")).hexdigest(),
+    }
+
+
+def _path_index_entries(target: Path, relative: str) -> list[list[str]]:
+    output = _fingerprint_git(
+        target, "ls-files", "--stage", "-z", "--", f":(literal){relative}",
+    )
+    records = []
+    for record in output.split(b"\0"):
+        if not record:
+            continue
+        header, separator, path = record.partition(b"\t")
+        fields = header.split(b" ")
+        if not separator or path != os.fsencode(relative) or len(fields) != 3:
+            raise WorkspaceError("Git returned an invalid index record during baseline capture.")
+        mode, object_id, stage = fields
+        records.append([mode.decode("ascii"), object_id.decode("ascii"), stage.decode("ascii")])
+    return sorted(records)
 
 
 def target_change_inventory(

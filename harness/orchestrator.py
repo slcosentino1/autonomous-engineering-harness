@@ -166,7 +166,11 @@ accepted_architectural_commitment, required_validation_scenario, optional_recomm
 future_production_consideration, or explicitly_out_of_scope. Use availability active or externally_blocked
 independently from class. Give every entry a stable ID such as C-001, a concise statement, an observable acceptance
 condition, implementation_expectations, and verification_scenarios (an array of {id, description}; use an empty
-array only when no specific scenario is required). Partial-delivery policy is optional. If no partial delivery is
+array only when no specific scenario is required). Include implementation_basis: use new_change when the approved
+requirement needs a workflow-introduced change; use existing_behavior_acceptable only when the acceptance condition
+explicitly allows existing behavior to satisfy it after current validation. Baseline inspection alone is never
+implementation evidence. When known, list commitment-driven paths and symbols in relevant_sources as an array of
+{path, symbol} objects; those references set review scope but do not establish fulfillment. Partial-delivery policy is optional. If no partial delivery is
 authorized, omit the `partial_delivery_policy` property entirely; do not add an empty policy or infer permission.
 When authorizations are explicitly approved, use exactly this structure:
 `partial_delivery_policy: {"reason":"non-empty policy-level reason","authorizations":[{"commitment_id":"C-001","allowed_dispositions":["externally_blocked"]}]}`.
@@ -176,7 +180,7 @@ deferred, waived, or unverified. Do not infer partial-delivery authorization. Re
 fenced block in this form:
 
 ```commitment-ledger
-{"schema_version":1,"commitments":[{"id":"C-001","class":"mandatory_user_requirement","statement":"...","acceptance_condition":"...","implementation_expectations":["..."],"verification_scenarios":[{"id":"scenario-1","description":"..."}],"availability":"active"}]}
+{"schema_version":1,"commitments":[{"id":"C-001","class":"mandatory_user_requirement","statement":"...","acceptance_condition":"...","implementation_expectations":["..."],"implementation_basis":"new_change","relevant_sources":[{"path":"src/service.py","symbol":"process_request"}],"verification_scenarios":[{"id":"scenario-1","description":"..."}],"availability":"active"}]}
 ```
 
 If a partial-delivery policy is present, add it as a top-level property of that same ledger JSON object using the
@@ -429,10 +433,54 @@ def _guidance_for_claude(
 
 def _review_diff(state: dict, target: Path) -> ReviewDiff:
     try:
+        snapshot = state.get("baseline_snapshot")
+        if isinstance(snapshot, dict):
+            execution = state.get("execution_fingerprint")
+            initial_target = execution.get("initial", {}).get("target", {}) if isinstance(execution, dict) else {}
+            if snapshot.get("baseline_fingerprint_sha256") != initial_target.get("working_tree_sha256"):
+                raise _review_input.ReviewInputError(
+                    "Saved baseline snapshot does not match the immutable initial target fingerprint.",
+                )
+        evidence_record = state.get("commitment_evidence")
+        evidence = evidence_record.get("evidence") if isinstance(evidence_record, dict) else None
+        review_scope_paths = {
+            reference.get("path")
+            for item in (evidence or {}).get("commitments", []) if isinstance(item, dict)
+            for reference in item.get("source_refs", []) if isinstance(reference, dict)
+            if isinstance(reference.get("path"), str)
+        }
+        approval = state.get("commitment_ledger_approval")
+        ledger = approval.get("ledger") if isinstance(approval, dict) else None
+        review_scope_paths.update(
+            reference.get("path")
+            for item in (ledger or {}).get("commitments", []) if isinstance(item, dict)
+            for reference in item.get("relevant_sources", []) if isinstance(reference, dict)
+            if isinstance(reference.get("path"), str)
+        )
+        if not isinstance(snapshot, dict):
+            review_scope_paths = set()
+        implementation_snapshot = None
+        correction_attempts = state.get("correction_attempts")
+        if isinstance(snapshot, dict) and isinstance(correction_attempts, list) and correction_attempts:
+            implementation_snapshot = state.get("implementation_snapshot")
+            integrity = state.get("integrity")
+            history = integrity.get("review_evidence_history", []) if isinstance(integrity, dict) else []
+            initial_review = next((
+                record for record in reversed(history)
+                if isinstance(record, dict) and record.get("purpose") == "initial"
+            ), None) if isinstance(history, list) else None
+            if (not isinstance(implementation_snapshot, dict) or not isinstance(initial_review, dict)
+                    or implementation_snapshot.get("source_patch_sha256") != initial_review.get("source_patch_sha256")):
+                raise _review_input.ReviewInputError(
+                    "Initial implementation snapshot is not bound to the completed initial review.",
+                )
         return _review_input.build_review_diff(
             target,
             state["baseline_commit"],
             state.get("preexisting_paths", []),
+            baseline_snapshot=state.get("baseline_snapshot"),
+            review_scope_paths=review_scope_paths,
+            implementation_snapshot=implementation_snapshot,
             redactor=redact,
         )
     except (_review_input.ReviewInputError, _workspace.WorkspaceError) as exc:
@@ -1056,6 +1104,78 @@ class Orchestrator:
             "target": self._fingerprint_repository(self.target, expected_commit=baseline_commit),
         }
 
+    def _write_operation_start_fingerprint(self, stage: str) -> dict | None:
+        """Ensure a new write operation begins from the exact approved or reviewed target state."""
+        if not isinstance(self.state.get("baseline_snapshot"), dict):
+            return None
+        current = self._fingerprint_repository(self.target)
+        if current.get("status") != "captured":
+            raise WorkflowError("Could not capture the target fingerprint for review provenance.")
+        if stage == "implementation":
+            execution = self.state.get("execution_fingerprint", {})
+            expected = execution.get("initial", {}).get("target", {}) if isinstance(execution, dict) else {}
+            operations = self.state.get("operation_history", [])
+            approved_retry = next((
+                item for item in reversed(operations)
+                if isinstance(item, dict) and item.get("operation_type") == "codex"
+                and item.get("stage") == "implementation"
+                and item.get("resolution") == "user_approved_retry_after_target_inspection"
+            ), None) if isinstance(operations, list) else None
+            if approved_retry is not None:
+                expected = approved_retry.get("retry_reviewed_target_fingerprint", {})
+            message = "Target changed after the workflow baseline and before implementation."
+        elif stage == "correction":
+            snapshot = self.state.get("implementation_snapshot", {})
+            expected = snapshot.get("target_fingerprint", {}) if isinstance(snapshot, dict) else {}
+            message = "Target changed after the initial review and before correction."
+        else:
+            return None
+        expected_sensitive = expected.get("sensitive_path_status") if isinstance(expected, dict) else None
+        comparison_current = current
+        if (isinstance(expected_sensitive, dict)
+                and "anonymous_path_metadata" not in expected_sensitive):
+            # Old persisted fingerprints predate path metadata. Approval validation
+            # already checks their available evidence conservatively; keep the same
+            # compatibility rule for the write-start comparison.
+            stable_current_sensitive = current.get("sensitive_path_status")
+            if isinstance(stable_current_sensitive, dict):
+                stable_current_sensitive = dict(stable_current_sensitive)
+                stable_current_sensitive.pop("anonymous_path_metadata", None)
+                comparison_current = {**current, "sensitive_path_status": stable_current_sensitive}
+        stable_expected = {key: value for key, value in expected.items() if key != "captured_at"}
+        stable_current = {key: value for key, value in comparison_current.items() if key != "captured_at"}
+        if expected.get("status") != "captured" or stable_current != stable_expected:
+            raise WorkflowError(message + " Reconcile the target and start a new workflow.")
+        return current
+
+    def _require_write_operation_target(self, purpose: str) -> None:
+        if not isinstance(self.state.get("baseline_snapshot"), dict):
+            return
+        expected_stage = "correction" if purpose == "verification" else "implementation"
+        operations = self.state.get("operation_history", [])
+        operation = next((
+            item for item in reversed(operations)
+            if isinstance(item, dict) and item.get("operation_type") == "codex"
+            and item.get("stage") == expected_stage
+            and (item.get("status") == "completed" or (
+                purpose == "initial"
+                and item.get("resolution") == "human_accepted_current_target_for_independent_review"
+            ))
+        ), None) if isinstance(operations, list) else None
+        if isinstance(operation, dict) and operation.get("resolution") == "human_accepted_current_target_for_independent_review":
+            expected = operation.get("human_accepted_target_fingerprint")
+        else:
+            expected = operation.get("target_fingerprint_after") if isinstance(operation, dict) else None
+        current = self._fingerprint_repository(self.target)
+        if (not isinstance(expected, dict) or expected.get("status") != "captured"
+                or current.get("status") != "captured"):
+            raise WorkflowError("Could not capture the target fingerprint for review provenance.")
+        if (expected.get("commit_sha") != current.get("commit_sha")
+                or expected.get("working_tree_sha256") != current.get("working_tree_sha256")):
+            raise WorkflowError(
+                "Target changed outside the completed write operation before independent review; attribution is inconclusive.",
+            )
+
     def _require_current_approval_baseline(self) -> None:
         def anonymous_metadata_is_valid(value: object, path_count: int) -> bool:
             if not isinstance(value, list) or len(value) != path_count:
@@ -1344,6 +1464,9 @@ class Orchestrator:
                     "Target changes overlap paths that were already changed before this workflow; "
                     "their origin cannot be established safely. Leave the workflow blocked for manual inspection."
                 )
+            accepted_fingerprint = self._fingerprint_repository(self.target)
+            if accepted_fingerprint.get("status") != "captured":
+                raise WorkflowError("Could not capture the target fingerprint for review provenance.")
             paths = [item["path"] for item in target_changes]
             self.state["implementation_summary"] = (
                 "Human-approved crash recovery: Codex was interrupted before its implementation summary was saved. "
@@ -1351,6 +1474,7 @@ class Orchestrator:
                 + ", ".join(paths)
             )
             operation["resolution"] = "human_accepted_current_target_for_independent_review"
+            operation["human_accepted_target_fingerprint"] = accepted_fingerprint
             operation["resolved_at"] = now()
             self.state["stage"] = "code_review"
         elif action == "retry":
@@ -1393,6 +1517,11 @@ class Orchestrator:
                     raise WorkflowError(
                         "Inspect target changes and pass --confirm-target-reviewed before retrying a write operation."
                     )
+                if operation.get("sandbox") == "workspace-write":
+                    reviewed_fingerprint = self._fingerprint_repository(self.target)
+                    if reviewed_fingerprint.get("status") != "captured":
+                        raise WorkflowError("Could not capture the target fingerprint for review provenance.")
+                    operation["retry_reviewed_target_fingerprint"] = reviewed_fingerprint
                 operation["resolution"] = "user_approved_retry_after_target_inspection"
                 operation["resolved_at"] = now()
         else:
@@ -1696,6 +1825,18 @@ class Orchestrator:
             "source_patch_sha256": source_hash,
             "target_commit_sha": fingerprint.get("commit_sha"),
             "target_working_tree_sha256": fingerprint.get("working_tree_sha256"),
+            "baseline_fingerprint_sha256": (
+                self.state.get("execution_fingerprint", {}).get("initial", {}).get("target", {}).get(
+                    "working_tree_sha256",
+                ) if isinstance(self.state.get("execution_fingerprint"), dict) else None
+            ),
+            "baseline_snapshot_sha256": (
+                self.state.get("baseline_snapshot", {}).get("sha256")
+                if isinstance(self.state.get("baseline_snapshot"), dict) else None
+            ),
+            "review_scope_sha256": source_hash,
+            "review_scope_paths": list(self.state.get("review_scope_files", [])),
+            "workflow_change_paths": list(self.state.get("review_workflow_paths", [])),
             "review_reports_sha256": hashlib.sha256(report_bytes).hexdigest(),
             "implementation_summary_sha256": hashlib.sha256(
                 str(self.state.get("implementation_summary") or "").encode("utf-8"),
@@ -1816,6 +1957,20 @@ class Orchestrator:
         current_patch_hash = _ReviewCampaign._campaign_source_hash(current_diff)
         if current_patch_hash != evidence.get("source_patch_sha256"):
             raise WorkflowError("Delivery is blocked because target code changed after its final review.")
+        execution_fingerprint = self.state.get("execution_fingerprint")
+        initial_target = (
+            execution_fingerprint.get("initial", {}).get("target", {})
+            if isinstance(execution_fingerprint, dict) else {}
+        )
+        baseline_snapshot = self.state.get("baseline_snapshot")
+        if isinstance(baseline_snapshot, dict) and (
+                baseline_snapshot.get("baseline_fingerprint_sha256") != initial_target.get("working_tree_sha256")
+                or evidence.get("baseline_fingerprint_sha256") != initial_target.get("working_tree_sha256")
+                or evidence.get("baseline_snapshot_sha256") != baseline_snapshot.get("sha256")
+                or evidence.get("review_scope_sha256") != current_patch_hash
+                or evidence.get("review_scope_paths") != self.state.get("review_scope_files", [])
+                or evidence.get("workflow_change_paths") != self.state.get("review_workflow_paths", [])):
+            raise WorkflowError("Delivery is blocked because baseline or review-scope provenance changed.")
         current_fingerprint = self._fingerprint_repository(self.target)
         if (current_fingerprint.get("status") != "captured"
                 or current_fingerprint.get("commit_sha") != evidence.get("target_commit_sha")
@@ -1854,6 +2009,26 @@ class Orchestrator:
             baseline = git(self.target, "rev-parse", "HEAD").decode("ascii", "strict").strip()
             initial_fingerprints = self._capture_initial_fingerprints(baseline)
             preexisting_paths = _protected_paths(self.target, baseline)
+            initial_target = initial_fingerprints.get("target", {})
+            baseline_snapshot = None
+            if initial_target.get("status") == "captured":
+                captured_snapshot = _workspace.capture_preexisting_snapshot(
+                    self.target, preexisting_paths, redactor=redact,
+                )
+                captured_snapshot["baseline_fingerprint_sha256"] = initial_target.get("working_tree_sha256")
+                snapshot_body = {key: value for key, value in captured_snapshot.items() if key != "sha256"}
+                captured_snapshot["sha256"] = hashlib.sha256(json.dumps(
+                    snapshot_body, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                ).encode("utf-8")).hexdigest()
+                confirmed_target = self._fingerprint_repository(self.target, expected_commit=baseline)
+                stable_initial = {key: value for key, value in initial_target.items() if key != "captured_at"}
+                stable_confirmed = {key: value for key, value in confirmed_target.items() if key != "captured_at"}
+                if confirmed_target.get("status") == "captured":
+                    if stable_confirmed != stable_initial:
+                        raise WorkflowError(
+                            "Target changed while the workflow baseline was being captured; workflow was not started."
+                        )
+                    baseline_snapshot = captured_snapshot
         self.workflow_dir = _check_plain_directories(self.target, WORKFLOW_ROOT, create=True) / self.workflow_id
         if self.workflow_dir.exists() or self.workflow_dir.is_symlink():
             raise WorkflowError(f"Workflow already exists: {self.workflow_id}")
@@ -1872,6 +2047,7 @@ class Orchestrator:
             "stage": "planning",
             "codex_model": self.model,
             "baseline_commit": baseline,
+            "baseline_snapshot": baseline_snapshot,
             "execution_fingerprint": {
                 "version": _workspace.FINGERPRINT_VERSION,
                 "algorithm": _workspace.FINGERPRINT_ALGORITHM,
@@ -2040,6 +2216,9 @@ class Orchestrator:
                     or not isinstance(history, list)
                     or sum(isinstance(item, dict) and item.get("operation_id") == operation_id for item in history) != 1):
                 raise _traceability.TraceabilityError("implementation operation ID is missing or ambiguous")
+            _traceability.bind_observed_execution_events(
+                evidence, operation.get("test_execution_events", []),
+            )
             operation["target_fingerprint"] = self._fingerprint_repository(self.target)
             receipts_by_id: dict[str, list[dict]] = {}
             for item in operation.get("test_execution_events", []):
@@ -2048,6 +2227,11 @@ class Orchestrator:
             for entry in evidence["commitments"]:
                 entry["operation_id"] = operation_id
                 for reference in entry.get("validation_refs", []):
+                    if reference.get("operation_id") not in (None, operation_id):
+                        raise _traceability.TraceabilityError(
+                            "validation reference names a different Codex operation",
+                        )
+                    reference["operation_id"] = operation_id
                     artifact_path = reference.get("artifact_path")
                     if not artifact_path:
                         continue
@@ -2332,13 +2516,22 @@ class Orchestrator:
             "working_tree_sha256": review_evidence.get("target_working_tree_sha256")
             if isinstance(review_evidence, dict) else None,
         }
+        review_provenance = {
+            key: review_evidence.get(key)
+            for key in (
+                "campaign_id", "purpose", "review_reports_sha256", "target_commit_sha",
+                "target_working_tree_sha256", "review_scope_sha256",
+            )
+        } if isinstance(review_evidence, dict) else None
         try:
             evaluation = _traceability.evaluate_ledger(
                 approval["ledger"], evidence, assessment,
                 target=self.target,
-                reviewed_paths=set(self.state.get("review_included_files", [])),
+                reviewed_paths=set(self.state.get("review_scope_files", self.state.get("review_included_files", []))),
                 operations=self.state.get("operation_history", []),
                 final_fingerprint=final_fingerprint,
+                workflow_changed_paths=set(self.state.get("review_workflow_paths", [])),
+                review_provenance=review_provenance,
             )
         except Exception as exc:
             hard_errors.append(f"Commitment evaluation failed: {type(exc).__name__}")
@@ -2382,7 +2575,7 @@ class Orchestrator:
         compact_ledger = [
             {
                 key: item.get(key)
-                for key in ("id", "class", "statement", "acceptance_condition", "availability", "verification_scenarios")
+                for key in ("id", "class", "statement", "acceptance_condition", "implementation_basis", "relevant_sources", "availability", "verification_scenarios")
             }
             for item in ledger.get("commitments", [])
             if isinstance(item, dict) and item.get("id") in relevant_ids
@@ -2404,9 +2597,55 @@ class Orchestrator:
             "codex_evidence_references": compact_evidence,
             "codex_evidence_error": evidence_record.get("error"),
             "execution_operation_id": operation_id,
+            "execution_target_fingerprint_before": operation.get("target_fingerprint_before"),
+            "execution_target_fingerprint_after": operation.get("target_fingerprint_after"),
             "execution_target_fingerprint": operation.get("target_fingerprint"),
             "observed_test_execution_receipts": receipts,
         }, sort_keys=True, ensure_ascii=False, indent=2)
+
+    def _commitment_validation_baseline(self) -> str:
+        """Expose non-sensitive initial path and content hashes for scope checks."""
+        preexisting = self.state.get("preexisting_paths", [])
+        paths = sorted({
+            path for path in preexisting
+            if isinstance(path, str)
+            and path != _workspace.WORKFLOW_ROOT
+            and not path.startswith(_workspace.WORKFLOW_ROOT + "/")
+            and not _workspace.fingerprint_path_is_sensitive(path)
+        }) if isinstance(preexisting, list) else []
+        path_states: dict[str, dict[str, object]] = {}
+        snapshot = self.state.get("baseline_snapshot")
+        execution = self.state.get("execution_fingerprint")
+        initial_target = (
+            execution.get("initial", {}).get("target", {}) if isinstance(execution, dict) else {}
+        )
+        if isinstance(snapshot, dict) and isinstance(snapshot.get("entries"), list):
+            snapshot_body = {key: value for key, value in snapshot.items() if key != "sha256"}
+            expected_snapshot_sha = hashlib.sha256(json.dumps(
+                snapshot_body, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            ).encode("utf-8")).hexdigest()
+            if (snapshot.get("sha256") == expected_snapshot_sha
+                    and snapshot.get("baseline_fingerprint_sha256")
+                    == (initial_target.get("working_tree_sha256") if isinstance(initial_target, dict) else None)):
+                for entry in snapshot["entries"]:
+                    if not isinstance(entry, dict):
+                        continue
+                    path = entry.get("path")
+                    kind = entry.get("kind")
+                    mode = entry.get("mode")
+                    digest = entry.get("sha256")
+                    if (path not in paths or kind not in {"file", "symlink"}
+                            or type(mode) is not int or not isinstance(digest, str)
+                            or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest)):
+                        continue
+                    path_states[path] = {"kind": kind, "mode": mode, "sha256": digest}
+        return json.dumps({
+            "baseline_commit": self.state.get("baseline_commit"),
+            "preexisting_non_sensitive_paths": paths,
+            "preexisting_path_states": path_states,
+            "preexisting_snapshot_complete": set(path_states) == set(paths),
+            "workflow_artifact_prefix": f"{_workspace.WORKFLOW_ROOT}/{self.workflow_id}/",
+        }, ensure_ascii=False, sort_keys=True, indent=2)
 
     def reject(self, reason: str) -> dict:
         return self._execute_locked(lambda: self._reject_locked(reason))
@@ -2846,6 +3085,11 @@ class Orchestrator:
                     raise WorkflowError("Codex result recovery is ambiguous; inspect the workflow status.")
                 return prior["result_text"]
 
+            write_start_fingerprint = (
+                self._write_operation_start_fingerprint(str(stage))
+                if sandbox == "workspace-write" and isinstance(stage, str) else None
+            )
+
             usage = self._resource_usage()
             limits = self._execution_limits()
             if usage["codex_calls"] >= limits["max_codex_calls"]:
@@ -2870,6 +3114,8 @@ class Orchestrator:
                     for item in self.state.get("operation_history", [])
                 ),
             )
+            if write_start_fingerprint is not None:
+                operation["target_fingerprint_before"] = write_start_fingerprint
             self._active_codex_operation_id = operation["operation_id"]
             self._save()
             operation["invocation_at"] = now()
@@ -2951,6 +3197,8 @@ class Orchestrator:
                 )
                 raise WorkflowError(f"Codex could not start: {redact(str(exc))}") from exc
             invocation_finished = time.monotonic()
+            if sandbox == "workspace-write":
+                operation["target_fingerprint_after"] = self._fingerprint_repository(self.target)
             stdout_raw, stdout_representation = _output_bytes(result.stdout)
             stderr_raw, stderr_representation = _output_bytes(result.stderr)
             stdout = result.stdout.decode("utf-8", "replace") if isinstance(result.stdout, bytes) else str(result.stdout or "")
@@ -3392,12 +3640,56 @@ class Orchestrator:
                 "assignment; do not elevate style preferences or hypothetical concerns into findings."
             ),
         }
+        source_refs = [
+            reference
+            for item in ((self.state.get("commitment_evidence") or {}).get("evidence") or {}).get(
+                    "commitments", []) if isinstance(item, dict)
+            for reference in item.get("source_refs", []) if isinstance(reference, dict)
+        ]
+        approval = self.state.get("commitment_ledger_approval")
+        approved_ledger = approval.get("ledger") if isinstance(approval, dict) else {}
+        source_refs.extend(
+            reference
+            for item in approved_ledger.get("commitments", []) if isinstance(item, dict)
+            for reference in item.get("relevant_sources", []) if isinstance(reference, dict)
+        )
+        symbols_by_path: dict[str, list[str]] = {}
+        for reference in source_refs:
+            path, symbol = reference.get("path"), reference.get("symbol")
+            if isinstance(path, str) and isinstance(symbol, str):
+                symbols_by_path.setdefault(path, []).append(symbol)
         approval = self.state.get("commitment_ledger_approval")
         ledger = approval.get("ledger") if isinstance(approval, dict) else {}
         requires_assessment = any(
             item.get("class") in _traceability.REQUIRED_CLASSES
             for item in ledger.get("commitments", []) if isinstance(item, dict)
         )
+        if (self.state.get("preexisting_paths") or review_diff.context_files or review_diff.context_exclusions
+                or requires_assessment or review_diff.operation_diffs):
+            shared["Evidence provenance and review scope"] = (
+                "Workflow implementation paths are the supplied deltas. Baseline context is inspection only, not implementation evidence. "
+                "Cite reviewed sources and receipts or report insufficient evidence."
+            )
+        if review_diff.context_files or review_diff.context_exclusions:
+            context_blocks = []
+            for path, provenance, baseline_text, final_text in review_diff.context_files:
+                symbols = sorted(set(symbols_by_path.get(path, [])))
+                context_blocks.append(
+                    f"### {path} ({provenance}; symbols: {', '.join(symbols) if symbols else 'path selected by approved commitment evidence'})\n"
+                    "Baseline version — context only, never implementation evidence:\n"
+                    f"```\n{baseline_text}\n```\n"
+                    "Final target version — inspect alongside the workflow diff:\n"
+                    f"```\n{final_text}\n```"
+                )
+            if review_diff.context_exclusions:
+                context_blocks.append("Context paths unavailable or excluded:\n" + "\n".join(
+                    f"- `{path}`: {reason}" for path, reason in review_diff.context_exclusions
+                ))
+            shared["Selected baseline and final source context"] = "\n\n".join(context_blocks)
+        if review_diff.operation_diffs:
+            shared["Initial implementation and correction deltas"] = "\n\n".join(
+                f"## {label}\n{text}" for label, text in review_diff.operation_diffs
+            )
         if self.state.get("traceability_required") is True and not requires_assessment:
             # Non-gating ledger entries need user approval, but do not add review obligations or
             # consume scarce patch context when no commitment requires independent assessment.
@@ -3407,9 +3699,13 @@ class Orchestrator:
         if self.state.get("traceability_required") is True and requires_assessment:
             shared["Commitment ledger and Harness-validated evidence references"] = self._commitment_review_context()
             shared["Commitment assessment contract"] = (
-                "Assess each required commitment independently against the source diff and observed runner receipts. "
-                "Agent assertions and metadata do not prove fulfillment; do not infer implementation from tests or "
-                "verification from source. An unfulfilled required item is a Must fix and requires "
+                "Assess each required commitment independently against the attributable workflow diff, selected baseline/final source context, and observed runner receipts. "
+                "For implementation_basis=new_change, cite at least one source path changed after the immutable baseline. "
+                "For implementation_basis=existing_behavior_acceptable, baseline source can support fulfillment only "
+                "because the approved acceptance condition explicitly permits it and current validation passes. "
+                "Baseline context alone never proves a new implementation. Agent assertions and metadata do not prove "
+                "fulfillment; do not infer implementation from tests or verification from source. Report insufficient "
+                "evidence where the selected source or observed validation is incomplete. An unfulfilled required item is a Must fix and requires "
                 "Decision: CHANGES_REQUESTED. Include one fenced `commitment-assessment` JSON block for every "
                 "required ID: {\"schema_version\":1,\"commitments\":[{\"id\":\"C-001\","
                 "\"implementation_status\":\"implemented|partial|not_started\","
@@ -3793,6 +4089,7 @@ class Orchestrator:
                         guidance, stage=stage,
                         context="\n".join((self.state["task"], self.state["proposal"])),
                     )
+                    validation_baseline = self._commitment_validation_baseline()
                     prompt = (
                         "Implement the approved proposal in this repository. Follow repository instructions. "
                         "Apply the relevant skill instructions supplied below; do not merely list skills. "
@@ -3805,18 +4102,32 @@ class Orchestrator:
                         "Do not delete unrelated existing files. Follow Engineering Judgment & Proportional Design "
                         "and do not invent product behavior. Return a concise summary with files changed, "
                         "commands actually run, results, and known limitations. Do not use this summary to declare "
-                        "commitments fulfilled. Finish with one `harness-evidence` JSON block linking each approved "
-                        "commitment to source references and specific scenario/test IDs plus Codex execution event IDs. "
-                        "Run all required scenarios after the final code edits, prefer one combined runner invocation, "
-                        "and make it the last tool action; do not edit code afterward. Do not include raw command output "
-                        "or secrets. Use exactly one fenced block labeled "
+                        "commitments fulfilled. For every required validation scenario, execute an actual pytest or "
+                        "unittest test that asserts the scenario acceptance condition; manual inspection and bare shell "
+                        "checks are not runner receipts. If no suitable existing test applies and adding an application "
+                        "test file would exceed scope, place a temporary unittest under the workflow verification "
+                        "directory inside `.engineering/workflows/` and run it from the target repository with "
+                        "`python3 -m unittest discover -v` so individual test IDs and outcomes are captured. "
+                        "For repository-scope scenarios, compare "
+                        "`git status --porcelain=v1 -z --untracked-files=all` with the supplied initial baseline; "
+                        "preserve pre-existing paths, exclude only the supplied Harness workflow-artifact prefix, "
+                        "verify each pre-existing path's supplied kind, mode, and SHA-256 state, and do not ignore "
+                        "other `.engineering/` paths or sensitive-path policy. If `preexisting_snapshot_complete` is "
+                        "false, do not claim the scope scenario passed. Include test IDs "
+                        "exactly as the runner reports them. Do not invent execution event IDs: set "
+                        "`execution_event_ids` to an empty array and the Harness will bind only observed receipts. "
+                        "Finish with one `harness-evidence` JSON block linking each approved commitment to source "
+                        "references and specific scenario/test IDs. Run all required scenarios after the final code edits, "
+                        "prefer one combined runner invocation, and make it the last tool action; do not edit code afterward. "
+                        "Do not include raw command output or secrets. Use exactly one fenced block labeled "
                         "`harness-evidence` with this JSON shape, replacing example values:\n"
                         "```harness-evidence\n"
                         "{\"schema_version\":1,\"commitments\":["
                         "{\"commitment_id\":\"C-001\",\"source_refs\":[{\"path\":\"src/file.py\","
                         "\"symbol\":\"function_name\"}],\"validation_refs\":[{\"scenario_id\":\"scenario-1\","
-                        "\"test_ids\":[\"tests/test_file.py::test_case\"],\"execution_event_ids\":[\"event-id\"]}],"
+                        "\"test_ids\":[\"tests/test_file.py::test_case\"],\"execution_event_ids\":[]}],"
                         "\"disposition\":null,\"reason\":null}]}\n```. Include only observed references.\n\n"
+                        f"Harness validation baseline (do not modify):\n{validation_baseline}\n\n"
                         f"{COMMITMENT_LEDGER_GUIDANCE}\n\n{PLANNING_PRINCIPLES}\n\n{skill_guidance}\n\n"
                         f"Assignment:\n{self.state['task']}\n\nApproved proposal:\n{self.state['proposal']}"
                     )
@@ -3826,8 +4137,9 @@ class Orchestrator:
                     self._save()
                 elif stage in {"code_review", "verification"}:
                     purpose = "verification" if stage == "verification" else "initial"
+                    self._require_write_operation_target(purpose)
                     review_diff = _review_diff(self.state, self.target)
-                    if not review_diff.included_paths:
+                    if not review_diff.included_paths and not review_diff.context_files:
                         self.state["review_included_files"] = []
                         self.state["review_exclusions"] = [
                             {"path": _safe_review_path(path), "reason": reason}
@@ -3855,6 +4167,26 @@ class Orchestrator:
                             ]
                             self._save()
                         raise
+                    self.state["review_scope_files"] = sorted({
+                        *review_diff.included_paths,
+                        *(path for path, _origin, _baseline, _final in review_diff.context_files),
+                    })
+                    self.state["review_workflow_paths"] = list(review_diff.workflow_paths)
+                    self.state["review_scope_sha256"] = _ReviewCampaign._campaign_source_hash(review_diff)
+                    if purpose == "initial" and not isinstance(self.state.get("implementation_snapshot"), dict):
+                        implementation_snapshot = _workspace.capture_preexisting_snapshot(
+                            self.target, review_diff.included_paths, redactor=redact,
+                        )
+                        implementation_snapshot["source_patch_sha256"] = self.state["review_scope_sha256"]
+                        implementation_snapshot["target_fingerprint"] = self._fingerprint_repository(self.target)
+                        snapshot_body = {
+                            key: value for key, value in implementation_snapshot.items() if key != "sha256"
+                        }
+                        implementation_snapshot["sha256"] = hashlib.sha256(json.dumps(
+                            snapshot_body, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                        ).encode("utf-8")).hexdigest()
+                        self.state["implementation_snapshot"] = implementation_snapshot
+                    self._save()
                     report = self._run_review_campaign(
                         campaign, shared, parts, review_diff,
                     )
@@ -3978,19 +4310,32 @@ class Orchestrator:
                             self.state["task"], self.state["proposal"], self.state["code_review"], individual_reports,
                         )),
                     )
+                    validation_baseline = self._commitment_validation_baseline()
                     prompt = (
                         "Evaluate the independent Claude code review. Treat its findings as the complete correction "
                         "assignment. Fix valid in-scope defects and reject incorrect recommendations with a brief "
                         "reason. Assess every distinct finding from individual part reports and the consolidated "
                         "integration report. Optional improvements are not mandatory. Modify only files necessary to "
                         "address valid findings; preserve behavior outside those findings. Do not perform unrelated "
-                        "refactoring, cleanup, or scope expansion. Add or update focused tests when needed and rerun "
-                        "all required commitment validation scenarios against the corrected target. Do not repeat "
-                        "the review. Return a concise correction and validation summary plus one complete "
-                        "`harness-evidence` JSON block for every approved commitment, tied to this correction "
-                        "operation's test execution event IDs. Run all required scenarios after the final code edits, "
-                        "prefer one combined runner invocation, and make it the last tool action; do not edit code "
-                        "afterward. Do not include raw output or secrets.\n\n"
+                        "refactoring, cleanup, or scope expansion. Add or update focused tests when needed. For every "
+                        "required validation scenario, execute an actual pytest or unittest test that asserts its "
+                        "acceptance condition; manual inspection and bare shell checks are not runner receipts. If no "
+                        "suitable existing test applies and adding an application test file would exceed scope, place a "
+                        "temporary unittest under this workflow's `.engineering/workflows/` verification directory and "
+                        "run it from the target repository with `python3 -m unittest discover -v` so individual test IDs "
+                        "and outcomes are captured. For repository-scope "
+                        "scenarios, compare `git status --porcelain=v1 -z --untracked-files=all` with the supplied initial "
+                        "baseline; preserve pre-existing paths, exclude only the supplied Harness workflow-artifact "
+                        "prefix, verify each pre-existing path's supplied kind, mode, and SHA-256 state, and do not ignore "
+                        "other `.engineering/` paths or sensitive-path policy. If `preexisting_snapshot_complete` is false, "
+                        "do not claim the scope scenario passed. Include test IDs "
+                        "exactly as the runner reports them. Set `execution_event_ids` to an empty array; the Harness "
+                        "will bind only observed receipts. Do not repeat the review. Return a concise correction and "
+                        "validation summary plus one complete `harness-evidence` JSON block for every approved "
+                        "commitment. Run all required scenarios after the final code edits, prefer one combined runner "
+                        "invocation, and make it the last tool action; do not edit code afterward. Do not include raw "
+                        "output or secrets.\n\n"
+                        f"Harness validation baseline (do not modify):\n{validation_baseline}\n\n"
                         f"{COMMITMENT_LEDGER_GUIDANCE}\n\n"
                         f"{PLANNING_PRINCIPLES}\n\n"
                         f"{skill_guidance}\n\n"

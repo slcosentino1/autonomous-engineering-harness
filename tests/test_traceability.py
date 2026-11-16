@@ -224,6 +224,54 @@ class CommitmentTraceabilityTests(unittest.TestCase):
         parsed = traceability.parse_codex_evidence(report, ledger)
         self.assertEqual(parsed["commitments"][0]["validation_refs"][0]["execution_event_ids"], ["event-1"])
 
+        unresolved = evidence_for()
+        unresolved["commitments"][0]["validation_refs"][0]["execution_event_ids"] = []
+        parsed_unresolved = traceability.parse_codex_evidence(
+            "```harness-evidence\n" + json.dumps(unresolved) + "\n```", ledger,
+        )
+        traceability.bind_observed_execution_events(parsed_unresolved, [{
+            "event_id": "observed-event", "event_index": 4, "runner": "unittest", "exit_code": 0,
+            "tests": [{"test_id": "tests/test_service.py::test_process", "status": "passed"}],
+        }])
+        self.assertEqual(
+            parsed_unresolved["commitments"][0]["validation_refs"][0]["execution_event_ids"],
+            ["observed-event"],
+        )
+
+    def test_event_binding_rejects_unobserved_ambiguous_and_unsupported_receipts(self):
+        for receipts in (
+            [],
+            [{"event_id": "event-1", "event_index": 1, "runner": "unknown", "exit_code": 0,
+              "tests": [{"test_id": "tests/test_service.py::test_process", "status": "passed"}]}],
+            [{"event_id": "event-1", "event_index": 1, "runner": "pytest", "exit_code": 0,
+              "tests": [{"test_id": "tests/test_service.py::test_process", "status": "passed"}]},
+             {"event_id": "event-2", "event_index": 2, "runner": "pytest", "exit_code": 0,
+              "tests": [{"test_id": "tests/test_service.py::test_process", "status": "passed"}]}],
+        ):
+            evidence = evidence_for()
+            evidence["commitments"][0]["validation_refs"][0]["execution_event_ids"] = []
+            parsed = traceability.parse_codex_evidence(
+                "```harness-evidence\n" + json.dumps(evidence) + "\n```",
+                traceability.parse_commitment_ledger(proposal_for(make_ledger())),
+            )
+            traceability.bind_observed_execution_events(parsed, receipts)
+            self.assertEqual(parsed["commitments"][0]["validation_refs"][0]["execution_event_ids"], [])
+
+    def test_explicit_mismatched_event_ids_are_not_replaced_by_other_receipts(self):
+        evidence = evidence_for(event_id="agent-invented-event")
+        ledger = traceability.parse_commitment_ledger(proposal_for(make_ledger()))
+        parsed = traceability.parse_codex_evidence(
+            "```harness-evidence\n" + json.dumps(evidence) + "\n```", ledger,
+        )
+        traceability.bind_observed_execution_events(parsed, [{
+            "event_id": "real-event", "event_index": 1, "runner": "pytest", "exit_code": 0,
+            "tests": [{"test_id": "tests/test_service.py::test_process", "status": "passed"}],
+        }])
+        self.assertEqual(
+            parsed["commitments"][0]["validation_refs"][0]["execution_event_ids"],
+            ["agent-invented-event"],
+        )
+
         invalid = evidence_for()
         invalid["commitments"][0]["source_refs"] = [{"path": "../outside.py", "symbol": "bad"}]
         parsed_invalid = traceability.parse_codex_evidence(
@@ -272,6 +320,62 @@ class CommitmentTraceabilityTests(unittest.TestCase):
         self.assertEqual(result["disposition"], "complete")
         self.assertEqual(result["commitments"][0]["verification_status"], "passed")
         self.assertIsNone(result["commitments"][1]["claude_assessment"])
+
+    def test_baseline_source_cannot_fulfill_new_change_but_can_support_explicit_existing_behavior_basis(self):
+        ledger_data = make_ledger()
+        commitment = ledger_data["commitments"][0]
+        commitment["acceptance_condition"] = (
+            "The process function handles a valid request; explicitly accepted existing behavior may satisfy this."
+        )
+        ledger_data["commitments"] = [commitment]
+        ledger = traceability.parse_commitment_ledger(proposal_for(ledger_data))
+        evidence = evidence_for()
+        evidence["commitments"] = [evidence["commitments"][0]]
+        assessment = {"schema_version": 1, "commitments": [assessment_for()["commitments"][0]]}
+        operation = operation_for([{
+            "event_id": "event-1", "event_index": 1, "runner": "pytest", "exit_code": 0,
+            "tests": [{"test_id": "tests/test_service.py::test_process", "status": "passed"}],
+        }])
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)
+            (target / "src").mkdir()
+            (target / "src/service.py").write_text("def process_request(): return True\n", encoding="utf-8")
+            common = {
+                "target": target, "reviewed_paths": {"src/service.py"}, "operations": [operation],
+                "final_fingerprint": {"working_tree_sha256": "tree-1"},
+                "workflow_changed_paths": set(),
+            }
+            new_change = traceability.evaluate_ledger(ledger, evidence, assessment, **common)
+            self.assertEqual(new_change["disposition"], "blocked")
+            self.assertEqual(new_change["commitments"][0]["implementation_evidence_status"], "missing")
+            self.assertEqual(new_change["commitments"][0]["source_provenance"][0]["origin"], "baseline_context")
+
+            accepted_ledger_data = json.loads(json.dumps(ledger_data))
+            accepted_ledger_data["commitments"][0]["implementation_basis"] = "existing_behavior_acceptable"
+            accepted_ledger = traceability.parse_commitment_ledger(proposal_for(accepted_ledger_data))
+            accepted = traceability.evaluate_ledger(accepted_ledger, evidence, assessment, **common)
+        self.assertEqual(accepted["disposition"], "complete")
+        self.assertEqual(accepted["commitments"][0]["implementation_evidence_status"], "baseline_allowed")
+
+    def test_empty_event_references_without_observed_receipts_remain_unverified(self):
+        ledger = traceability.parse_commitment_ledger(proposal_for(make_ledger()))
+        evidence = evidence_for()
+        evidence["commitments"][0]["validation_refs"][0]["execution_event_ids"] = []
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)
+            (target / "src").mkdir()
+            (target / "src/service.py").write_text("def process_request(): pass\n", encoding="utf-8")
+            result = traceability.evaluate_ledger(
+                ledger, evidence, assessment_for(), target=target,
+                reviewed_paths={"src/service.py"},
+                operations=[operation_for([{
+                    "event_id": "observed-but-unbound", "event_index": 1, "runner": "pytest", "exit_code": 0,
+                    "tests": [{"test_id": "tests/test_service.py::test_process", "status": "passed"}],
+                }])],
+                final_fingerprint={"working_tree_sha256": "tree-1"},
+            )
+        self.assertEqual(result["commitments"][0]["verification_status"], "unverified")
+        self.assertEqual(result["disposition"], "blocked")
 
     def test_test_event_followed_by_another_tool_event_remains_valid(self):
         ledger = traceability.parse_commitment_ledger(proposal_for(make_ledger()))

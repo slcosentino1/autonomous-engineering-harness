@@ -96,6 +96,28 @@ def parse_commitment_ledger(proposal: str) -> dict[str, Any]:
         availability = commitment.get("availability")
         if not isinstance(availability, str) or availability not in AVAILABILITY_STATES:
             raise TraceabilityError(f"{label}.availability is not supported")
+        implementation_basis = commitment.get("implementation_basis")
+        if implementation_basis is not None and implementation_basis not in {
+                "new_change", "existing_behavior_acceptable"}:
+            raise TraceabilityError(
+                f"{label}.implementation_basis must be new_change or existing_behavior_acceptable",
+            )
+        relevant_sources = commitment.get("relevant_sources")
+        if relevant_sources is not None:
+            if not isinstance(relevant_sources, list):
+                raise TraceabilityError(f"{label}.relevant_sources must be an array")
+            normalized_sources = []
+            for source_index, source in enumerate(relevant_sources):
+                path = source.get("path") if isinstance(source, dict) else None
+                symbol = source.get("symbol") if isinstance(source, dict) else None
+                relative = PurePosixPath(path) if isinstance(path, str) else None
+                if (relative is None or not path or "\\" in path or relative.is_absolute()
+                        or any(part in {"", ".", ".."} for part in relative.parts)
+                        or not _nonempty_text(symbol)):
+                    raise TraceabilityError(
+                        f"{label}.relevant_sources[{source_index}] needs a safe repository path and symbol",
+                    )
+                normalized_sources.append({"path": path, "symbol": symbol.strip()})
         scenarios = commitment.get("verification_scenarios", [])
         if not isinstance(scenarios, list):
             raise TraceabilityError(f"{label}.verification_scenarios must be an array")
@@ -114,7 +136,7 @@ def parse_commitment_ledger(proposal: str) -> dict[str, Any]:
             normalized_scenarios.append({"id": scenario_id, "description": scenario["description"].strip()})
         if commitment_class == "required_validation_scenario" and not normalized_scenarios:
             raise TraceabilityError(f"{commitment_id} is a required validation scenario but has no scenario")
-        normalized.append({
+        normalized_commitment = {
             "id": commitment_id,
             "class": commitment_class,
             "statement": commitment["statement"].strip(),
@@ -122,7 +144,12 @@ def parse_commitment_ledger(proposal: str) -> dict[str, Any]:
             "implementation_expectations": implementation,
             "verification_scenarios": normalized_scenarios,
             "availability": availability,
-        })
+        }
+        if implementation_basis is not None:
+            normalized_commitment["implementation_basis"] = implementation_basis
+        if relevant_sources is not None:
+            normalized_commitment["relevant_sources"] = normalized_sources
+        normalized.append(normalized_commitment)
 
     policy = ledger.get("partial_delivery_policy")
     if "partial_delivery_policy" in ledger:
@@ -218,13 +245,13 @@ def parse_codex_evidence(text: str, ledger: dict[str, Any]) -> dict[str, Any] | 
             if not isinstance(reference, dict) or not _nonempty_text(reference.get("scenario_id")):
                 raise TraceabilityError(f"validation reference for {commitment_id} needs a scenario_id")
             test_ids = reference.get("test_ids")
-            event_ids = reference.get("execution_event_ids")
+            event_ids = reference.get("execution_event_ids", [])
             if (not isinstance(test_ids, list) or not test_ids or
                     not all(_nonempty_text(item) for item in test_ids) or
-                    not isinstance(event_ids, list) or not event_ids or
+                    not isinstance(event_ids, list) or
                     not all(_nonempty_text(item) for item in event_ids)):
                 raise TraceabilityError(
-                    f"validation reference for {commitment_id} needs test_ids and execution_event_ids",
+                    f"validation reference for {commitment_id} needs test_ids and a valid execution_event_ids array",
                 )
             if len(set(test_ids)) != len(test_ids):
                 raise TraceabilityError(f"validation reference for {commitment_id} repeats a test ID")
@@ -445,6 +472,50 @@ def _index_test_results(results: Any) -> dict[str, dict[str, Any]] | None:
     return indexed
 
 
+def bind_observed_execution_events(evidence: dict[str, Any], receipts: list[Any]) -> None:
+    """Fill empty event references only from unique observed pytest/unittest receipts."""
+    if not isinstance(evidence, dict) or not isinstance(evidence.get("commitments"), list):
+        return
+    receipt_list = receipts if isinstance(receipts, list) else []
+    event_counts: dict[str, int] = {}
+    for receipt in receipt_list:
+        if isinstance(receipt, dict) and isinstance(receipt.get("event_id"), str):
+            event_counts[receipt["event_id"]] = event_counts.get(receipt["event_id"], 0) + 1
+
+    test_events: dict[str, list[tuple[str, int]]] = {}
+    for receipt in receipt_list:
+        if (not isinstance(receipt, dict)
+                or receipt.get("runner") not in {"pytest", "unittest"}
+                or type(receipt.get("exit_code")) is not int):
+            continue
+        event_id = receipt.get("event_id")
+        event_index = receipt.get("event_index")
+        if (not isinstance(event_id, str) or not event_id or event_counts.get(event_id) != 1
+                or type(event_index) is not int):
+            continue
+        results = _index_test_results(receipt.get("tests"))
+        if results is None:
+            continue
+        for test_id in results:
+            test_events.setdefault(test_id, []).append((event_id, event_index))
+
+    for entry in evidence["commitments"]:
+        if not isinstance(entry, dict) or not isinstance(entry.get("validation_refs"), list):
+            continue
+        for reference in entry["validation_refs"]:
+            if (not isinstance(reference, dict)
+                    or reference.get("execution_event_ids") not in (None, [])):
+                continue
+            test_ids = reference.get("test_ids")
+            if not isinstance(test_ids, list) or not test_ids:
+                continue
+            matches = [test_events.get(test_id, []) for test_id in test_ids]
+            if any(len(events) != 1 for events in matches):
+                continue
+            events = sorted({event for group in matches for event in group}, key=lambda item: item[1])
+            reference["execution_event_ids"] = [event_id for event_id, _index in events]
+
+
 def _junit_receipt_matches(
     target: Path,
     artifact_path: str,
@@ -496,6 +567,8 @@ def evaluate_ledger(
     reviewed_paths: set[str],
     operations: list[dict[str, Any]],
     final_fingerprint: dict[str, Any] | None,
+    workflow_changed_paths: set[str] | None = None,
+    review_provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return per-commitment evidence outcomes and a conservative delivery disposition."""
     evidence_by_id = {
@@ -531,6 +604,18 @@ def evaluate_ledger(
             else "missing" if not source_results else "invalid"
         )
         source_reasons = [reason for _status, reason in source_results if reason]
+        changed_paths = workflow_changed_paths
+        if changed_paths is None:
+            implementation_status = "unverified"
+        elif any(
+                isinstance(ref, dict) and ref.get("path") in changed_paths
+                for ref in source_refs):
+            implementation_status = "valid"
+        elif commitment.get("implementation_basis", "new_change") == "existing_behavior_acceptable":
+            implementation_status = "baseline_allowed"
+        else:
+            implementation_status = "missing"
+            source_reasons.append("no referenced source file has an attributable workflow change")
 
         validation_refs = item_evidence.get("validation_refs", [])
         expected_scenarios = {item["id"] for item in commitment["verification_scenarios"]}
@@ -705,8 +790,42 @@ def evaluate_ledger(
             "claude_explanation": independent.get("explanation"),
             "claude_evidence_refs_valid": claude_refs_valid,
             "source_evidence_status": source_status,
+            "implementation_evidence_status": implementation_status,
+            "implementation_operation_id": item_evidence.get("operation_id"),
+            "implementation_target_fingerprint": (
+                operation_by_id.get(item_evidence.get("operation_id"), [{}])[0].get("target_fingerprint")
+                if len(operation_by_id.get(item_evidence.get("operation_id"), [])) == 1 else None
+            ),
+            "source_provenance": [
+                {
+                    "path": ref.get("path"),
+                    "symbol": ref.get("symbol"),
+                    "origin": (
+                        "unknown" if changed_paths is None else
+                        "workflow_change" if ref.get("path") in changed_paths else "baseline_context"
+                    ),
+                }
+                for ref in source_refs if isinstance(ref, dict)
+            ],
             "source_refs": source_refs,
             "validation_refs": validation_refs,
+            "validation_provenance": [
+                {
+                    "scenario_id": reference.get("scenario_id"),
+                    "test_ids": reference.get("test_ids", []),
+                    "execution_event_ids": reference.get("execution_event_ids", []),
+                    "operation_id": item_evidence.get("operation_id"),
+                    "target_fingerprint": (
+                        operation_by_id.get(item_evidence.get("operation_id"), [{}])[0].get("target_fingerprint")
+                        if len(operation_by_id.get(item_evidence.get("operation_id"), [])) == 1 else None
+                    ),
+                }
+                for reference in validation_refs if isinstance(reference, dict)
+            ],
+            "review_evidence": {
+                **(review_provenance or {}),
+                "evidence_refs": claude_refs if isinstance(claude_refs, dict) else {},
+            },
             "reasons": source_reasons,
             "disposition": item_evidence.get("disposition"),
             "disposition_reason": item_evidence.get("reason"),
@@ -732,6 +851,7 @@ def evaluate_ledger(
         if commitment["class"] in REQUIRED_CLASSES:
             fulfilled = (
                 source_status == "valid"
+                and implementation_status in {"valid", "baseline_allowed", "unverified"}
                 and independent.get("implementation_status") == "implemented"
                 and independent.get("assessment") == "fulfilled"
                 and claude_refs_valid

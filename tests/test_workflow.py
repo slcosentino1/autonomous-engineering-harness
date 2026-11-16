@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -2596,6 +2597,81 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue((runner.workflow_dir / "delivery.md").is_file())
         self.assertIn("python -m unittest", (runner.workflow_dir / "delivery.md").read_text())
 
+    def test_review_campaign_sees_preexisting_staged_context_without_attributing_it_to_codex(self):
+        (self.target / "README.md").write_text(
+            "target\nPre-existing staged integration note.\n", encoding="utf-8",
+        )
+        git(self.target, "add", "README.md")
+        evidence = {
+            "schema_version": 1,
+            "commitments": [{
+                "commitment_id": "C-TEST-001",
+                "source_refs": [{"path": "README.md", "symbol": "integration_note"}],
+                "validation_refs": [], "disposition": None, "reason": None,
+            }],
+        }
+        implementation = "Implemented a separate feature.\n\n```harness-evidence\n" + json.dumps(evidence) + "\n```\n"
+        codex = FakeCodex(
+            "# Proposal\n\n## Scope\nAdd a separate feature.\n",
+            self.refined(),
+            implementation,
+        )
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05),
+            claude_reviewer.ReviewResult("No code findings.", 0.05),
+        )
+
+        def implement(index, _command, _kwargs):
+            if index == 2:
+                (self.target / "src").mkdir()
+                (self.target / "src/feature.py").write_text("def feature(): return True\n", encoding="utf-8")
+
+        codex.on_call = implement
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add a separate feature while preserving the existing integration note",
+            budget_usd=1.0, workflow_id="dirty-baseline-review", process_runner=codex, claude_runner=claude,
+        )
+
+        self.assertEqual(runner.start()["status"], "awaiting_approval")
+        completed = orchestrator.Orchestrator(
+            self.target, workflow_id="dirty-baseline-review", process_runner=codex, claude_runner=claude,
+        ).approve()
+
+        self.assertEqual(completed["status"], "complete")
+        review_prompt = claude.prompts[-1]
+        self.assertIn("Pre-existing staged integration note.", review_prompt)
+        self.assertIn("Baseline version — context only, never implementation evidence", review_prompt)
+        self.assertIn("src/feature.py", review_prompt)
+        self.assertIn("Workflow implementation paths", review_prompt)
+        self.assertIn("src/feature.py", completed["review_workflow_paths"])
+        self.assertNotIn("README.md", completed["review_workflow_paths"])
+        self.assertEqual(completed["review_scope_files"], ["README.md", "src/feature.py"])
+        result = completed["commitment_gate"]["commitments"][0]
+        self.assertEqual(result["implementation_evidence_status"], "missing")
+        self.assertEqual(result["source_provenance"][0]["origin"], "baseline_context")
+
+    def test_baseline_mutation_after_approval_but_before_codex_fails_closed(self):
+        codex = FakeCodex("# Proposal\nPlan.\n", self.refined(), "This response must not be used.")
+        claude = FakeClaude(claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05))
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add a feature", workflow_id="baseline-mutation", process_runner=codex,
+            claude_runner=claude,
+        )
+        self.assertEqual(runner.start()["status"], "awaiting_approval")
+        original = runner._run_codex_impl
+
+        def mutate_before_write(prompt, *, sandbox):
+            if sandbox == "workspace-write":
+                (self.target / "README.md").write_text("changed after approval\n", encoding="utf-8")
+            return original(prompt, sandbox=sandbox)
+
+        with patch.object(runner, "_run_codex_impl", side_effect=mutate_before_write):
+            with self.assertRaisesRegex(orchestrator.WorkflowError, "changed after the workflow baseline"):
+                runner.approve()
+
+        self.assertEqual(len(codex.commands), 2)
+        self.assertEqual(runner.state["status"], "failed")
+
     def test_codex_process_receives_no_github_or_langfuse_credentials(self):
         codex = FakeCodex("# Proposal\nPlan.\n", self.refined())
         claude = FakeClaude(claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05))
@@ -2808,6 +2884,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(state["integrity"]["verification_result"]["status"], "verified")
         self.assertIn("Post-correction verification", claude.prompts[-1])
         self.assertIn("Handle empty input", claude.prompts[-1])
+        self.assertIn("Initial implementation and correction deltas", claude.prompts[-1])
+        self.assertIn("Original implementation delta", claude.prompts[-1])
+        self.assertIn("Correction delta since initial review", claude.prompts[-1])
+        self.assertIn("def parse", claude.prompts[-1])
         self.assertEqual(
             state["integrity"]["delivery_artifact_sha256"],
             hashlib.sha256((runner.workflow_dir / "delivery.md").read_bytes()).hexdigest(),
@@ -4823,6 +4903,258 @@ class CommitmentLedgerIntegrationTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def run_smoke_commitment_checks(
+        self, *, add_unrelated_change: bool = False, modify_preexisting: bool = False,
+    ):
+        (self.target / ".gitignore").write_text(".env\n", encoding="utf-8")
+        git(self.target, "add", ".gitignore")
+        git(self.target, "commit", "-q", "-m", "ignore local environment file")
+        metadata = self.target / ".engineering" / "existing-metadata.txt"
+        metadata.parent.mkdir(parents=True)
+        metadata.write_text("pre-existing harness metadata\n", encoding="utf-8")
+        (self.target / ".env").write_text("private test secret\n", encoding="utf-8")
+        baseline_commit = git(self.target, "rev-parse", "HEAD")
+        baseline_paths = workspace_ops.protected_paths(self.target, baseline_commit)
+        (self.target / "SMOKE_TEST.md").write_text(
+            "# Harness smoke test\n\nThe GitHub import workflow works.\n", encoding="utf-8",
+        )
+
+        workflow_id = "smoke-evidence-check"
+        runner = orchestrator.Orchestrator(
+            self.target, workflow_id=workflow_id, task="Verify the smoke-test artifact and repository scope",
+            process_runner=lambda *_args, **_kwargs: self.fail("provider must not be called"),
+            claude_runner=lambda *_args, **_kwargs: self.fail("provider must not be called"),
+        )
+        runner.workflow_dir.mkdir(parents=True)
+        verification_dir = runner.workflow_dir / "verification"
+        verification_dir.mkdir()
+        workflow_prefix = f"{workspace_ops.WORKFLOW_ROOT}/{workflow_id}/"
+        initial_target = runner._fingerprint_repository(self.target, expected_commit=baseline_commit)
+        baseline_snapshot = workspace_ops.capture_preexisting_snapshot(self.target, baseline_paths)
+        baseline_snapshot["baseline_fingerprint_sha256"] = initial_target["working_tree_sha256"]
+        snapshot_body = {key: value for key, value in baseline_snapshot.items() if key != "sha256"}
+        baseline_snapshot["sha256"] = hashlib.sha256(json.dumps(
+            snapshot_body, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")).hexdigest()
+        runner.state = {
+            "baseline_commit": baseline_commit,
+            "preexisting_paths": baseline_paths,
+            "baseline_snapshot": baseline_snapshot,
+            "execution_fingerprint": {"initial": {"target": initial_target}},
+        }
+        validation_baseline = json.loads(runner._commitment_validation_baseline())
+        module = f"""from pathlib import Path
+import hashlib
+import json
+import os
+import stat
+import subprocess
+import unittest
+
+ROOT = Path.cwd()
+BASELINE_PATHS = {json.dumps(validation_baseline['preexisting_non_sensitive_paths'])}
+BASELINE_PATH_STATES = {json.dumps(validation_baseline['preexisting_path_states'], sort_keys=True)}
+BASELINE_SNAPSHOT_COMPLETE = {validation_baseline['preexisting_snapshot_complete']!r}
+WORKFLOW_PREFIX = {workflow_prefix!r}
+
+class CommitmentChecks(unittest.TestCase):
+    def test_smoke_file_content(self):
+        path = ROOT / "SMOKE_TEST.md"
+        self.assertTrue(path.is_file())
+        self.assertEqual(path.read_text(encoding="utf-8"),
+                         "# Harness smoke test\\n\\nThe GitHub import workflow works.\\n")
+
+    def test_repository_change_scope(self):
+        result = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"],
+            cwd=ROOT, check=True, stdout=subprocess.PIPE,
+        )
+        current_paths = {{os.fsdecode(record[3:]) for record in result.stdout.split(b"\\0") if record}}
+        application_paths = {{path for path in current_paths if not path.startswith(WORKFLOW_PREFIX)}}
+        expected_paths = set(BASELINE_PATHS) | {{"SMOKE_TEST.md"}}
+        self.assertEqual(application_paths, expected_paths)
+
+        self.assertTrue(BASELINE_SNAPSHOT_COMPLETE, "pre-existing path baseline is incomplete")
+        for relative, expected in BASELINE_PATH_STATES.items():
+            path = ROOT / relative
+            self.assertEqual(stat.S_IMODE(path.lstat().st_mode), expected["mode"])
+            if expected["kind"] == "symlink":
+                self.assertTrue(path.is_symlink())
+                content = os.fsencode(os.readlink(path))
+            else:
+                self.assertTrue(path.is_file() and not path.is_symlink())
+                content = path.read_bytes()
+            self.assertEqual(hashlib.sha256(content).hexdigest(), expected["sha256"])
+"""
+        (verification_dir / "test_commitment_checks.py").write_text(module, encoding="utf-8")
+        if add_unrelated_change:
+            (self.target / "unrelated.py").write_text("unexpected\n", encoding="utf-8")
+        if modify_preexisting:
+            metadata.write_text("pre-existing harness metadata changed\n", encoding="utf-8")
+
+        relative_verification_dir = verification_dir.relative_to(self.target.resolve()).as_posix()
+        command = [
+            sys.executable, "-m", "unittest", "discover", "-v", "-s", relative_verification_dir,
+            "-p", "test_*.py",
+        ]
+        completed = subprocess.run(command, cwd=self.target, capture_output=True, text=True, check=False)
+        event_id = "observed-unittest-event"
+        jsonl = json.dumps({"type": "item.completed", "item": {
+            "id": event_id,
+            "type": "command_execution",
+            "command": " ".join(shlex.quote(part) for part in command),
+            "exit_code": completed.returncode,
+            "aggregated_output": completed.stdout + completed.stderr,
+        }}).encode("utf-8")
+        operation = {
+            "operation_id": "smoke-implementation-operation",
+            "operation_type": "codex",
+            "stage": "implementation",
+            "status": "completed",
+            "started_at": "2026-11-16T10:00:00Z",
+            "finished_at": "2026-11-16T10:00:01Z",
+            "stdout_sha256": hashlib.sha256(jsonl).hexdigest(),
+            **orchestrator._codex_jsonl_evidence(jsonl),
+        }
+        raw_ledger = {"schema_version": 1, "commitments": [
+            {
+                "id": "C-001", "class": "mandatory_user_requirement",
+                "statement": "Create the exact smoke-test document.",
+                "acceptance_condition": "The exact requested heading and sentence are present.",
+                "implementation_expectations": ["Add the root-level Markdown file."],
+                "verification_scenarios": [{"id": "scenario-1", "description": "Check exact file content."}],
+                "availability": "active",
+            },
+            {
+                "id": "C-002", "class": "mandatory_user_requirement",
+                "statement": "Do not change unrelated application files.",
+                "acceptance_condition": "Only the expected task file changes beyond pre-existing paths.",
+                "implementation_expectations": ["Preserve pre-existing metadata."],
+                "verification_scenarios": [{"id": "scenario-2", "description": "Check repository change scope."}],
+                "availability": "active",
+            },
+        ]}
+        ledger = orchestrator._traceability.parse_commitment_ledger(
+            "Proposal\n\n```commitment-ledger\n" + json.dumps(raw_ledger) + "\n```\n",
+        )
+        proposal = "Proposal\n\n```commitment-ledger\n" + json.dumps(raw_ledger) + "\n```\n"
+        runner.proposal_path.write_text(proposal, encoding="utf-8")
+        proposal_sha = hashlib.sha256(proposal.encode("utf-8")).hexdigest()
+        runner.state = {
+            "workflow_id": workflow_id,
+            "target": str(self.target),
+            "baseline_commit": baseline_commit,
+            "baseline_snapshot": baseline_snapshot,
+            "execution_fingerprint": {"initial": {"target": initial_target}},
+            "status": "complete",
+            "stage": "complete",
+            "traceability_required": True,
+            "proposal_version": 1,
+            "proposal_artifact_sha256": proposal_sha,
+            "preexisting_paths": baseline_paths,
+            "commitment_ledger_approval": {
+                "proposal_version": 1,
+                "proposal_sha256": proposal_sha,
+                "ledger": ledger,
+                "ledger_sha256": orchestrator._traceability.canonical_sha256(ledger),
+            },
+            "operation_history": [operation],
+        }
+        test_results = {
+            item["test_id"]: item
+            for item in operation["test_execution_events"][0]["tests"]
+        }
+        if not test_results:
+            raise AssertionError(completed.stdout + completed.stderr)
+        test_ids = {
+            "C-001": next(key for key in test_results if key.endswith(".test_smoke_file_content")),
+            "C-002": next(key for key in test_results if key.endswith(".test_repository_change_scope")),
+        }
+        entries = []
+        for commitment_id, scenario_id in (("C-001", "scenario-1"), ("C-002", "scenario-2")):
+            entries.append({
+                "commitment_id": commitment_id,
+                "source_refs": [{"path": "SMOKE_TEST.md", "symbol": "document"}],
+                "validation_refs": [{
+                    "scenario_id": scenario_id,
+                    "test_ids": [test_ids[commitment_id]],
+                    "execution_event_ids": [],
+                }],
+                "disposition": None,
+                "reason": None,
+            })
+        evidence_report = "```harness-evidence\n" + json.dumps({
+            "schema_version": 1, "commitments": entries,
+        }) + "\n```\n"
+        runner._capture_commitment_evidence(evidence_report)
+        with runner._workflow_lock():
+            runner._save()
+        persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        return runner, ledger, persisted, test_ids, completed.returncode
+
+    def test_smoke_content_and_scope_scenarios_create_persisted_bound_receipts(self):
+        runner, ledger, persisted, test_ids, exit_code = self.run_smoke_commitment_checks()
+
+        self.assertEqual(exit_code, 0)
+        operation = persisted["operation_history"][0]
+        receipt = operation["test_execution_events"][0]
+        self.assertEqual(receipt["runner"], "unittest")
+        self.assertEqual(receipt["exit_code"], 0)
+        self.assertEqual({item["status"] for item in receipt["tests"]}, {"passed"})
+        self.assertTrue(all(
+            reference["execution_event_ids"] == [receipt["event_id"]]
+            for commitment in persisted["commitment_evidence"]["evidence"]["commitments"]
+            for reference in commitment["validation_refs"]
+        ))
+        assessment = {
+            "schema_version": 1,
+            "commitments": [{
+                "id": commitment_id,
+                "implementation_status": "implemented",
+                "verification_status": "passed",
+                "assessment": "fulfilled",
+                "explanation": "The acceptance test passed.",
+                "evidence_refs": {
+                    "source": ["SMOKE_TEST.md#document"],
+                    "validation": [scenario_id, test_ids[commitment_id]],
+                },
+            } for commitment_id, scenario_id in (("C-001", "scenario-1"), ("C-002", "scenario-2"))],
+        }
+        result = orchestrator._traceability.evaluate_ledger(
+            ledger, persisted["commitment_evidence"]["evidence"], assessment,
+            target=self.target, reviewed_paths={"SMOKE_TEST.md"},
+            operations=persisted["operation_history"],
+            final_fingerprint={"working_tree_sha256": operation["target_fingerprint"]["working_tree_sha256"]},
+        )
+        self.assertEqual(result["disposition"], "complete")
+        self.assertEqual([item["verification_status"] for item in result["commitments"]], ["passed", "passed"])
+        baseline = json.loads(runner._commitment_validation_baseline())
+        self.assertTrue(baseline["preexisting_snapshot_complete"])
+        self.assertEqual(
+            baseline["preexisting_path_states"][".engineering/existing-metadata.txt"]["sha256"],
+            hashlib.sha256(b"pre-existing harness metadata\n").hexdigest(),
+        )
+
+    def test_unrelated_application_change_fails_scope_receipt(self):
+        _runner, _ledger, persisted, test_ids, exit_code = self.run_smoke_commitment_checks(
+            add_unrelated_change=True,
+        )
+
+        self.assertNotEqual(exit_code, 0)
+        receipt = persisted["operation_history"][0]["test_execution_events"][0]
+        scope_result = next(item for item in receipt["tests"] if item["test_id"] == test_ids["C-002"])
+        self.assertEqual(scope_result["status"], "failed")
+
+    def test_modified_preexisting_metadata_fails_scope_receipt(self):
+        _runner, _ledger, persisted, test_ids, exit_code = self.run_smoke_commitment_checks(
+            modify_preexisting=True,
+        )
+
+        self.assertNotEqual(exit_code, 0)
+        receipt = persisted["operation_history"][0]["test_execution_events"][0]
+        scope_result = next(item for item in receipt["tests"] if item["test_id"] == test_ids["C-002"])
+        self.assertEqual(scope_result["status"], "failed")
+
     def exercise_delivery(self, scenario: str) -> tuple[dict, str, Path]:
         workflow_id = f"ledger-{scenario}"
         runner = orchestrator.Orchestrator(
@@ -4965,6 +5297,8 @@ class CommitmentLedgerIntegrationTests(unittest.TestCase):
             "operation_history": [operation],
             "integrity": {"review_evidence": {}},
             "review_included_files": ["src/service.py"],
+            "review_scope_files": ["src/service.py"],
+            "review_workflow_paths": ["src/service.py"],
             "implementation_summary": "Implementation was captured from a completed operation.",
             "code_review": review_report,
             "correction_attempts": [],
@@ -5365,7 +5699,9 @@ class WorkflowExecutionFingerprintTests(unittest.TestCase):
         def fail_after_approval_baseline(*args, **kwargs):
             nonlocal calls
             calls += 1
-            if calls == 1:
+            # Approval validation and the pre-write guard both need a baseline read;
+            # fail on the post-write fingerprint to exercise review provenance handling.
+            if calls <= 2:
                 return real_fingerprint(*args, **kwargs)
             raise workspace_ops.WorkspaceError("hidden")
 

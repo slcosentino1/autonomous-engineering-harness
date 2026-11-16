@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import subprocess
+import hashlib
+import json
 import sys
 import tempfile
 import unittest
@@ -52,6 +54,15 @@ class ReviewInputTests(unittest.TestCase):
         return review_input.build_review_diff(
             self.target, self.baseline, preexisting_paths, redactor=redactor,
         )
+
+    def capture_snapshot(self, paths):
+        snapshot = workspace.capture_preexisting_snapshot(self.target, paths)
+        snapshot["baseline_fingerprint_sha256"] = "test-initial-fingerprint"
+        body = {key: value for key, value in snapshot.items() if key != "sha256"}
+        snapshot["sha256"] = hashlib.sha256(json.dumps(
+            body, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")).hexdigest()
+        return snapshot
 
     def test_tracks_added_modified_deleted_and_untracked_files_in_stable_complete_order(self):
         self.add_baseline_files({"modified.py": "old = 1\n", "deleted.py": "remove = True\n"})
@@ -148,6 +159,143 @@ class ReviewInputTests(unittest.TestCase):
         with self.assertRaises(orchestrator.WorkflowError) as wrapper_error:
             orchestrator._review_diff(state, invalid_target)
         self.assertEqual(str(wrapper_error.exception), str(direct_error.exception))
+
+    def test_baseline_snapshot_includes_staged_unstaged_and_untracked_context_but_attributes_only_new_deltas(self):
+        self.add_baseline_files({
+            "src/staged.py": "committed version = 0\n",
+            "src/unstaged.py": "unstaged source before start\n",
+        })
+        (self.target / "src/staged.py").write_text("staged version = 1\n", encoding="utf-8")
+        git(self.target, "add", "src/staged.py")
+        (self.target / "src/unstaged.py").write_text("unstaged source before start\nlocal note\n", encoding="utf-8")
+        (self.target / "docs").mkdir()
+        (self.target / "docs/context.md").write_text("untracked context before start\n", encoding="utf-8")
+        preexisting = workspace.protected_paths(self.target, self.baseline)
+        snapshot = self.capture_snapshot(preexisting)
+
+        (self.target / "src/staged.py").write_text("workflow version = 2\n", encoding="utf-8")
+        (self.target / "src/feature.py").write_text("def added_feature():\n    return True\n", encoding="utf-8")
+        packet = review_input.build_review_diff(
+            self.target, self.baseline, preexisting, baseline_snapshot=snapshot,
+            review_scope_paths={"src/staged.py", "src/unstaged.py", "docs/context.md"},
+        )
+
+        self.assertEqual(packet.workflow_paths, ("src/feature.py", "src/staged.py"))
+        self.assertEqual(packet.included_paths, packet.workflow_paths)
+        staged_patch = dict(packet.file_patches)["src/staged.py"]
+        self.assertIn("-staged version = 1", staged_patch)
+        self.assertIn("+workflow version = 2", staged_patch)
+        self.assertNotIn("-committed version = 0", staged_patch)
+        context = {path: (origin, before, after) for path, origin, before, after in packet.context_files}
+        self.assertEqual(context["src/staged.py"][0], "pre-existing target state")
+        self.assertIn("staged version = 1", context["src/staged.py"][1])
+        self.assertIn("workflow version = 2", context["src/staged.py"][2])
+        self.assertEqual(context["src/unstaged.py"][1], context["src/unstaged.py"][2])
+        self.assertIn("local note", context["src/unstaged.py"][1])
+        self.assertIn("untracked context before start", context["docs/context.md"][1])
+        self.assertNotIn("src/unstaged.py", packet.workflow_paths)
+        self.assertNotIn("docs/context.md", packet.workflow_paths)
+
+    def test_changed_preexisting_untracked_file_uses_its_saved_content_as_the_patch_base(self):
+        (self.target / "notes.md").write_text("pre-existing note\n", encoding="utf-8")
+        preexisting = workspace.protected_paths(self.target, self.baseline)
+        snapshot = self.capture_snapshot(preexisting)
+        (self.target / "notes.md").write_text("pre-existing note\nworkflow addition\n", encoding="utf-8")
+
+        packet = review_input.build_review_diff(
+            self.target, self.baseline, preexisting, baseline_snapshot=snapshot,
+            review_scope_paths={"notes.md"},
+        )
+
+        self.assertEqual(packet.workflow_paths, ("notes.md",))
+        self.assertEqual(packet.included_paths, ("notes.md",))
+        self.assertIn("+workflow addition", packet.text)
+        self.assertNotIn("-pre-existing note", packet.text)
+
+    def test_mutated_baseline_snapshot_fails_closed(self):
+        (self.target / "src").mkdir()
+        (self.target / "src/existing.py").write_text("baseline = True\n", encoding="utf-8")
+        preexisting = workspace.protected_paths(self.target, self.baseline)
+        snapshot = self.capture_snapshot(preexisting)
+        snapshot["entries"][0]["content_base64"] = "Y29ycnVwdGVk"
+
+        with self.assertRaisesRegex(review_input.ReviewInputError, "integrity"):
+            review_input.build_review_diff(self.target, self.baseline, preexisting, baseline_snapshot=snapshot)
+
+    def test_review_scope_adds_direct_python_dependency_without_scanning_repository(self):
+        self.add_baseline_files({
+            "src/pkg/service.py": "from .store import Store\n\ndef process(): return Store()\n",
+            "src/pkg/store.py": "class Store: pass\n",
+        })
+        snapshot = self.capture_snapshot([])
+
+        packet = review_input.build_review_diff(
+            self.target, self.baseline, [], baseline_snapshot=snapshot,
+            review_scope_paths={"src/pkg/service.py"},
+        )
+
+        self.assertEqual({path for path, *_ in packet.context_files}, {"src/pkg/service.py", "src/pkg/store.py"})
+
+    def test_index_only_mutation_is_excluded_as_ambiguous_and_not_attributed(self):
+        self.add_baseline_files({"src/staged.py": "committed baseline\n"})
+        source = self.target / "src/staged.py"
+        source.write_text("staged baseline\n", encoding="utf-8")
+        git(self.target, "add", "src/staged.py")
+        source.write_text("worktree baseline\n", encoding="utf-8")
+        preexisting = workspace.protected_paths(self.target, self.baseline)
+        snapshot = self.capture_snapshot(preexisting)
+
+        new_blob = subprocess.check_output(
+            ["git", "-C", str(self.target), "hash-object", "-w", "--stdin"],
+            input=b"index-only change\n",
+        ).decode().strip()
+        git(self.target, "update-index", "--cacheinfo", f"100644,{new_blob},src/staged.py")
+        packet = review_input.build_review_diff(
+            self.target, self.baseline, preexisting, baseline_snapshot=snapshot,
+        )
+
+        self.assertEqual(packet.workflow_paths, ())
+        self.assertNotIn("src/staged.py", packet.included_paths)
+        self.assertIn("index changed without a worktree source delta", dict(packet.excluded_files)["src/staged.py"])
+
+    def test_mode_only_change_is_reviewed_and_attributed(self):
+        self.add_baseline_files({"src/runner.py": "print('run')\n"})
+        snapshot = self.capture_snapshot([])
+        path = self.target / "src/runner.py"
+        path.chmod(0o755)
+
+        packet = review_input.build_review_diff(
+            self.target, self.baseline, [], baseline_snapshot=snapshot,
+        )
+
+        self.assertEqual(packet.workflow_paths, ("src/runner.py",))
+        self.assertIn("old mode 100644", packet.text)
+        self.assertIn("new mode 100755", packet.text)
+
+    def test_correction_review_keeps_initial_and_correction_deltas_separate(self):
+        self.add_baseline_files({"src/service.py": "def process(): return 'baseline'\n"})
+        baseline_snapshot = self.capture_snapshot([])
+        (self.target / "src/service.py").write_text("def process(): return 'implemented'\n", encoding="utf-8")
+        implementation_snapshot = workspace.capture_preexisting_snapshot(self.target, ["src/service.py"])
+        implementation_body = {key: value for key, value in implementation_snapshot.items() if key != "sha256"}
+        implementation_snapshot["source_patch_sha256"] = "initial-review-hash"
+        implementation_snapshot["target_fingerprint"] = {"status": "captured", "working_tree_sha256": "tree-1"}
+        implementation_body = {key: value for key, value in implementation_snapshot.items() if key != "sha256"}
+        implementation_snapshot["sha256"] = hashlib.sha256(json.dumps(
+            implementation_body, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")).hexdigest()
+        (self.target / "src/service.py").write_text("def process(): return 'corrected'\n", encoding="utf-8")
+
+        packet = review_input.build_review_diff(
+            self.target, self.baseline, [], baseline_snapshot=baseline_snapshot,
+            review_scope_paths={"src/service.py"}, implementation_snapshot=implementation_snapshot,
+        )
+
+        deltas = dict(packet.operation_diffs)
+        self.assertIn("+def process(): return 'implemented'", deltas["Original implementation delta"])
+        self.assertIn("-def process(): return 'baseline'", deltas["Original implementation delta"])
+        self.assertIn("+def process(): return 'corrected'", deltas["Correction delta since initial review"])
+        self.assertIn("-def process(): return 'implemented'", deltas["Correction delta since initial review"])
 
 
 if __name__ == "__main__":

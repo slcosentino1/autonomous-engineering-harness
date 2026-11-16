@@ -58,12 +58,16 @@ def _review_sha256_text(value: str) -> str | None:
 
 @dataclass(frozen=True)
 class ReviewDiff:
-    """Complete text patch plus an auditable account of files filtered from it."""
+    """Workflow diff plus commitment-selected baseline/final context and exclusions."""
 
     text: str
     included_paths: tuple[str, ...]
     excluded_files: tuple[tuple[str, str], ...]
     file_patches: tuple[tuple[str, str], ...]
+    workflow_paths: tuple[str, ...] = ()
+    context_files: tuple[tuple[str, str, str, str], ...] = ()
+    context_exclusions: tuple[tuple[str, str], ...] = ()
+    operation_diffs: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -437,7 +441,7 @@ def _part_coverage(segments: list[ReviewSegment], *, excluded_count: int) -> str
         if segment.patch_line_start == 1 and segment.patch_line_end == segment.patch_line_count:
             line_description = "complete patch"
         lines.append(
-            f"- `{segment.path}` — {line_description}; SHA-256 `{segment.patch_sha256}`"
+            f"- `{segment.path}` — {line_description}"
         )
     lines.append(f"Changed metadata/binary/protected paths explicitly excluded and recorded: {excluded_count}.")
     return "\n".join(lines)
@@ -823,6 +827,14 @@ class ReviewCampaign:
             "patches": list(review_diff.file_patches),
             "exclusions": list(review_diff.excluded_files),
         }
+        if (review_diff.workflow_paths or review_diff.context_files or review_diff.context_exclusions
+                or review_diff.operation_diffs):
+            content.update({
+                "workflow_paths": list(review_diff.workflow_paths),
+                "context_files": list(review_diff.context_files),
+                "context_exclusions": list(review_diff.context_exclusions),
+                "operation_diffs": list(review_diff.operation_diffs),
+            })
         encoded = json.dumps(content, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
