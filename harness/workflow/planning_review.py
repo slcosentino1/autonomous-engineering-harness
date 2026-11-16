@@ -23,6 +23,63 @@ _SCORE_ROW = re.compile(
 )
 
 
+def build_plan_review_input(
+    *,
+    iteration: int,
+    max_plan_reviews: int,
+    proposal_version: int,
+    assignment: str,
+    proposal: str,
+    target: str,
+    repository_context: str,
+    planning_principles: str,
+    relevant_skills: str,
+    review_guidance: str,
+) -> tuple[str, dict[str, str], dict]:
+    """Build deterministic plan-review sections without workflow state or provider access."""
+    disposition_heading = re.search(
+        r"(?im)^\s*##\s+Claude finding dispositions\s*$", proposal,
+    )
+    proposal_for_review = proposal
+    if disposition_heading:
+        proposal_for_review = proposal[:disposition_heading.start()].rstrip()
+    header = (
+        "Act as an independent Senior Software Architect reviewing a proposal. Inspect the complete assignment, "
+        "current proposal, repository context, workflow constraints, and listed skill guidance. "
+        "Do not rely on prior review conclusions or Codex dispositions; they are withheld. Give evidence-based "
+        "findings and a scorecard. Do not implement code."
+    )
+    sections = {
+        "Review metadata": (
+            f"Plan review iteration {iteration} of at most {max_plan_reviews}; proposal version {proposal_version}; "
+            "all required context sections below are complete."
+        ),
+        "Assignment": assignment,
+        "Current proposal": proposal_for_review,
+        "Repository context": repository_context,
+        "Workflow constraints": (
+            f"Target: {target}. The proposal is awaiting human approval; implementation is not authorized "
+            "until the user approves it. The workflow does not authorize commits, pushes, merges, deployments, "
+            "publication, shared-infrastructure changes, or access to unrelated repositories. Preserve the "
+            "existing assignment and workflow budget."
+        ),
+        "Engineering Judgment & Proportional Design": planning_principles,
+        "Relevant skills": relevant_skills,
+        "Review duties": review_guidance,
+        "Independence boundary": (
+            "Prior Claude reports and Codex finding dispositions are deliberately withheld from this review. "
+            "Base the assessment on the assignment and current proposal supplied here. The proposal's revision "
+            "number is context only; do not infer that earlier conclusions were correct."
+        ),
+    }
+    metadata = {
+        "iteration": iteration,
+        "proposal_version": proposal_version,
+        "header_id": "plan-review-v2",
+    }
+    return header, sections, metadata
+
+
 def normalize_scorecard(report: str) -> tuple[str, dict]:
     """Calculate and append an evidence-backed mean without imposing an approval threshold."""
     heading = _SCORECARD_HEADING.search(report)

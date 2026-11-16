@@ -39,7 +39,9 @@ from workflow import cli as _cli
 from workflow import persistence as _persistence
 from workflow import process_locks as _process_locks
 from workflow import process_control as _process_control
+from workflow import planning as _planning
 from workflow import planning_review as _planning_review
+from workflow import execution as _execution
 from workflow import review_input as _review_input
 from workflow import skills as _skills
 from workflow import traceability as _traceability
@@ -4054,6 +4056,393 @@ class Orchestrator:
         finally:
             self._finish_workflow_runtime()
 
+    def _run_planning_stage(self) -> None:
+        stage = self.state["stage"]
+        guidance = self._guidance()
+        skill_guidance = _guidance_for_codex(
+            guidance, stage=stage, context=self.state["task"],
+        )
+        prompt = _planning.build_planning_prompt(
+            architectural_decision_output=ARCHITECTURAL_DECISION_OUTPUT,
+            commitment_ledger_guidance=COMMITMENT_LEDGER_GUIDANCE,
+            skill_guidance=skill_guidance,
+            planning_principles=PLANNING_PRINCIPLES,
+            target=str(self.target),
+            assignment=self.state["task"],
+        )
+        proposal = clean_markdown(self._run_codex(prompt, sandbox="read-only"))
+        self.state["proposal"] = proposal
+        self.state["proposal_version"] = 1
+        self._write_proposal(proposal)
+        self.state["stage"] = "plan_review_1"
+        self._save()
+
+    def _run_plan_review_stage(self) -> None:
+        stage = self.state["stage"]
+        iteration = int(stage[-1])
+        header, sections, metadata = self._plan_review_prompt(iteration)
+        recoverable_context = next((
+            context for context in reversed(self.state.get("claude_contexts", []))
+            if context.get("stage") == stage
+            and context.get("proposal_version") == metadata["proposal_version"]
+            and context.get("call_state") == "completed"
+            and isinstance(context.get("report"), str)
+            and context.get("report")
+            and not any(
+                review.get("context_manifest", {}).get("prompt_sha256")
+                == context.get("prompt_sha256")
+                for review in self.state.get("plan_reviews", [])
+            )
+        ), None)
+        if recoverable_context is not None:
+            report, manifest = recoverable_context["report"], recoverable_context
+        else:
+            report, manifest = self._call_claude(header, stage, sections, metadata=metadata)
+        report, _scorecard = _planning_review.normalize_scorecard(report)
+        self.state["plan_reviews"].append({
+            "attempt": len(self.state.get("plan_reviews", [])) + 1,
+            "iteration": iteration,
+            "proposal_version": metadata["proposal_version"],
+            "report": report,
+            "time": now(),
+            "valid": True,
+            "context_manifest": manifest,
+        })
+        self.state["stage"] = f"plan_refine_{iteration}"
+        self._save()
+
+    def _run_plan_refinement_stage(self) -> None:
+        stage = self.state["stage"]
+        iteration = int(stage[-1])
+        review = next((record for record in reversed(self.state.get("plan_reviews", []))
+                       if record.get("valid") is True and record.get("iteration") == iteration), None)
+        if review is None:
+            raise WorkflowError(f"No valid Claude plan review exists for iteration {iteration}.")
+        report = review["report"]
+        guidance = self._guidance()
+        skill_guidance = _guidance_for_codex(
+            guidance, stage=stage,
+            context="\n".join((self.state["task"], self.state["proposal"], report)),
+        )
+        prompt = _planning.build_plan_refinement_prompt(
+            architectural_decision_output=ARCHITECTURAL_DECISION_OUTPUT,
+            planning_principles=PLANNING_PRINCIPLES,
+            skill_guidance=skill_guidance,
+            commitment_ledger_guidance=COMMITMENT_LEDGER_GUIDANCE,
+            assignment=self.state["task"],
+            proposal_version=int(self.state.get("proposal_version", 1)),
+            proposal=self.state["proposal"],
+            iteration=iteration,
+            review_proposal_version=review.get("proposal_version"),
+            report=report,
+        )
+        refined = self._run_codex(prompt, sandbox="read-only")
+        next_proposal_version = int(self.state.get("proposal_version", 1)) + 1
+        try:
+            proposal, review_again, dispositions = self._refined_proposal(refined)
+            validated_ledger = self._validate_proposal_ledger(proposal)
+        except WorkflowError as exc:
+            self._record_unvalidated_planning_output(
+                refined, exc, stage=stage, proposal_version=next_proposal_version,
+            )
+            raise
+        self.state["proposal"] = proposal
+        self.state["proposal_version"] = next_proposal_version
+        self.state.setdefault("plan_review_decisions", []).append({
+            "iteration": iteration,
+            "proposal_version": self.state["proposal_version"],
+            "dispositions": dispositions,
+        })
+        self._write_proposal(proposal, validated_ledger=validated_ledger)
+        if iteration == 1 and review_again:
+            self.state["stage"] = "plan_review_2"
+        else:
+            self.state["status"] = "awaiting_approval"
+            self.state["stage"] = "implementation"
+        self._save()
+
+    def _run_human_revision_stage(self) -> None:
+        stage = self.state["stage"]
+        guidance = self._guidance()
+        skill_guidance = _guidance_for_codex(
+            guidance, stage=stage,
+            context="\n".join((self.state["task"], self.state["proposal"], self.state["human_feedback"])),
+        )
+        prompt = _planning.build_human_revision_prompt(
+            architectural_decision_output=ARCHITECTURAL_DECISION_OUTPUT,
+            planning_principles=PLANNING_PRINCIPLES,
+            commitment_ledger_guidance=COMMITMENT_LEDGER_GUIDANCE,
+            skill_guidance=skill_guidance,
+            assignment=self.state["task"],
+            proposal_version=int(self.state.get("proposal_version", 1)),
+            proposal=self.state["proposal"],
+            review_history=self._review_history_for_prompt(),
+            human_feedback=self.state["human_feedback"],
+        )
+        self.state["proposal"] = clean_markdown(self._run_codex(prompt, sandbox="read-only"))
+        self.state["proposal_version"] = int(self.state.get("proposal_version", 1)) + 1
+        self._write_proposal(self.state["proposal"])
+        authorized_plan_limit = self.state["authorization"]["claude_aily"]["max_plan_reviews"]
+        valid_reviews = self._valid_plan_reviews()
+        if len(valid_reviews) < authorized_plan_limit:
+            self.state["stage"] = f"plan_review_{len(valid_reviews) + 1}"
+        else:
+            self.state["status"] = "awaiting_approval"
+            self.state["stage"] = "implementation"
+        self._save()
+
+    def _run_implementation_stage(self) -> None:
+        stage = self.state["stage"]
+        if not self.state.get("implementation_approved_at"):
+            self.state["status"] = "awaiting_approval"
+            self._save()
+            return
+        guidance = self._guidance()
+        skill_guidance = _guidance_for_codex(
+            guidance, stage=stage,
+            context="\n".join((self.state["task"], self.state["proposal"])),
+        )
+        validation_baseline = self._commitment_validation_baseline()
+        prompt = _execution.build_implementation_prompt(
+            validation_baseline=validation_baseline,
+            commitment_ledger_guidance=COMMITMENT_LEDGER_GUIDANCE,
+            planning_principles=PLANNING_PRINCIPLES,
+            skill_guidance=skill_guidance,
+            assignment=self.state["task"],
+            approved_proposal=self.state["proposal"],
+        )
+        self.state["implementation_summary"] = self._run_codex(prompt, sandbox="workspace-write")
+        self._capture_commitment_evidence(self.state["implementation_summary"])
+        self.state["stage"] = "code_review"
+        self._save()
+
+    def _run_code_review_stage(self) -> None:
+        stage = self.state["stage"]
+        purpose = "verification" if stage == "verification" else "initial"
+        self._require_write_operation_target(purpose)
+        review_diff = _review_diff(self.state, self.target)
+        if not review_diff.included_paths and not review_diff.context_files:
+            self.state["review_included_files"] = []
+            self.state["review_exclusions"] = [
+                {"path": _safe_review_path(path), "reason": reason}
+                for path, reason in review_diff.excluded_files
+            ]
+            self.state["review_files_not_reviewed"] = []
+            self._save()
+            reasons = "; ".join(
+                f"{path}: {reason}" for path, reason in review_diff.excluded_files
+            )
+            detail = f"No reviewable text changes were found. Excluded changed files: {reasons or 'none'}"
+            raise WorkflowError(detail)
+        try:
+            campaign, shared, parts = self._prepare_review_campaign(review_diff, purpose=purpose)
+        except WorkflowError as exc:
+            if not self.state.get("review_campaign"):
+                self.state["review_included_files"] = list(review_diff.included_paths)
+                self.state["review_exclusions"] = [
+                    {"path": _safe_review_path(path), "reason": reason}
+                    for path, reason in review_diff.excluded_files
+                ]
+                self.state["review_files_not_reviewed"] = [
+                    {"path": path, "reason": redact(str(exc))}
+                    for path in review_diff.included_paths
+                ]
+                self._save()
+            raise
+        self.state["review_scope_files"] = sorted({
+            *review_diff.included_paths,
+            *(path for path, _origin, _baseline, _final in review_diff.context_files),
+        })
+        self.state["review_workflow_paths"] = list(review_diff.workflow_paths)
+        self.state["review_scope_sha256"] = _ReviewCampaign._campaign_source_hash(review_diff)
+        if purpose == "initial" and not isinstance(self.state.get("implementation_snapshot"), dict):
+            implementation_snapshot = _workspace.capture_preexisting_snapshot(
+                self.target, review_diff.included_paths, redactor=redact,
+            )
+            implementation_snapshot["source_patch_sha256"] = self.state["review_scope_sha256"]
+            implementation_snapshot["target_fingerprint"] = self._fingerprint_repository(self.target)
+            snapshot_body = {
+                key: value for key, value in implementation_snapshot.items() if key != "sha256"
+            }
+            implementation_snapshot["sha256"] = hashlib.sha256(json.dumps(
+                snapshot_body, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            ).encode("utf-8")).hexdigest()
+            self.state["implementation_snapshot"] = implementation_snapshot
+        self._save()
+        report = self._run_review_campaign(
+            campaign, shared, parts, review_diff,
+        )
+        campaign["purpose"] = purpose
+        if purpose == "verification":
+            self.state["verification_report"] = report
+        else:
+            self.state["code_review"] = report
+        self._capture_commitment_assessment(report, purpose=purpose)
+        if purpose == "verification":
+            self.state["verification_context_sha256"] = campaign.get("shared_context_sha256")
+        else:
+            self.state["code_review_context_sha256"] = campaign.get("shared_context_sha256")
+        review_evidence = "\n\n".join([
+            report,
+            *(record.get("report", "") for record in campaign.get("part_reviews", [])),
+        ])
+        if campaign.get("status") != "complete" or campaign.get("files_not_reviewed"):
+            raise WorkflowError("Review did not complete all required files and parts; delivery is blocked.")
+        no_blocking_findings = _clearly_no_review_findings(review_evidence)
+        if purpose == "initial" and no_blocking_findings:
+            self.state["correction_summary"] = (
+                "Claude reported no acceptance-blocking findings; no correction run was needed."
+            )
+        verification_dispositions = None
+        if purpose == "verification" and no_blocking_findings:
+            history = self.state.get("review_campaign_history", [])
+            original_campaign = next((
+                item for item in reversed(history)
+                if isinstance(item, dict) and item.get("purpose") == "initial"
+            ), {})
+            verification_dispositions, disposition_error = _post_correction_dispositions(
+                original_campaign, campaign,
+            )
+            if disposition_error is not None:
+                self.state.setdefault("integrity", {})["verification_result"] = {
+                    "status": "failed",
+                    "campaign_id": campaign.get("campaign_id"),
+                    "checked_at": now(),
+                    "report_sha256": hashlib.sha256(report.encode("utf-8")).hexdigest(),
+                    "finding": disposition_error,
+                }
+                self._save()
+                raise WorkflowError(
+                    "Independent post-correction verification is inconclusive; delivery is blocked. "
+                    + disposition_error
+                )
+        self._record_review_snapshot(campaign, review_diff, purpose=purpose)
+        if purpose == "verification":
+            integrity = self.state.setdefault("integrity", {})
+            if no_blocking_findings:
+                integrity["verification_result"] = {
+                    "status": "verified",
+                    "campaign_id": campaign.get("campaign_id"),
+                    "original_campaign_id": (self.state.get("correction_attempts") or [{}])[-1].get(
+                        "original_campaign_id",
+                    ),
+                    "checked_at": now(),
+                    "report_sha256": hashlib.sha256(report.encode("utf-8")).hexdigest(),
+                    "finding": "No unresolved blocking findings were reported.",
+                    "original_finding_dispositions": verification_dispositions,
+                }
+                self.state["stage"] = "complete"
+            else:
+                integrity["verification_result"] = {
+                    "status": "failed",
+                    "campaign_id": campaign.get("campaign_id"),
+                    "checked_at": now(),
+                    "report_sha256": hashlib.sha256(report.encode("utf-8")).hexdigest(),
+                    "finding": "The independent verification reports unresolved or new blocking findings.",
+                }
+                self._save()
+                raise WorkflowError(
+                    "Independent post-correction verification found unresolved or new blocking findings; delivery is blocked."
+                )
+        elif no_blocking_findings:
+            self.state["stage"] = "complete"
+        else:
+            self.state["stage"] = "correction"
+        self._save()
+
+    def _run_correction_stage(self) -> None:
+        stage = self.state["stage"]
+        guidance = self._guidance()
+        campaign = self.state.get("review_campaign") or {}
+        if campaign.get("status") != "complete":
+            raise WorkflowError("Correction is blocked because the initial review campaign is incomplete.")
+        external = self.state["authorization"]["claude_aily"]
+        if external.get("budget_unknown") is True:
+            raise WorkflowError("Correction is blocked because Claude spend is unknown and verification cannot be authorized safely.")
+        limits = self._execution_limits()
+        usage = self._resource_usage()
+        remaining_claude_calls = limits["max_claude_calls"] - usage["claude_calls"]
+        minimum_verification_calls = max(1, int(campaign.get("required_calls", 1)))
+        if remaining_claude_calls < minimum_verification_calls:
+            raise WorkflowError(
+                "Correction is blocked because the saved Claude call authorization cannot cover an independent verification campaign."
+            )
+        attempts = self.state.setdefault("correction_attempts", [])
+        attempt = attempts[-1] if attempts and attempts[-1].get("status") == "in_progress" else None
+        if attempt is None:
+            if len(attempts) >= limits["max_correction_attempts"]:
+                raise WorkflowError("The authorized Codex correction-attempt limit is exhausted.")
+            attempt = {
+                "attempt": len(attempts) + 1,
+                "status": "in_progress",
+                "started_at": now(),
+                "original_campaign_id": campaign.get("campaign_id"),
+                "original_report_sha256": hashlib.sha256(
+                    str(self.state.get("code_review") or "").encode("utf-8"),
+                ).hexdigest(),
+            }
+            attempts.append(attempt)
+            usage["correction_attempts"] += 1
+            self._save()
+        individual_reports = "\n\n".join(
+            f"### {record.get('part_id')}\n{record.get('report', '')}"
+            for record in campaign.get("part_reviews", []) if record.get("report")
+        ) or "No separate individual reports were recorded."
+        skill_guidance = _guidance_for_codex(
+            guidance, stage=stage,
+            context="\n".join((
+                self.state["task"], self.state["proposal"], self.state["code_review"], individual_reports,
+            )),
+        )
+        validation_baseline = self._commitment_validation_baseline()
+        prompt = _execution.build_correction_prompt(
+            validation_baseline=validation_baseline,
+            commitment_ledger_guidance=COMMITMENT_LEDGER_GUIDANCE,
+            planning_principles=PLANNING_PRINCIPLES,
+            skill_guidance=skill_guidance,
+            assignment=self.state["task"],
+            approved_proposal=self.state["proposal"],
+            code_review=self.state["code_review"],
+            individual_reports=individual_reports,
+            implementation_summary=self.state["implementation_summary"],
+        )
+        self.state["correction_summary"] = self._run_codex(prompt, sandbox="workspace-write")
+        self._capture_commitment_evidence(self.state["correction_summary"])
+        attempt["status"] = "completed"
+        attempt["finished_at"] = now()
+        attempt["correction_summary_sha256"] = hashlib.sha256(
+            self.state["correction_summary"].encode("utf-8"),
+        ).hexdigest()
+        campaign["purpose"] = "initial"
+        campaign_history = self.state.setdefault("review_campaign_history", [])
+        if not any(item.get("campaign_id") == campaign.get("campaign_id") for item in campaign_history):
+            campaign_history.append(copy.deepcopy(campaign))
+        self.state["review_campaign"] = None
+        self.state["review_campaign_id"] = None
+        self.state["verification_report"] = None
+        self.state["stage"] = "verification"
+        self._save()
+
+    def _run_complete_stage(self) -> None:
+        stage = self.state["stage"]
+        delivery_verification = self._verify_delivery_integrity()
+        self._capture_final_target_fingerprint()
+        final_target = self.state.get("execution_fingerprint", {}).get("final", {}).get("target", {})
+        if (final_target.get("status") != "captured"
+                or final_target.get("commit_sha") != delivery_verification.get("target_commit_sha")
+                or final_target.get("working_tree_sha256") != delivery_verification.get("target_working_tree_sha256")):
+            raise WorkflowError("Delivery is blocked because the target changed during final integrity checks.")
+        self.state["status"] = "complete"
+        self.state["completed_at"] = now()
+        self._evaluate_commitment_delivery()
+        if isinstance(self.state.get("commitment_gate"), dict):
+            self.state["commitment_gate"]["workflow_status"] = "complete"
+        _atomic_text(self.delivery_path, self._delivery_report())
+        delivery_hash = hashlib.sha256(_persistence.read_bytes(self.delivery_path)).hexdigest()
+        self.state.setdefault("integrity", {})["delivery_artifact_sha256"] = delivery_hash
+        self._save()
+
+
     def _run_pending_stages(self) -> dict:
         while self.state.get("status") == "running":
             stage = self.state["stage"]
@@ -4065,451 +4454,21 @@ class Orchestrator:
                 if self._workflow_runtime_remaining() <= 0:
                     raise WorkflowError("The authorized workflow execution-time limit is exhausted.")
                 if stage == "planning":
-                    guidance = self._guidance()
-                    skill_guidance = _guidance_for_codex(
-                        guidance, stage=stage, context=self.state["task"],
-                    )
-                    prompt = (
-                        "Understand the assignment and this repository. Use the applicable instruction and skill "
-                        "content supplied below; inspect relevant target files. Do not merely list skills: apply "
-                        "relevant guidance and record each selected skill and its use. If none apply, say so. "
-                        "Make reasonable technical decisions, identify requirements, edge cases, and verification. "
-                        "Apply Engineering Judgment & Proportional Design. Separate must implement, should implement, "
-                        "future production considerations, and out of scope. Do not invent product behavior. "
-                        "Return a concise, readable Markdown implementation proposal with scope, approach, risks, "
-                        "a requirements-to-design mapping, material architectural decisions and their trade-offs, "
-                        "relevant skills and how they were applied, and concrete validation commands. Include the "
-                        "approved-design commitment classifications and the required machine-readable ledger below. "
-                        "Do not modify "
-                        "files or run tests.\n\n"
-                        f"{COMMITMENT_LEDGER_GUIDANCE}\n\n"
-                        f"{skill_guidance}\n\n"
-                        f"{PLANNING_PRINCIPLES}\n\nTarget: {self.target}\n\nAssignment:\n{self.state['task']}"
-                    )
-                    prompt = f"{ARCHITECTURAL_DECISION_OUTPUT}\n\n{prompt}"
-                    proposal = clean_markdown(self._run_codex(prompt, sandbox="read-only"))
-                    self.state["proposal"] = proposal
-                    self.state["proposal_version"] = 1
-                    self._write_proposal(proposal)
-                    self.state["stage"] = "plan_review_1"
-                    self._save()
+                    self._run_planning_stage()
                 elif stage in {"plan_review_1", "plan_review_2"}:
-                    iteration = int(stage[-1])
-                    header, sections, metadata = self._plan_review_prompt(iteration)
-                    recoverable_context = next((
-                        context for context in reversed(self.state.get("claude_contexts", []))
-                        if context.get("stage") == stage
-                        and context.get("proposal_version") == metadata["proposal_version"]
-                        and context.get("call_state") == "completed"
-                        and isinstance(context.get("report"), str)
-                        and context.get("report")
-                        and not any(
-                            review.get("context_manifest", {}).get("prompt_sha256")
-                            == context.get("prompt_sha256")
-                            for review in self.state.get("plan_reviews", [])
-                        )
-                    ), None)
-                    if recoverable_context is not None:
-                        report, manifest = recoverable_context["report"], recoverable_context
-                    else:
-                        report, manifest = self._call_claude(header, stage, sections, metadata=metadata)
-                    report, _scorecard = _planning_review.normalize_scorecard(report)
-                    self.state["plan_reviews"].append({
-                        "attempt": len(self.state.get("plan_reviews", [])) + 1,
-                        "iteration": iteration,
-                        "proposal_version": metadata["proposal_version"],
-                        "report": report,
-                        "time": now(),
-                        "valid": True,
-                        "context_manifest": manifest,
-                    })
-                    self.state["stage"] = f"plan_refine_{iteration}"
-                    self._save()
+                    self._run_plan_review_stage()
                 elif stage in {"plan_refine_1", "plan_refine_2"}:
-                    iteration = int(stage[-1])
-                    review = next((record for record in reversed(self.state.get("plan_reviews", []))
-                                   if record.get("valid") is True and record.get("iteration") == iteration), None)
-                    if review is None:
-                        raise WorkflowError(f"No valid Claude plan review exists for iteration {iteration}.")
-                    report = review["report"]
-                    guidance = self._guidance()
-                    skill_guidance = _guidance_for_codex(
-                        guidance, stage=stage,
-                        context="\n".join((self.state["task"], self.state["proposal"], report)),
-                    )
-                    prompt = (
-                        "Evaluate every distinct finding in this valid Claude plan-review report. For each, explicitly "
-                        "mark incorporated, rejected, or deferred and give a reason. Incorporate valid in-scope "
-                        "recommendations; do not turn optional production advice into assignment requirements. "
-                        "Return the complete refined proposal as readable Markdown, retaining requirements mapping, "
-                        "material architectural decisions and trade-offs, scope distinctions, and the relevant skills "
-                        "and their application. Preserve or update the machine-readable commitment ledger to reflect "
-                        "the refined proposal without converting optional or future advice into obligations. Put a section titled "
-                        "`## Claude finding dispositions` at the end of the proposal. Use one bullet for every finding "
-                        "in this format: `- Finding: ... | Decision: incorporated/rejected/deferred | Reason: ...`. "
-                        "If there are none, write `- No actionable findings.` Apply Engineering Judgment & "
-                        "Proportional Design. Add one final "
-                        "line exactly in this form: `Second plan review needed: yes` or `...: no`. Use yes only when "
-                        "a material plan change needs a second independent plan review.\n\n"
-                        f"{ARCHITECTURAL_DECISION_OUTPUT}\n\n{PLANNING_PRINCIPLES}\n\n{skill_guidance}\n\n"
-                        f"{COMMITMENT_LEDGER_GUIDANCE}\n\n"
-                        f"Assignment:\n{self.state['task']}\n\nCurrent proposal (version "
-                        f"{self.state.get('proposal_version', 1)}):\n{self.state['proposal']}\n\n"
-                        f"Claude review (iteration {iteration}, proposal version {review.get('proposal_version')}):\n{report}"
-                    )
-                    refined = self._run_codex(prompt, sandbox="read-only")
-                    next_proposal_version = int(self.state.get("proposal_version", 1)) + 1
-                    try:
-                        proposal, review_again, dispositions = self._refined_proposal(refined)
-                        validated_ledger = self._validate_proposal_ledger(proposal)
-                    except WorkflowError as exc:
-                        self._record_unvalidated_planning_output(
-                            refined, exc, stage=stage, proposal_version=next_proposal_version,
-                        )
-                        raise
-                    self.state["proposal"] = proposal
-                    self.state["proposal_version"] = next_proposal_version
-                    self.state.setdefault("plan_review_decisions", []).append({
-                        "iteration": iteration,
-                        "proposal_version": self.state["proposal_version"],
-                        "dispositions": dispositions,
-                    })
-                    self._write_proposal(proposal, validated_ledger=validated_ledger)
-                    if iteration == 1 and review_again:
-                        self.state["stage"] = "plan_review_2"
-                    else:
-                        self.state["status"] = "awaiting_approval"
-                        self.state["stage"] = "implementation"
-                    self._save()
+                    self._run_plan_refinement_stage()
                 elif stage == "human_revision":
-                    guidance = self._guidance()
-                    skill_guidance = _guidance_for_codex(
-                        guidance, stage=stage,
-                        context="\n".join((self.state["task"], self.state["proposal"], self.state["human_feedback"])),
-                    )
-                    prompt = (
-                        "Revise the saved proposal to address the user's explicit feedback. Keep the original "
-                        "assignment and unrelated decisions intact. Apply Engineering Judgment & Proportional Design. "
-                        "Apply relevant skill instructions below, and record the skill name and how it informed the "
-                        "proposal; if there are no applicable skills, state that. Distinguish must implement, should "
-                        "implement, future production considerations, and out of scope. Preserve and update the "
-                        "machine-readable commitment ledger using the user's explicit feedback. Return the complete proposal "
-                        "in readable Markdown; do not implement code.\n\n"
-                        f"{ARCHITECTURAL_DECISION_OUTPUT}\n\n{PLANNING_PRINCIPLES}\n\n{COMMITMENT_LEDGER_GUIDANCE}\n\n{skill_guidance}\n\n"
-                        f"Assignment:\n{self.state['task']}\n\nCurrent proposal (version "
-                        f"{self.state.get('proposal_version', 1)}):\n{self.state['proposal']}\n\n"
-                        f"Prior review attempts:\n{self._review_history_for_prompt()}\n\n"
-                        f"User feedback:\n{self.state['human_feedback']}"
-                    )
-                    self.state["proposal"] = clean_markdown(self._run_codex(prompt, sandbox="read-only"))
-                    self.state["proposal_version"] = int(self.state.get("proposal_version", 1)) + 1
-                    self._write_proposal(self.state["proposal"])
-                    authorized_plan_limit = self.state["authorization"]["claude_aily"]["max_plan_reviews"]
-                    valid_reviews = self._valid_plan_reviews()
-                    if len(valid_reviews) < authorized_plan_limit:
-                        self.state["stage"] = f"plan_review_{len(valid_reviews) + 1}"
-                    else:
-                        self.state["status"] = "awaiting_approval"
-                        self.state["stage"] = "implementation"
-                    self._save()
+                    self._run_human_revision_stage()
                 elif stage == "implementation":
-                    if not self.state.get("implementation_approved_at"):
-                        self.state["status"] = "awaiting_approval"
-                        self._save()
-                        break
-                    guidance = self._guidance()
-                    skill_guidance = _guidance_for_codex(
-                        guidance, stage=stage,
-                        context="\n".join((self.state["task"], self.state["proposal"])),
-                    )
-                    validation_baseline = self._commitment_validation_baseline()
-                    prompt = (
-                        "Implement the approved proposal in this repository. Follow repository instructions. "
-                        "Apply the relevant skill instructions supplied below; do not merely list skills. "
-                        "Use the persistent workflow authorization for ordinary target-workspace operations without "
-                        "individual approvals. Install dependencies only from project manifests using the project's "
-                        "package manager; do not use arbitrary download URLs or custom registries. Run relevant checks. "
-                        "Do not expose secrets or read unrelated repositories. Commit, push, merge, deploy, publish, "
-                        "shared-infrastructure changes, and access outside the target require separate explicit "
-                        "user authorization and are not included in this workflow authorization. "
-                        "Do not delete unrelated existing files. Follow Engineering Judgment & Proportional Design "
-                        "and do not invent product behavior. Return a concise summary with files changed, "
-                        "commands actually run, results, and known limitations. Do not use this summary to declare "
-                        "commitments fulfilled. For every required validation scenario, execute an actual pytest or "
-                        "unittest test that asserts the scenario acceptance condition; manual inspection and bare shell "
-                        "checks are not runner receipts. If no suitable existing test applies and adding an application "
-                        "test file would exceed scope, place a temporary unittest under the workflow verification "
-                        "directory inside `.engineering/workflows/` and run it from the target repository with "
-                        "`python3 -m unittest discover -v` so individual test IDs and outcomes are captured. "
-                        "For repository-scope scenarios, compare "
-                        "`git status --porcelain=v1 -z --untracked-files=all` with the supplied initial baseline; "
-                        "preserve pre-existing paths, exclude only the supplied Harness workflow-artifact prefix, "
-                        "verify each pre-existing path's supplied kind, mode, and SHA-256 state, and do not ignore "
-                        "other `.engineering/` paths or sensitive-path policy. If `preexisting_snapshot_complete` is "
-                        "false, do not claim the scope scenario passed. Include test IDs "
-                        "exactly as the runner reports them. Do not invent execution event IDs: set "
-                        "`execution_event_ids` to an empty array and the Harness will bind only observed receipts. "
-                        "Finish with one `harness-evidence` JSON block linking each approved commitment to source "
-                        "references and specific scenario/test IDs. Run all required scenarios after the final code edits, "
-                        "prefer one combined runner invocation, and make it the last tool action; do not edit code afterward. "
-                        "Do not include raw command output or secrets. Use exactly one fenced block labeled "
-                        "`harness-evidence` with this JSON shape, replacing example values:\n"
-                        "```harness-evidence\n"
-                        "{\"schema_version\":1,\"commitments\":["
-                        "{\"commitment_id\":\"C-001\",\"source_refs\":[{\"path\":\"src/file.py\","
-                        "\"symbol\":\"function_name\"}],\"validation_refs\":[{\"scenario_id\":\"scenario-1\","
-                        "\"test_ids\":[\"tests/test_file.py::test_case\"],\"execution_event_ids\":[]}],"
-                        "\"disposition\":null,\"reason\":null}]}\n```. Include only observed references.\n\n"
-                        f"Harness validation baseline (do not modify):\n{validation_baseline}\n\n"
-                        f"{COMMITMENT_LEDGER_GUIDANCE}\n\n{PLANNING_PRINCIPLES}\n\n{skill_guidance}\n\n"
-                        f"Assignment:\n{self.state['task']}\n\nApproved proposal:\n{self.state['proposal']}"
-                    )
-                    self.state["implementation_summary"] = self._run_codex(prompt, sandbox="workspace-write")
-                    self._capture_commitment_evidence(self.state["implementation_summary"])
-                    self.state["stage"] = "code_review"
-                    self._save()
+                    self._run_implementation_stage()
                 elif stage in {"code_review", "verification"}:
-                    purpose = "verification" if stage == "verification" else "initial"
-                    self._require_write_operation_target(purpose)
-                    review_diff = _review_diff(self.state, self.target)
-                    if not review_diff.included_paths and not review_diff.context_files:
-                        self.state["review_included_files"] = []
-                        self.state["review_exclusions"] = [
-                            {"path": _safe_review_path(path), "reason": reason}
-                            for path, reason in review_diff.excluded_files
-                        ]
-                        self.state["review_files_not_reviewed"] = []
-                        self._save()
-                        reasons = "; ".join(
-                            f"{path}: {reason}" for path, reason in review_diff.excluded_files
-                        )
-                        detail = f"No reviewable text changes were found. Excluded changed files: {reasons or 'none'}"
-                        raise WorkflowError(detail)
-                    try:
-                        campaign, shared, parts = self._prepare_review_campaign(review_diff, purpose=purpose)
-                    except WorkflowError as exc:
-                        if not self.state.get("review_campaign"):
-                            self.state["review_included_files"] = list(review_diff.included_paths)
-                            self.state["review_exclusions"] = [
-                                {"path": _safe_review_path(path), "reason": reason}
-                                for path, reason in review_diff.excluded_files
-                            ]
-                            self.state["review_files_not_reviewed"] = [
-                                {"path": path, "reason": redact(str(exc))}
-                                for path in review_diff.included_paths
-                            ]
-                            self._save()
-                        raise
-                    self.state["review_scope_files"] = sorted({
-                        *review_diff.included_paths,
-                        *(path for path, _origin, _baseline, _final in review_diff.context_files),
-                    })
-                    self.state["review_workflow_paths"] = list(review_diff.workflow_paths)
-                    self.state["review_scope_sha256"] = _ReviewCampaign._campaign_source_hash(review_diff)
-                    if purpose == "initial" and not isinstance(self.state.get("implementation_snapshot"), dict):
-                        implementation_snapshot = _workspace.capture_preexisting_snapshot(
-                            self.target, review_diff.included_paths, redactor=redact,
-                        )
-                        implementation_snapshot["source_patch_sha256"] = self.state["review_scope_sha256"]
-                        implementation_snapshot["target_fingerprint"] = self._fingerprint_repository(self.target)
-                        snapshot_body = {
-                            key: value for key, value in implementation_snapshot.items() if key != "sha256"
-                        }
-                        implementation_snapshot["sha256"] = hashlib.sha256(json.dumps(
-                            snapshot_body, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-                        ).encode("utf-8")).hexdigest()
-                        self.state["implementation_snapshot"] = implementation_snapshot
-                    self._save()
-                    report = self._run_review_campaign(
-                        campaign, shared, parts, review_diff,
-                    )
-                    campaign["purpose"] = purpose
-                    if purpose == "verification":
-                        self.state["verification_report"] = report
-                    else:
-                        self.state["code_review"] = report
-                    self._capture_commitment_assessment(report, purpose=purpose)
-                    if purpose == "verification":
-                        self.state["verification_context_sha256"] = campaign.get("shared_context_sha256")
-                    else:
-                        self.state["code_review_context_sha256"] = campaign.get("shared_context_sha256")
-                    review_evidence = "\n\n".join([
-                        report,
-                        *(record.get("report", "") for record in campaign.get("part_reviews", [])),
-                    ])
-                    if campaign.get("status") != "complete" or campaign.get("files_not_reviewed"):
-                        raise WorkflowError("Review did not complete all required files and parts; delivery is blocked.")
-                    no_blocking_findings = _clearly_no_review_findings(review_evidence)
-                    if purpose == "initial" and no_blocking_findings:
-                        self.state["correction_summary"] = (
-                            "Claude reported no acceptance-blocking findings; no correction run was needed."
-                        )
-                    verification_dispositions = None
-                    if purpose == "verification" and no_blocking_findings:
-                        history = self.state.get("review_campaign_history", [])
-                        original_campaign = next((
-                            item for item in reversed(history)
-                            if isinstance(item, dict) and item.get("purpose") == "initial"
-                        ), {})
-                        verification_dispositions, disposition_error = _post_correction_dispositions(
-                            original_campaign, campaign,
-                        )
-                        if disposition_error is not None:
-                            self.state.setdefault("integrity", {})["verification_result"] = {
-                                "status": "failed",
-                                "campaign_id": campaign.get("campaign_id"),
-                                "checked_at": now(),
-                                "report_sha256": hashlib.sha256(report.encode("utf-8")).hexdigest(),
-                                "finding": disposition_error,
-                            }
-                            self._save()
-                            raise WorkflowError(
-                                "Independent post-correction verification is inconclusive; delivery is blocked. "
-                                + disposition_error
-                            )
-                    self._record_review_snapshot(campaign, review_diff, purpose=purpose)
-                    if purpose == "verification":
-                        integrity = self.state.setdefault("integrity", {})
-                        if no_blocking_findings:
-                            integrity["verification_result"] = {
-                                "status": "verified",
-                                "campaign_id": campaign.get("campaign_id"),
-                                "original_campaign_id": (self.state.get("correction_attempts") or [{}])[-1].get(
-                                    "original_campaign_id",
-                                ),
-                                "checked_at": now(),
-                                "report_sha256": hashlib.sha256(report.encode("utf-8")).hexdigest(),
-                                "finding": "No unresolved blocking findings were reported.",
-                                "original_finding_dispositions": verification_dispositions,
-                            }
-                            self.state["stage"] = "complete"
-                        else:
-                            integrity["verification_result"] = {
-                                "status": "failed",
-                                "campaign_id": campaign.get("campaign_id"),
-                                "checked_at": now(),
-                                "report_sha256": hashlib.sha256(report.encode("utf-8")).hexdigest(),
-                                "finding": "The independent verification reports unresolved or new blocking findings.",
-                            }
-                            self._save()
-                            raise WorkflowError(
-                                "Independent post-correction verification found unresolved or new blocking findings; delivery is blocked."
-                            )
-                    elif no_blocking_findings:
-                        self.state["stage"] = "complete"
-                    else:
-                        self.state["stage"] = "correction"
-                    self._save()
+                    self._run_code_review_stage()
                 elif stage == "correction":
-                    guidance = self._guidance()
-                    campaign = self.state.get("review_campaign") or {}
-                    if campaign.get("status") != "complete":
-                        raise WorkflowError("Correction is blocked because the initial review campaign is incomplete.")
-                    external = self.state["authorization"]["claude_aily"]
-                    if external.get("budget_unknown") is True:
-                        raise WorkflowError("Correction is blocked because Claude spend is unknown and verification cannot be authorized safely.")
-                    limits = self._execution_limits()
-                    usage = self._resource_usage()
-                    remaining_claude_calls = limits["max_claude_calls"] - usage["claude_calls"]
-                    minimum_verification_calls = max(1, int(campaign.get("required_calls", 1)))
-                    if remaining_claude_calls < minimum_verification_calls:
-                        raise WorkflowError(
-                            "Correction is blocked because the saved Claude call authorization cannot cover an independent verification campaign."
-                        )
-                    attempts = self.state.setdefault("correction_attempts", [])
-                    attempt = attempts[-1] if attempts and attempts[-1].get("status") == "in_progress" else None
-                    if attempt is None:
-                        if len(attempts) >= limits["max_correction_attempts"]:
-                            raise WorkflowError("The authorized Codex correction-attempt limit is exhausted.")
-                        attempt = {
-                            "attempt": len(attempts) + 1,
-                            "status": "in_progress",
-                            "started_at": now(),
-                            "original_campaign_id": campaign.get("campaign_id"),
-                            "original_report_sha256": hashlib.sha256(
-                                str(self.state.get("code_review") or "").encode("utf-8"),
-                            ).hexdigest(),
-                        }
-                        attempts.append(attempt)
-                        usage["correction_attempts"] += 1
-                        self._save()
-                    individual_reports = "\n\n".join(
-                        f"### {record.get('part_id')}\n{record.get('report', '')}"
-                        for record in campaign.get("part_reviews", []) if record.get("report")
-                    ) or "No separate individual reports were recorded."
-                    skill_guidance = _guidance_for_codex(
-                        guidance, stage=stage,
-                        context="\n".join((
-                            self.state["task"], self.state["proposal"], self.state["code_review"], individual_reports,
-                        )),
-                    )
-                    validation_baseline = self._commitment_validation_baseline()
-                    prompt = (
-                        "Evaluate the independent Claude code review. Treat its findings as the complete correction "
-                        "assignment. Fix valid in-scope defects and reject incorrect recommendations with a brief "
-                        "reason. Assess every distinct finding from individual part reports and the consolidated "
-                        "integration report. Optional improvements are not mandatory. Modify only files necessary to "
-                        "address valid findings; preserve behavior outside those findings. Do not perform unrelated "
-                        "refactoring, cleanup, or scope expansion. Add or update focused tests when needed. For every "
-                        "required validation scenario, execute an actual pytest or unittest test that asserts its "
-                        "acceptance condition; manual inspection and bare shell checks are not runner receipts. If no "
-                        "suitable existing test applies and adding an application test file would exceed scope, place a "
-                        "temporary unittest under this workflow's `.engineering/workflows/` verification directory and "
-                        "run it from the target repository with `python3 -m unittest discover -v` so individual test IDs "
-                        "and outcomes are captured. For repository-scope "
-                        "scenarios, compare `git status --porcelain=v1 -z --untracked-files=all` with the supplied initial "
-                        "baseline; preserve pre-existing paths, exclude only the supplied Harness workflow-artifact "
-                        "prefix, verify each pre-existing path's supplied kind, mode, and SHA-256 state, and do not ignore "
-                        "other `.engineering/` paths or sensitive-path policy. If `preexisting_snapshot_complete` is false, "
-                        "do not claim the scope scenario passed. Include test IDs "
-                        "exactly as the runner reports them. Set `execution_event_ids` to an empty array; the Harness "
-                        "will bind only observed receipts. Do not repeat the review. Return a concise correction and "
-                        "validation summary plus one complete `harness-evidence` JSON block for every approved "
-                        "commitment. Run all required scenarios after the final code edits, prefer one combined runner "
-                        "invocation, and make it the last tool action; do not edit code afterward. Do not include raw "
-                        "output or secrets.\n\n"
-                        f"Harness validation baseline (do not modify):\n{validation_baseline}\n\n"
-                        f"{COMMITMENT_LEDGER_GUIDANCE}\n\n"
-                        f"{PLANNING_PRINCIPLES}\n\n"
-                        f"{skill_guidance}\n\n"
-                        f"Assignment:\n{self.state['task']}\n\nApproved proposal:\n{self.state['proposal']}\n\n"
-                        f"Claude code review:\n{self.state['code_review']}\n\n"
-                        f"Individual Claude part reports:\n{individual_reports}\n\n"
-                        f"Prior implementation summary:\n{self.state['implementation_summary']}"
-                    )
-                    self.state["correction_summary"] = self._run_codex(prompt, sandbox="workspace-write")
-                    self._capture_commitment_evidence(self.state["correction_summary"])
-                    attempt["status"] = "completed"
-                    attempt["finished_at"] = now()
-                    attempt["correction_summary_sha256"] = hashlib.sha256(
-                        self.state["correction_summary"].encode("utf-8"),
-                    ).hexdigest()
-                    campaign["purpose"] = "initial"
-                    campaign_history = self.state.setdefault("review_campaign_history", [])
-                    if not any(item.get("campaign_id") == campaign.get("campaign_id") for item in campaign_history):
-                        campaign_history.append(copy.deepcopy(campaign))
-                    self.state["review_campaign"] = None
-                    self.state["review_campaign_id"] = None
-                    self.state["verification_report"] = None
-                    self.state["stage"] = "verification"
-                    self._save()
+                    self._run_correction_stage()
                 elif stage == "complete":
-                    delivery_verification = self._verify_delivery_integrity()
-                    self._capture_final_target_fingerprint()
-                    final_target = self.state.get("execution_fingerprint", {}).get("final", {}).get("target", {})
-                    if (final_target.get("status") != "captured"
-                            or final_target.get("commit_sha") != delivery_verification.get("target_commit_sha")
-                            or final_target.get("working_tree_sha256") != delivery_verification.get("target_working_tree_sha256")):
-                        raise WorkflowError("Delivery is blocked because the target changed during final integrity checks.")
-                    self.state["status"] = "complete"
-                    self.state["completed_at"] = now()
-                    self._evaluate_commitment_delivery()
-                    if isinstance(self.state.get("commitment_gate"), dict):
-                        self.state["commitment_gate"]["workflow_status"] = "complete"
-                    _atomic_text(self.delivery_path, self._delivery_report())
-                    delivery_hash = hashlib.sha256(_persistence.read_bytes(self.delivery_path)).hexdigest()
-                    self.state.setdefault("integrity", {})["delivery_artifact_sha256"] = delivery_hash
-                    self._save()
+                    self._run_complete_stage()
                 else:
                     raise WorkflowError(f"Unknown workflow stage: {stage}")
             except KeyboardInterrupt:
@@ -4624,52 +4583,24 @@ class Orchestrator:
         limit = self.state["authorization"]["claude_aily"]["max_plan_reviews"]
         version = int(self.state.get("proposal_version", 1))
         guidance = self._guidance()
-        proposal_for_review = self.state["proposal"]
-        disposition_heading = re.search(
-            r"(?im)^\s*##\s+Claude finding dispositions\s*$", proposal_for_review,
+        relevant_skills = _guidance_for_claude(
+            guidance,
+            stage="plan_review",
+            context="\n".join((self.state.get("task", ""), self.state.get("proposal", ""))),
+            include_skill_content=self._claude_skill_content_authorized(),
         )
-        if disposition_heading:
-            proposal_for_review = proposal_for_review[:disposition_heading.start()].rstrip()
-        header = (
-            "Act as an independent Senior Software Architect reviewing a proposal. Inspect the complete assignment, "
-            "current proposal, repository context, workflow constraints, and listed skill guidance. "
-            "Do not rely on prior review conclusions or Codex dispositions; they are withheld. Give evidence-based "
-            "findings and a scorecard. Do not implement code."
+        return _planning_review.build_plan_review_input(
+            iteration=iteration,
+            max_plan_reviews=limit,
+            proposal_version=version,
+            assignment=self.state["task"],
+            proposal=self.state["proposal"],
+            target=str(self.target),
+            repository_context=self._repository_context_for_claude(guidance),
+            planning_principles=PLANNING_PRINCIPLES,
+            relevant_skills=relevant_skills,
+            review_guidance=PLAN_REVIEW_GUIDANCE,
         )
-        sections = {
-            "Review metadata": (
-                f"Plan review iteration {iteration} of at most {limit}; proposal version {version}; "
-                "all required context sections below are complete."
-            ),
-            "Assignment": self.state["task"],
-            "Current proposal": proposal_for_review,
-            "Repository context": self._repository_context_for_claude(guidance),
-            "Workflow constraints": (
-                f"Target: {self.target}. The proposal is awaiting human approval; implementation is not authorized "
-                "until the user approves it. The workflow does not authorize commits, pushes, merges, deployments, "
-                "publication, shared-infrastructure changes, or access to unrelated repositories. Preserve the "
-                "existing assignment and workflow budget."
-            ),
-            "Engineering Judgment & Proportional Design": PLANNING_PRINCIPLES,
-            "Relevant skills": _guidance_for_claude(
-                guidance,
-                stage="plan_review",
-                context="\n".join((self.state.get("task", ""), self.state.get("proposal", ""))),
-                include_skill_content=self._claude_skill_content_authorized(),
-            ),
-            "Review duties": PLAN_REVIEW_GUIDANCE,
-            "Independence boundary": (
-                "Prior Claude reports and Codex finding dispositions are deliberately withheld from this review. "
-                "Base the assessment on the assignment and current proposal supplied here. The proposal's revision "
-                "number is context only; do not infer that earlier conclusions were correct."
-            ),
-        }
-        metadata = {
-            "iteration": iteration,
-            "proposal_version": version,
-            "header_id": "plan-review-v2",
-        }
-        return header, sections, metadata
 
     @staticmethod
     def _refined_proposal(value: str) -> tuple[str, bool, str]:
