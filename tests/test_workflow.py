@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from io import StringIO
@@ -5185,48 +5186,133 @@ class WorkflowExecutionFingerprintTests(unittest.TestCase):
         persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
         self.assertEqual(persisted["status"], "awaiting_approval")
 
-    def test_sensitive_modified_env_at_start_blocks_approval_without_persisting_value(self):
-        secret_file = self.target / ".env"
-        secret_file.write_text("non-secret baseline marker\n", encoding="utf-8")
-        git(self.target, "add", ".env")
-        git(self.target, "commit", "-q", "-m", "track local configuration")
-        sentinel = "DIRTY_ENV_SECRET_SENTINEL"
-        secret_file.write_text(sentinel + "\n", encoding="utf-8")
-
-        runner, _codex, _claude = self.make_runner("sensitive-modified-at-start")
-        state = runner.start()
-        initial_status = state["execution_fingerprint"]["initial"]["target"]["sensitive_path_status"]
-        self.assertTrue(initial_status["unstaged_changes"])
-        self.assertTrue(initial_status["dirty"])
-        before = runner.state_path.read_bytes()
-        serialized = before.decode("utf-8")
-        self.assertNotIn(sentinel, serialized)
-        self.assertNotIn(hashlib.sha256((sentinel + "\n").encode()).hexdigest(), serialized)
-
-        with self.assertRaisesRegex(orchestrator.WorkflowError, "already modified, staged, or untracked"):
-            runner.approve()
-
-        self.assertEqual(runner.state_path.read_bytes(), before)
-
-    def test_ignored_untracked_env_at_start_blocks_approval(self):
+    def test_ignored_untracked_env_at_start_is_allowed_when_unchanged(self):
         (self.target / ".gitignore").write_text(".env\n", encoding="utf-8")
         git(self.target, "add", ".gitignore")
         git(self.target, "commit", "-q", "-m", "ignore local environment file")
-        (self.target / ".env").write_text("UNTRACKED_ENV_SENTINEL\n", encoding="utf-8")
+        sentinel = "UNTRACKED_ENV_SENTINEL"
+        (self.target / ".env").write_text(sentinel + "\n", encoding="utf-8")
 
-        runner, _codex, _claude = self.make_runner("sensitive-untracked-at-start")
+        def implement(_index, _command, _kwargs):
+            (self.target / "generated.py").write_text("value = 42\n", encoding="utf-8")
+
+        runner, _codex, _claude = self.make_runner(
+            "sensitive-untracked-at-start", on_implementation=implement,
+        )
         state = runner.start()
         fingerprint = state["execution_fingerprint"]["initial"]["target"]
         self.assertFalse(fingerprint["untracked_files"])
         self.assertTrue(fingerprint["sensitive_path_status"]["untracked_files"])
         self.assertTrue(fingerprint["sensitive_path_status"]["dirty"])
+        self.assertEqual(len(fingerprint["sensitive_path_status"]["anonymous_path_metadata"]), 1)
+        self.assertEqual(state["preexisting_paths"], [])
+        persisted = runner.state_path.read_bytes()
+        serialized = persisted.decode("utf-8")
+        self.assertNotIn('"path": ".env"', serialized)
+        self.assertNotIn(sentinel, serialized)
+        self.assertNotIn(hashlib.sha256((sentinel + "\n").encode()).hexdigest(), serialized)
+
+        approved = runner.approve()
+
+        self.assertEqual(approved["status"], "complete")
+        self.assertNotIn(sentinel, runner.state_path.read_text(encoding="utf-8"))
+
+    def test_modified_ignored_env_after_start_blocks_approval_without_persisting_value(self):
+        (self.target / ".gitignore").write_text(".env\n", encoding="utf-8")
+        git(self.target, "add", ".gitignore")
+        git(self.target, "commit", "-q", "-m", "ignore local environment file")
+        secret_file = self.target / ".env"
+        secret_file.write_text("initial secret marker\n", encoding="utf-8")
+        runner, _codex, _claude = self.make_runner("sensitive-ignored-modified-after-start")
+        runner.start()
+        secret = "CHANGED_IGNORED_ENV_SENTINEL"
+        secret_file.write_text(secret + "\n", encoding="utf-8")
         before = runner.state_path.read_bytes()
 
-        with self.assertRaisesRegex(orchestrator.WorkflowError, "already modified, staged, or untracked"):
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "Sensitive files changed after this workflow started"):
             runner.approve()
 
         self.assertEqual(runner.state_path.read_bytes(), before)
-        self.assertNotIn(b"UNTRACKED_ENV_SENTINEL", before)
+        serialized = before.decode("utf-8")
+        self.assertNotIn(secret, serialized)
+        self.assertNotIn(hashlib.sha256((secret + "\n").encode()).hexdigest(), serialized)
+
+    def test_new_ignored_sensitive_file_after_start_blocks_approval(self):
+        (self.target / ".gitignore").write_text(".env*\n", encoding="utf-8")
+        git(self.target, "add", ".gitignore")
+        git(self.target, "commit", "-q", "-m", "ignore local environment files")
+        (self.target / ".env").write_text("initial secret marker\n", encoding="utf-8")
+        runner, _codex, _claude = self.make_runner("sensitive-added-after-start")
+        runner.start()
+        added_secret = "NEW_ENV_SECRET_SENTINEL"
+        (self.target / ".env.local").write_text(added_secret + "\n", encoding="utf-8")
+        before = runner.state_path.read_bytes()
+
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "Sensitive files changed after this workflow started"):
+            runner.approve()
+
+        self.assertEqual(runner.state_path.read_bytes(), before)
+        self.assertNotIn(added_secret.encode(), before)
+
+    def test_removed_ignored_sensitive_file_after_start_blocks_approval(self):
+        (self.target / ".gitignore").write_text(".env\n", encoding="utf-8")
+        git(self.target, "add", ".gitignore")
+        git(self.target, "commit", "-q", "-m", "ignore local environment file")
+        secret_file = self.target / ".env"
+        secret_file.write_text("initial secret marker\n", encoding="utf-8")
+        runner, _codex, _claude = self.make_runner("sensitive-removed-after-start")
+        runner.start()
+        secret_file.unlink()
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "Sensitive files changed after this workflow started"):
+            runner.approve()
+
+    def test_sensitive_file_staged_after_start_blocks_approval(self):
+        secret_file = self.target / ".env"
+        secret_file.write_text("initial marker\n", encoding="utf-8")
+        git(self.target, "add", ".env")
+        git(self.target, "commit", "-q", "-m", "track local configuration")
+        runner, _codex, _claude = self.make_runner("sensitive-staged-after-start")
+        runner.start()
+        secret_file.write_text("updated marker\n", encoding="utf-8")
+        git(self.target, "add", ".env")
+
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "Sensitive files changed after this workflow started"):
+            runner.approve()
+
+    def test_legacy_fingerprint_allows_unchanged_ignored_sensitive_file(self):
+        (self.target / ".gitignore").write_text(".env\n", encoding="utf-8")
+        git(self.target, "add", ".gitignore")
+        git(self.target, "commit", "-q", "-m", "ignore local environment file")
+        (self.target / ".env").write_text("existing secret marker\n", encoding="utf-8")
+        time.sleep(1.05)  # Legacy timestamps have second precision; ensure the file predates the saved second.
+
+        def implement(_index, _command, _kwargs):
+            (self.target / "generated.py").write_text("value = 42\n", encoding="utf-8")
+
+        runner, _codex, _claude = self.make_runner(
+            "legacy-sensitive-fingerprint", on_implementation=implement,
+        )
+        runner.start()
+        persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        del persisted["execution_fingerprint"]["initial"]["target"]["sensitive_path_status"][
+            "anonymous_path_metadata"
+        ]
+        runner.state_path.write_text(json.dumps(persisted, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+        approved = runner.approve()
+
+        self.assertEqual(approved["status"], "complete")
+
+    def test_clean_repository_approval_still_succeeds(self):
+        def implement(_index, _command, _kwargs):
+            (self.target / "generated.py").write_text("value = 42\n", encoding="utf-8")
+
+        runner, _codex, _claude = self.make_runner("clean-approval-baseline", on_implementation=implement)
+        runner.start()
+
+        approved = runner.approve()
+
+        self.assertEqual(approved["status"], "complete")
 
     def test_sensitive_env_changed_between_start_and_approval_is_rejected_unchanged(self):
         secret_file = self.target / ".env"

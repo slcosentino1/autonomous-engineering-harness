@@ -1057,6 +1057,16 @@ class Orchestrator:
         }
 
     def _require_current_approval_baseline(self) -> None:
+        def anonymous_metadata_is_valid(value: object, path_count: int) -> bool:
+            if not isinstance(value, list) or len(value) != path_count:
+                return False
+            for record in value:
+                if (not isinstance(record, list) or len(record) != 5
+                        or any(type(part) is not int or part < 0 for part in record)
+                        or record[0] not in (0, 1)):
+                    return False
+            return True
+
         def sensitive_status_is_valid(value: object) -> bool:
             if not isinstance(value, dict) or value.get("status") != "captured":
                 return False
@@ -1064,9 +1074,14 @@ class Orchestrator:
             if not all(type(value.get(name)) is bool for name in (*flag_names, "dirty")):
                 return False
             path_count = value.get("path_count")
+            if (type(path_count) is not int or path_count < 0
+                    or value["dirty"] != any(value[name] for name in flag_names)):
+                return False
+            # Older persisted fingerprints predate anonymous metadata. Keep them readable, then
+            # use their capture time as a conservative fallback during approval validation.
             return (
-                type(path_count) is int and path_count >= 0
-                and value["dirty"] == any(value[name] for name in flag_names)
+                "anonymous_path_metadata" not in value
+                or anonymous_metadata_is_valid(value["anonymous_path_metadata"], path_count)
             )
 
         execution = self.state.get("execution_fingerprint")
@@ -1087,12 +1102,6 @@ class Orchestrator:
             raise WorkflowError(
                 "The workflow has no usable initial sensitive-path status; reconcile the target and start a new workflow."
             )
-        if expected_sensitive["dirty"] or any(expected_sensitive[key] for key in (
-                "staged_changes", "unstaged_changes", "untracked_files")):
-            raise WorkflowError(
-                "Sensitive files were already modified, staged, or untracked when the workflow started. "
-                "Clean or reconcile them, then start a new workflow."
-            )
 
         current = self._fingerprint_repository(self.target, expected_commit=expected["commit_sha"])
         if current.get("status") != "captured":
@@ -1106,14 +1115,52 @@ class Orchestrator:
                 "Sensitive-path status is unavailable; approval was not granted. "
                 "Reconcile the target and start a new workflow."
             )
-        if current_sensitive["dirty"] or any(current_sensitive[key] for key in (
-                "staged_changes", "unstaged_changes", "untracked_files")):
+        sensitive_flags = ("staged_changes", "unstaged_changes", "untracked_files")
+        sensitive_state_changed = (
+            any(expected_sensitive[key] != current_sensitive[key] for key in sensitive_flags)
+            or expected_sensitive["path_count"] != current_sensitive["path_count"]
+        )
+        expected_metadata = expected_sensitive.get("anonymous_path_metadata")
+        current_metadata = current_sensitive.get("anonymous_path_metadata")
+        if "anonymous_path_metadata" in current_sensitive and not anonymous_metadata_is_valid(
+                current_metadata, current_sensitive["path_count"]):
+            raise WorkflowError(
+                "Sensitive-path status is unavailable; approval was not granted. "
+                "Reconcile the target and start a new workflow."
+            )
+
+        if expected_metadata is not None:
+            sensitive_state_changed = sensitive_state_changed or expected_metadata != current_metadata
+        elif expected_sensitive["path_count"]:
+            # Legacy state has no initial stat records. Allow unchanged pre-existing files only
+            # when their current change time is no later than the saved initial capture time.
+            captured_at = expected.get("captured_at")
+            try:
+                captured_time = datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
+                if captured_time.tzinfo is None:
+                    raise ValueError("capture timestamp has no timezone")
+                elapsed = captured_time.astimezone(timezone.utc) - datetime(1970, 1, 1, tzinfo=timezone.utc)
+                captured_ns = ((elapsed.days * 86400 + elapsed.seconds) * 1_000_000_000
+                               + elapsed.microseconds * 1_000)
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                captured_ns = -1
+            if (captured_ns < 0 or not isinstance(current_metadata, list)
+                    or any(record[0] != 1 or record[4] > captured_ns for record in current_metadata)):
+                sensitive_state_changed = True
+
+        if sensitive_state_changed:
             raise WorkflowError(
                 "Sensitive files changed after this workflow started; approval was not granted. "
                 "Clean or reconcile them, then start a new workflow."
             )
         stable_expected = {key: value for key, value in expected.items() if key != "captured_at"}
         stable_current = {key: value for key, value in current.items() if key != "captured_at"}
+        if "anonymous_path_metadata" not in expected_sensitive:
+            # The metadata is an additive fingerprint field. Ignore it for legacy snapshots after
+            # the conservative approval check above has compared the available evidence.
+            stable_current_sensitive = stable_current.get("sensitive_path_status")
+            if isinstance(stable_current_sensitive, dict):
+                stable_current_sensitive.pop("anonymous_path_metadata", None)
         if stable_current != stable_expected:
             raise WorkflowError(
                 "The target changed after this workflow started; approval was not granted. "

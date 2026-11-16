@@ -294,6 +294,40 @@ def _sensitive_status_flags(output: bytes) -> tuple[bool, bool, bool]:
     return staged, unstaged, untracked
 
 
+def _anonymous_sensitive_path_metadata(root: Path, paths: set[bytes]) -> list[list[int]]:
+    """Capture path-free stat records so approval can detect ordinary edits to ignored secrets."""
+    records: list[list[int]] = []
+    for path in paths:
+        relative = os.fsdecode(path)
+        full_path = root / relative
+        parent = root
+        for component in Path(relative).parts[:-1]:
+            parent = parent / component
+            try:
+                parent_mode = parent.lstat().st_mode
+            except FileNotFoundError:
+                break
+            except OSError as exc:
+                raise WorkspaceError("Sensitive repository metadata is unavailable.") from exc
+            if stat.S_ISLNK(parent_mode):
+                raise WorkspaceError("Sensitive repository path traverses a symbolic link.")
+        try:
+            item = full_path.lstat()
+        except FileNotFoundError:
+            records.append([0, 0, 0, 0, 0])
+        except OSError as exc:
+            raise WorkspaceError("Sensitive repository metadata is unavailable.") from exc
+        else:
+            records.append([
+                1,
+                int(item.st_mode),
+                int(item.st_size),
+                int(item.st_mtime_ns),
+                int(item.st_ctime_ns),
+            ])
+    return sorted(records)
+
+
 def _hash_worktree_path(
     root: Path,
     path: bytes,
@@ -422,6 +456,7 @@ def repository_fingerprint(
     sensitive_paths = {
         path for path in all_paths if not _fingerprint_internal_path(path) and _fingerprint_sensitive_path(path)
     }
+    sensitive_path_metadata = _anonymous_sensitive_path_metadata(root, sensitive_paths)
     relevant_paths = sorted(
         path for path in all_paths
         if not _fingerprint_internal_path(path) and not _fingerprint_sensitive_path(path)
@@ -459,6 +494,12 @@ def repository_fingerprint(
         root, "ls-files", "--others", "--exclude-standard", "-z", redactor=redactor,
     )
     ignored_sensitive_after = _ignored_sensitive_paths(root, redactor=redactor)
+    sensitive_paths_after = {
+        path for path in set(head_entries) | set(index_entries)
+        | {path for path in untracked_after.split(b"\0") if path} | ignored_sensitive_after
+        if not _fingerprint_internal_path(path) and _fingerprint_sensitive_path(path)
+    }
+    sensitive_path_metadata_after = _anonymous_sensitive_path_metadata(root, sensitive_paths_after)
     status_after = _fingerprint_git(
         root, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames",
         "--ignore-submodules=none", redactor=redactor,
@@ -471,6 +512,8 @@ def repository_fingerprint(
         raise WorkspaceError("Untracked repository files changed during fingerprint calculation.")
     if ignored_sensitive_after != ignored_sensitive_paths:
         raise WorkspaceError("Ignored sensitive repository files changed during fingerprint calculation.")
+    if sensitive_path_metadata_after != sensitive_path_metadata:
+        raise WorkspaceError("Sensitive repository files changed during fingerprint calculation.")
 
     return {
         "version": FINGERPRINT_VERSION,
@@ -495,6 +538,7 @@ def repository_fingerprint(
             "untracked_files": sensitive_untracked,
             "dirty": sensitive_staged or sensitive_unstaged or sensitive_untracked,
             "path_count": len(sensitive_paths),
+            "anonymous_path_metadata": sensitive_path_metadata,
         },
         "excluded_internal_paths": FINGERPRINT_EXCLUDED_INTERNAL_PATHS.copy(),
         "excluded_sensitive_paths": "known sensitive path components and .env.* basenames",
