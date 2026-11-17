@@ -58,7 +58,7 @@ class ApprovalConditionsTests(unittest.TestCase):
         saved = json.loads(runner.state_path.read_text(encoding="utf-8"))
         self.assertEqual(saved["approval_conditions"], conditions)
         implementation_prompt = codex.prompts[2]
-        self.assertIn("Additional human approval conditions", implementation_prompt)
+        self.assertIn("Human approval conditions (additional implementation constraints", implementation_prompt)
         self.assertIn("Keep the public API backward compatible.", implementation_prompt)
         self.assertIn("Do not add dependencies.", implementation_prompt)
 
