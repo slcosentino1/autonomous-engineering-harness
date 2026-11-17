@@ -1,6 +1,6 @@
 # Autonomous Engineering Harness
 
-A small Python workflow that plans an assignment, waits for approval, implements it with Codex, and reviews the resulting change with Claude through Aily.
+A Python-based engineering workflow that coordinates Codex and Claude (through Aily) across planning, human approval, implementation, independent review, bounded correction, verification, and delivery. It is designed to make agent-driven changes auditable and controlled rather than simply chaining CLI calls.
 
 ## Requirements
 
@@ -214,3 +214,12 @@ git diff --check
 ```
 
 The workflow tests use fake Codex and Aily processes; they do not contact external services.
+
+
+## Project ownership and permissions
+
+Copyright © 2026 Sebastian Cosentino. All rights reserved.
+
+This repository is public for viewing and evaluation. Unless you have separate, express written permission from the copyright holder, no license is granted to use, copy, modify, adapt, publish, distribute, sublicense, or create derivative works from this project's code or documentation. Public visibility on GitHub does not place this project in the public domain or make it open source.
+
+The project may include references to and integrations with third-party tools. Their names and trademarks belong to their respective owners; this notice applies only to original material in this repository.
