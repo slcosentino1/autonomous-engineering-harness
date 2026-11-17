@@ -136,6 +136,13 @@ def campaign_source_hash(
 
 
 def campaign_part_manifest(parts: Sequence[dict]) -> list[dict]:
+    part_ids = [part.get("part_id") for part in parts if isinstance(part, dict)]
+    if len(part_ids) != len(parts) or any(
+        not isinstance(part_id, str) or not part_id.strip() for part_id in part_ids
+    ):
+        raise ReviewCampaignError("Review campaign parts must have non-empty part IDs.")
+    if len(part_ids) != len(set(part_ids)):
+        raise ReviewCampaignError("Review campaign part IDs must be unique.")
     return [
         {
             "part_id": part["part_id"],

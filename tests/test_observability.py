@@ -1110,7 +1110,7 @@ class ObservabilityTests(unittest.TestCase):
                 with self.assertRaises(interrupt_type):
                     runner._finish_execution_trace(None)
 
-            campaign = ReviewCampaign({}, trace_span=lambda *_args: (_ for _ in ()).throw(interrupt_type("stop")))
+            campaign = ReviewCampaign(trace_span=lambda *_args: (_ for _ in ()).throw(interrupt_type("stop")))
             with self.subTest(review=interrupt_type.__name__):
                 with self.assertRaises(interrupt_type):
                     campaign._trace_context("review.part", {})

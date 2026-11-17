@@ -86,6 +86,34 @@ class CampaignInput:
                 raise TypeError(f"CampaignInput.{name} must be an immutable tuple.")
         if any(not isinstance(item, tuple) for item in self.shared_context + self.excluded_files):
             raise TypeError("CampaignInput name/value pairs must be immutable tuples.")
+        part_ids = [part.part_id for part in self.parts]
+        if any(not isinstance(part_id, str) or not part_id.strip() for part_id in part_ids):
+            raise ValueError("CampaignInput part IDs must be non-empty text values.")
+        if len(part_ids) != len(set(part_ids)):
+            raise ValueError("CampaignInput part IDs must be unique.")
+
+
+@dataclass(frozen=True)
+class RequestIdentity:
+    """Stable identity for the exact review request a provider result answers."""
+
+    campaign_id: str
+    kind: Literal["part", "integration"]
+    part_id: str
+    purpose: str
+    proposal_version: int
+    proposal_sha256: str
+    report_contract_version: str
+    header_id: str
+    source_patch_sha256: str
+    shared_context_sha256: str
+    part_patch_sha256: str | None
+    segment_sha256s: tuple[str, ...]
+    prompt_sha256: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.segment_sha256s, tuple):
+            raise TypeError("RequestIdentity.segment_sha256s must be an immutable tuple.")
 
 
 @dataclass(frozen=True)
@@ -115,6 +143,24 @@ class ReviewRequest:
     def section_mapping(self) -> dict[str, str]:
         return dict(self.sections)
 
+    @property
+    def identity(self) -> RequestIdentity:
+        return RequestIdentity(
+            campaign_id=self.campaign_id,
+            kind=self.kind,
+            part_id=self.part_id,
+            purpose=self.purpose,
+            proposal_version=self.proposal_version,
+            proposal_sha256=self.proposal_sha256,
+            report_contract_version=self.report_contract_version,
+            header_id=self.header_id,
+            source_patch_sha256=self.source_patch_sha256,
+            shared_context_sha256=self.shared_context_sha256,
+            part_patch_sha256=self.part_patch_sha256,
+            segment_sha256s=self.segment_sha256s,
+            prompt_sha256=self.prompt_sha256,
+        )
+
 
 @dataclass(frozen=True)
 class PreviousResult:
@@ -126,6 +172,9 @@ class PreviousResult:
     cost_usd: float | None
     campaign_call_number: int | None
     received_at: str
+    request_identity: RequestIdentity
+    operation_id: str | None
+    result_sha256: str | None
     recovered: bool = False
 
 

@@ -29,6 +29,8 @@ from observability import langfuse as langfuse_adapter  # noqa: E402
 from observability.tracer import safe_workflow_reference  # noqa: E402
 from tools import read_documentation_url  # noqa: E402
 from workflow import review as review_contracts  # noqa: E402
+from workflow import review_requests  # noqa: E402
+from workflow.review_models import CampaignPart  # noqa: E402
 from workflow import workspace as workspace_ops  # noqa: E402
 from workflow import persistence as persistence_ops  # noqa: E402
 from workflow import codex_evidence  # noqa: E402
@@ -798,126 +800,98 @@ class ReviewContractExtractionTests(unittest.TestCase):
 
 
 class ReviewCampaignBoundaryTests(unittest.TestCase):
-    def test_campaign_runs_through_state_and_provider_callbacks_without_orchestrator(self):
-        patch = "diff --git a/src/feature.py b/src/feature.py\n+value = 1\n"
+    def _request(self):
         segment = review_contracts.ReviewSegment(
-            "src/feature.py", patch, 1, 1, 1, review_contracts._review_patch_sha256(patch),
+            "src/feature.py", "diff --git a/src/feature.py b/src/feature.py\n+value = 1\n",
+            1, 2, 2, review_contracts._review_patch_sha256(
+                "diff --git a/src/feature.py b/src/feature.py\n+value = 1\n",
+            ),
         )
-        review_diff = review_contracts.ReviewDiff(
-            patch, (segment.path,), (), ((segment.path, patch),),
-        )
-        part = {"part_id": "part-000001", "segments": [segment]}
-        campaign = {
-            "campaign_id": "callback-campaign",
-            "status": "planned",
-            "shared_context_sha256": "shared-hash",
-            "payload_limit_characters": 10000,
-            "parts": review_contracts.ReviewCampaign._campaign_part_manifest([part]),
-            "part_reviews": [{"part_id": part["part_id"], "status": "pending", "report": None, "calls": []}],
-            "integration_review": {"required": False, "status": "not_required", "report": None, "calls": []},
-            "files_reviewed": [],
-            "files_not_reviewed": [{"path": segment.path, "reason": "pending"}],
-            "excluded_files": [],
-        }
-        state = {"review_campaign": campaign, "claude_contexts": [], "proposal_version": 1}
-        report = (
-            "Decision: APPROVED\nPart ID: part-000001\n\n"
-            "## Files reviewed\n- `src/feature.py`\n\n"
-            "## Findings\nNone\n\n"
-            "## Cross-component concerns\nNone\n\n"
-            "## Overall assessment\nThe changed file was reviewed."
-        )
-        saves = []
-        calls = []
-
-        def request_review(header, stage, sections, *, metadata):
-            calls.append((header, stage, sections, metadata))
-            return report, {
-                "prompt_sha256": "prompt-hash", "cost_usd": 0.05, "call_state": "completed",
-                "campaign_call_number": 1,
-            }
-
-        campaign_ops = review_contracts.ReviewCampaign(
-            state,
-            save_state=lambda: saves.append("saved"),
-            request_review=request_review,
+        part = CampaignPart("part-000001", (segment,))
+        return review_requests.build_part_request(
+            campaign_id="coordinator-campaign", part=part, purpose="initial", proposal_version=3,
+            payload_limit_characters=10000,
+            report_contract_version=review_contracts.PART_REVIEW_VALIDATOR_VERSION,
+            source_patch_sha256="source-hash", shared_context_sha256="shared-hash",
+            shared_context={"Assignment": "Review this change", "Approved proposal": "Preserve behavior"},
+            excluded_count=0,
         )
 
-        result = campaign_ops._run_review_campaign(
-            campaign, {"Assignment": "Review this change"}, [part], review_diff,
-        )
-
-        self.assertEqual(result, report)
-        self.assertEqual(campaign["status"], "complete")
-        self.assertEqual(campaign["files_reviewed"], [segment.path])
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][1], "code_review")
-        self.assertGreater(len(saves), 1)
-
-    def test_part_trace_result_uses_part_identity_when_saved_checkpoints_are_reordered(self):
-        patches = (("src/first.py", "first = 1\n"), ("src/second.py", "second = 2\n"))
-        parts = []
-        for index, (path, patch) in enumerate(patches, start=1):
-            segment = review_contracts.ReviewSegment(
-                path, patch, 1, 1, 1, review_contracts._review_patch_sha256(patch),
-            )
-            parts.append({"part_id": f"part-{index:06d}", "segments": [segment]})
-        part_reviews = [
-            {"part_id": part["part_id"], "status": "pending", "report": None, "calls": []}
-            for part in reversed(parts)
+    def _execution_records(self, request, report):
+        operation_id = "operation-123"
+        sections = [
+            {"name": name, "characters": len(value), "sha256": hashlib.sha256(value.encode()).hexdigest()}
+            for name, value in request.sections
         ]
-        campaign = {
-            "campaign_id": "reordered-campaign",
-            "status": "in_progress",
-            "purpose": "initial",
-            "header_id": "code-review-part-v2",
-            "report_contract_version": "part-review-v2",
-            "source_patch_sha256": "source-hash",
-            "shared_context_sha256": "shared-hash",
-            "payload_limit_characters": 10000,
-            "parts": review_contracts.ReviewCampaign._campaign_part_manifest(parts),
-            "part_reviews": part_reviews,
-            "integration_review": {"required": False, "status": "not_required", "report": None, "calls": []},
-            "files_reviewed": [],
-            "files_not_reviewed": [
-                {"path": path, "reason": "pending"} for path, _patch in patches
-            ],
-            "excluded_files": [],
+        context = {
+            "operation_id": operation_id, "stage": "code_review", "call_state": "completed",
+            "complete": True, "proposal_version": request.proposal_version,
+            "header_id": request.header_id, "header_characters": len(request.header),
+            "header_sha256": hashlib.sha256(request.header.encode()).hexdigest(),
+            "characters": len(request.prompt), "utf8_bytes": len(request.prompt.encode()),
+            "payload_limit_characters": request.payload_limit_characters,
+            "prompt_sha256": request.prompt_sha256, "sections": sections,
+            "campaign_id": request.campaign_id, "review_kind": request.kind,
+            "part_id": request.part_id, "shared_context_sha256": request.shared_context_sha256,
+            "part_patch_sha256": request.part_patch_sha256, "review_purpose": request.purpose,
         }
-        state = {"review_campaign": campaign, "claude_contexts": [], "proposal_version": 1}
-        trace_results = []
+        operation = {
+            "operation_id": operation_id, "operation_type": "claude", "stage": "code_review",
+            "status": "completed", "launch_state": "completed", "input_sha256": request.prompt_sha256,
+            "result_sha256": hashlib.sha256(report.encode()).hexdigest(),
+            "campaign_id": request.campaign_id, "part_id": request.part_id,
+            "proposal_version": request.proposal_version, "review_purpose": request.purpose,
+            "context_index": 0,
+        }
+        return operation, context
 
-        class TraceSpan:
-            def __enter__(self):
-                return self
+    def test_coordinator_joins_live_result_to_exact_operation_and_context(self):
+        request = self._request()
+        report = "structured report"
+        operation, context = self._execution_records(request, report)
+        coordinator = object.__new__(orchestrator.Orchestrator)
+        coordinator.state = {"operation_history": [operation], "claude_contexts": [context]}
+        manifest = dict(context)
+        coordinator._validate_review_execution_result(request, report, manifest)
 
-            def __exit__(self, *_args):
-                return False
+        for altered_context in (
+            {**context, "prompt_sha256": "different"},
+            {**context, "proposal_version": request.proposal_version + 1},
+            {**context, "part_patch_sha256": "different"},
+        ):
+            coordinator.state["claude_contexts"] = [altered_context]
+            with self.subTest(context=altered_context), self.assertRaisesRegex(
+                orchestrator.WorkflowError, "identity is invalid",
+            ):
+                coordinator._validate_review_execution_result(request, report, manifest)
 
-            def update(self, **metadata):
-                trace_results.append(metadata["review_result"])
+        coordinator.state["claude_contexts"] = [context]
+        altered_manifest = {**manifest, "part_id": "part-000002"}
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "manifest part_id"):
+            coordinator._validate_review_execution_result(request, report, altered_manifest)
 
-        def request_review(_header, _stage, _sections, *, metadata):
-            return "unstructured report", {
-                "prompt_sha256": "prompt-hash", "cost_usd": 0.05, "call_state": "completed",
-                "campaign_call_number": 1,
-            }
+        coordinator.state["operation_history"] = [operation, dict(operation)]
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "exactly one history record"):
+            coordinator._validate_review_execution_result(request, report, manifest)
 
-        campaign_ops = review_contracts.ReviewCampaign(
-            state,
-            save_state=lambda: None,
-            request_review=request_review,
-            trace_span=lambda *_args: TraceSpan(),
+        coordinator.state["operation_history"] = [operation]
+        coordinator.state["operation_history"][0]["result_sha256"] = "0" * 64
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "terminal operation"):
+            coordinator._validate_review_execution_result(request, report, manifest)
+
+    def test_part_manifest_rejects_missing_and_duplicate_ids_before_execution(self):
+        part = {"part_id": "part-000001", "segments": []}
+        with self.assertRaisesRegex(review_contracts.ReviewCampaignError, "non-empty part IDs"):
+            review_contracts.ReviewCampaign._campaign_part_manifest([{"segments": []}])
+        with self.assertRaisesRegex(review_contracts.ReviewCampaignError, "must be unique"):
+            review_contracts.ReviewCampaign._campaign_part_manifest([part, dict(part)])
+
+    def test_review_requests_no_longer_import_provider_adapter(self):
+        self.assertNotIn("claude_reviewer", review_requests.__dict__)
+        self.assertEqual(
+            review_requests.redact_review_text("api_key=secretvalue123"),
+            "[REDACTED]",
         )
-        first_diff = review_contracts.ReviewDiff(
-            patches[0][1], (patches[0][0],), (), (patches[0],),
-        )
-
-        with self.assertRaises(review_contracts.ReviewCampaignError):
-            campaign_ops._run_review_campaign(campaign, {"Assignment": "Review this change"}, parts, first_diff)
-
-        self.assertEqual(trace_results, ["invalid_report"])
-        self.assertEqual(campaign["part_reviews"][1]["status"], "invalid_report")
 
 
 class WorkspaceModuleTests(unittest.TestCase):

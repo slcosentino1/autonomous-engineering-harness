@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import sys
 import unittest
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "harness"))
 
 from workflow import review_partitioning, review_requests
+from workflow import review_text
 from workflow.review_campaign import (
     advance, block_campaign_for_authorization, create_campaign_snapshot, sync_campaign_coverage,
 )
@@ -112,6 +115,19 @@ class ReviewPartitioningTests(unittest.TestCase):
 
 
 class ReviewRequestTests(unittest.TestCase):
+    def test_provider_neutral_redaction_and_payload_validation_keep_adapter_behavior(self):
+        import claude_reviewer
+
+        self.assertEqual(review_text.redact("Bearer abcdefghijklmnop"), "[REDACTED]")
+        self.assertEqual(review_requests.redact_review_text("password=abcdefghijk"), "[REDACTED]")
+        with patch.dict("os.environ", {review_text.MAX_REVIEW_PAYLOAD_ENV: "4"}):
+            self.assertEqual(review_text.validate_review_invocation("safe", "aily"), 4)
+            with self.assertRaisesRegex(review_text.ReviewTextError, "above the configured"):
+                review_text.validate_review_invocation("too long", "aily")
+            with self.assertRaisesRegex(claude_reviewer.ReviewError, "above the configured"):
+                claude_reviewer.validate_review_invocation("too long", "aily")
+        self.assertNotIn("claude_reviewer", review_requests.__dict__)
+
     def test_part_request_has_stable_identity_and_exact_formatted_prompt_hash(self):
         part = CampaignPart("part-000001", (_segment("src/a.py", "def a():\n    return 1\n"),))
         request = review_requests.build_part_request(
@@ -217,6 +233,15 @@ class ReviewTransitionTests(unittest.TestCase):
             part_header=review_requests.review_header(), transition_at="2026-01-01T00:00:00Z",
         )
 
+    def _result(self, request, report=None, *, outcome="completed", call_state="completed", prompt_hash=None):
+        return PreviousResult(
+            part_id=request.part_id, outcome=outcome, call_state=call_state, report=report,
+            prompt_sha256=request.prompt_sha256 if prompt_hash is None else prompt_hash,
+            cost_usd=0.02, campaign_call_number=1, received_at="2026-01-01T00:01:00Z",
+            request_identity=request.identity, operation_id="operation-1",
+            result_sha256=hashlib.sha256(report.encode("utf-8")).hexdigest() if report is not None else None,
+        )
+
     def test_transition_is_deterministic_and_does_not_mutate_inputs(self):
         original_snapshot = self.snapshot.serialized
         original_input = copy.deepcopy(self.input)
@@ -233,9 +258,8 @@ class ReviewTransitionTests(unittest.TestCase):
 
     def test_part_results_evolve_snapshot_then_request_integration_and_complete(self):
         initial = advance(self.snapshot, self.input)
-        after_first = advance(self.snapshot, self.input, PreviousResult(
-            "part-000001", "completed", "completed", _part_report("part-000001", "src/first.py"),
-            initial.request.prompt_sha256, 0.02, 1, "2026-01-01T00:01:00Z",
+        after_first = advance(self.snapshot, self.input, self._result(
+            initial.request, _part_report("part-000001", "src/first.py"),
         ))
         self.assertEqual(after_first.decision, "request_part")
         self.assertEqual(after_first.part_id, "part-000002")
@@ -244,18 +268,19 @@ class ReviewTransitionTests(unittest.TestCase):
         self.assertEqual(first_record["calls"][0]["cost_usd"], 0.02)
         self.assertEqual(after_first.snapshot.to_mapping()["files_reviewed"], ["src/first.py"])
 
-        after_second = advance(after_first.snapshot, self.input, PreviousResult(
-            "part-000002", "completed", "completed", _part_report("part-000002", "src/second.py"),
-            after_first.request.prompt_sha256, 0.03, 2, "2026-01-01T00:02:00Z",
+        after_second = advance(after_first.snapshot, self.input, self._result(
+            after_first.request, _part_report("part-000002", "src/second.py"),
         ))
         self.assertEqual(after_second.decision, "request_integration")
         self.assertIn("Individual part reports", after_second.request.section_mapping())
         self.assertEqual(after_second.snapshot.to_mapping()["files_not_reviewed"], [])
 
-        completed = advance(after_second.snapshot, self.input, PreviousResult(
-            "integration", "completed", "completed",
-            "Decision: APPROVED\nConsolidated findings: None\nIntegration findings: None\nOverall assessment: coherent.",
-            after_second.request.prompt_sha256, 0.04, 3, "2026-01-01T00:03:00Z",
+        integration_report = (
+            "Decision: APPROVED\nConsolidated findings: None\nIntegration findings: None\n"
+            "Overall assessment: coherent."
+        )
+        completed = advance(after_second.snapshot, self.input, self._result(
+            after_second.request, integration_report,
         ))
         self.assertEqual(completed.decision, "complete")
         saved = completed.snapshot.to_mapping()
@@ -266,10 +291,8 @@ class ReviewTransitionTests(unittest.TestCase):
         self.assertIn("context_sha256", saved["part_reviews"][0])
 
     def test_invalid_and_uncertain_results_are_blocked_without_losing_reports(self):
-        invalid = advance(self.snapshot, self.input, PreviousResult(
-            "part-000001", "completed", "completed", "not a structured report", "prompt", 0.01, 1,
-            "2026-01-01T00:01:00Z",
-        ))
+        first = advance(self.snapshot, self.input)
+        invalid = advance(self.snapshot, self.input, self._result(first.request, "not a structured report"))
         self.assertEqual(invalid.decision, "blocked")
         self.assertEqual(invalid.reason, "invalid_report")
         self.assertEqual(invalid.snapshot.to_mapping()["part_reviews"][0]["report"], "not a structured report")
@@ -278,21 +301,74 @@ class ReviewTransitionTests(unittest.TestCase):
         self.assertEqual(retry.decision, "request_part")
         self.assertEqual(retry.part_id, "part-000001")
 
-        uncertain = advance(self.snapshot, self.input, PreviousResult(
-            "part-000001", "uncertain", "interrupted_unknown_cost", None, None, None, None,
-            "2026-01-01T00:01:00Z",
+        uncertain = advance(self.snapshot, self.input, self._result(
+            first.request, outcome="uncertain", call_state="interrupted_unknown_cost",
         ))
         self.assertEqual(uncertain.decision, "blocked")
         self.assertEqual(uncertain.reason, "uncertain_result")
         self.assertEqual(uncertain.snapshot, self.snapshot)
 
-        failed = advance(self.snapshot, self.input, PreviousResult(
-            "part-000001", "failed", "failed", None, "prompt", 0.01, 1,
-            "2026-01-01T00:01:00Z",
+        failed = advance(self.snapshot, self.input, self._result(
+            first.request, outcome="failed", call_state="failed",
         ))
         self.assertEqual(failed.decision, "blocked")
         self.assertEqual(failed.reason, "provider_failed")
         self.assertEqual(failed.snapshot.to_mapping()["part_reviews"][0]["status"], "call_failed")
+
+    def test_result_identity_and_report_hash_mismatches_do_not_mutate_snapshot(self):
+        request = advance(self.snapshot, self.input).request
+        valid = self._result(request, _part_report("part-000001", "src/first.py"))
+        mismatched_identity = replace(
+            valid, request_identity=replace(valid.request_identity, proposal_version=99),
+        )
+        mismatched_campaign = replace(
+            valid, request_identity=replace(valid.request_identity, campaign_id="another-campaign"),
+        )
+        mismatched_part = replace(valid, part_id="part-000002")
+        mismatched_report_hash = replace(valid, result_sha256="0" * 64)
+        mismatched_prompt = replace(valid, prompt_sha256="different-prompt")
+
+        for result in (
+            mismatched_identity, mismatched_campaign, mismatched_part,
+            mismatched_report_hash, mismatched_prompt,
+        ):
+            with self.subTest(result=result):
+                transition = advance(self.snapshot, self.input, result)
+                self.assertEqual(transition.decision, "blocked")
+                self.assertEqual(transition.reason, "invalid_result")
+                self.assertEqual(transition.snapshot, self.snapshot)
+
+    def test_checkpoint_ids_are_unique_and_reordered_checkpoints_follow_part_identity(self):
+        reordered = copy.deepcopy(self.campaign)
+        reordered["part_reviews"].reverse()
+        snapshot = CampaignSnapshot.from_mapping(reordered)
+        first_request = advance(snapshot, self.input)
+        self.assertEqual(first_request.part_id, "part-000001")
+        transitioned = advance(snapshot, self.input, self._result(
+            first_request.request, _part_report("part-000001", "src/first.py"),
+        ))
+        records = {item["part_id"]: item for item in transitioned.snapshot.to_mapping()["part_reviews"]}
+        self.assertEqual(records["part-000001"]["status"], "reviewed")
+        self.assertEqual(transitioned.part_id, "part-000002")
+
+        duplicated = copy.deepcopy(self.campaign)
+        duplicated["part_reviews"][1]["part_id"] = duplicated["part_reviews"][0]["part_id"]
+        transition = advance(CampaignSnapshot.from_mapping(duplicated), self.input)
+        self.assertEqual(transition.decision, "blocked")
+        self.assertEqual(transition.reason, "input_mismatch")
+        self.assertIn("duplicate", transition.findings[0])
+
+        missing = copy.deepcopy(self.campaign)
+        missing["part_reviews"].pop()
+        transition = advance(CampaignSnapshot.from_mapping(missing), self.input)
+        self.assertEqual(transition.decision, "blocked")
+        self.assertEqual(transition.reason, "input_mismatch")
+        self.assertIn("exactly match", transition.findings[0])
+
+    def test_campaign_input_rejects_duplicate_part_ids(self):
+        duplicate = CampaignPart("part-000001", self.first.segments)
+        with self.assertRaisesRegex(ValueError, "must be unique"):
+            CampaignInput(**{**self.input.__dict__, "parts": (self.first, duplicate)})
 
     def test_input_mismatch_is_blocked_without_snapshot_mutation(self):
         changed_input = CampaignInput(

@@ -6,26 +6,17 @@ import hashlib
 import copy
 import json
 import re
-import uuid
 from collections import Counter
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-import claude_reviewer
-
 from workflow.review_models import (
-    CampaignInput, CampaignSnapshot, CampaignTransition, PreviousResult,
     ReviewCampaignError, ReviewDiff, ReviewSegment,
 )
-from workflow.review_campaign import (
-    advance as _advance_review_campaign,
-    block_campaign_for_authorization as _block_campaign_for_authorization,
-    create_campaign_snapshot as _create_campaign_snapshot,
-    make_campaign_input as _make_campaign_input,
-    sync_campaign_coverage as _sync_campaign_coverage,
-)
+from workflow.review_campaign import sync_campaign_coverage as _sync_campaign_coverage
+from workflow.review_text import MAX_REVIEW_PAYLOAD_ENV
 from workflow.review_requests import (
     format_context_prompt as _format_context_prompt, part_coverage as _part_coverage,
     redact_review_text as _review_redact,
@@ -52,7 +43,7 @@ from workflow.review_validation import (
 
 
 
-CLAUDE_MAX_PAYLOAD_ENV = claude_reviewer.MAX_REVIEW_PAYLOAD_ENV
+CLAUDE_MAX_PAYLOAD_ENV = MAX_REVIEW_PAYLOAD_ENV
 
 
 
@@ -141,28 +132,12 @@ correction stage; Should fix and Optional improvements must be reasoned about an
 explicitly identifies an acceptance-blocking defect."""
 
 class ReviewCampaign:
-    """Compatibility runner for campaign persistence and provider callbacks.
-
-    Deterministic requests, validation, coverage, and snapshot transitions live in
-    the dedicated pure review modules. This adapter retains the current workflow
-    save and provider ordering until the Coordinator recovery extraction phase.
-    """
+    """Compatibility helpers for deterministic review construction and recovery."""
 
     def __init__(
         self,
-        state: dict,
-        *,
-        save_state: Callable[[], None] | None = None,
-        request_review: Callable[..., tuple[str, dict]] | None = None,
-        authorized_call_limit: int | None = None,
-        authorize_call_count: Callable[[int], bool] | None = None,
         trace_span: Callable[[str, dict], object] | None = None,
     ):
-        self.state = state
-        self._save = save_state
-        self._call_claude = request_review
-        self.authorized_call_limit = authorized_call_limit
-        self._authorize_call_count_callback = authorize_call_count
         self._trace_span_callback = trace_span
 
     def _trace_context(self, name: str, metadata: dict):
@@ -172,19 +147,6 @@ class ReviewCampaign:
             return self._trace_span_callback(name, metadata)
         except Exception:
             return nullcontext()
-
-    def _authorize_call_count(self, required_calls: int) -> bool:
-        if self._authorize_call_count_callback is None:
-            raise ReviewCampaignError("Review campaign authorization was not supplied by the workflow coordinator.")
-        return self._authorize_call_count_callback(required_calls)
-
-    def _require_save(self) -> None:
-        if self._save is None:
-            raise ReviewCampaignError("Review campaign persistence was not supplied by the workflow coordinator.")
-
-    def _require_review_call(self) -> None:
-        if self._call_claude is None:
-            raise ReviewCampaignError("Claude review execution was not supplied by the workflow coordinator.")
 
     @staticmethod
     def _code_review_header() -> str:
@@ -204,37 +166,9 @@ class ReviewCampaign:
     def _part_coverage(segments: list[ReviewSegment], *, excluded_count: int) -> str:
         return _part_coverage(segments, excluded_count=excluded_count)
 
-    def _part_sections(
-        self, shared: dict[str, str], segments: list[ReviewSegment], *, campaign_id: str,
-        part_id: str, excluded_count: int,
-    ) -> dict[str, str]:
-        return part_sections(
-            shared, segments, campaign_id=campaign_id, part_id=part_id,
-            proposal_version=self.state.get("proposal_version", 1), excluded_count=excluded_count,
-        )
-
     @staticmethod
     def _serialized_review_fits(header: str, sections: dict[str, str], limit: int) -> bool:
         return serialized_review_fits(header, sections, limit)
-
-    def _split_oversized_segment(
-        self, path: str, patch: str, *, shared: dict[str, str], campaign_id: str,
-        limit: int, excluded_count: int, header: str | None = None,
-    ) -> list[ReviewSegment]:
-        return _split_oversized_segment(
-            path, patch, shared=shared, campaign_id=campaign_id,
-            proposal_version=self.state.get("proposal_version", 1), limit=limit,
-            excluded_count=excluded_count, header=header,
-        )
-
-    def _partition_review_segments(
-        self, review_diff: ReviewDiff, shared: dict[str, str], *, campaign_id: str,
-        limit: int, header: str | None = None,
-    ) -> tuple[list[dict], bool]:
-        return _partition_review_segments(
-            review_diff, shared, campaign_id=campaign_id,
-            proposal_version=self.state.get("proposal_version", 1), limit=limit, header=header,
-        )
 
     @staticmethod
     def _validate_review_partition(review_diff: ReviewDiff, parts: list[dict]) -> None:
@@ -250,143 +184,6 @@ class ReviewCampaign:
     def _campaign_part_manifest(parts: list[dict]) -> list[dict]:
         return _campaign_part_manifest(parts)
 
-    def _prepare_review_campaign(self, review_diff: ReviewDiff, shared: dict[str, str]) -> tuple[dict, dict[str, str], list[dict]]:
-        existing = self.state.get("review_campaign")
-        authorization_limit = self.authorized_call_limit
-        campaign_limit = None
-        if existing:
-            campaign_id = existing["campaign_id"]
-            partition_limit = existing.get(
-                "partition_limit_characters", existing["payload_limit_characters"],
-            )
-            campaign_limit = existing["payload_limit_characters"]
-            try:
-                current_limit = claude_reviewer.max_review_payload_chars()
-            except claude_reviewer.ReviewError as exc:
-                raise ReviewCampaignError(str(exc)) from exc
-            if current_limit < campaign_limit:
-                raise ReviewCampaignError(
-                    f"Current {CLAUDE_MAX_PAYLOAD_ENV} limit ({current_limit}) is below the saved review "
-                    f"campaign limit ({campaign_limit}); restore the saved limit to resume safely."
-                )
-            limit = partition_limit
-        else:
-            try:
-                limit = claude_reviewer.max_review_payload_chars()
-            except claude_reviewer.ReviewError as exc:
-                raise ReviewCampaignError(str(exc)) from exc
-            campaign_id = uuid.uuid4().hex
-
-        saved_headers = [
-            context.get("header_id") for context in self.state.get("claude_contexts", [])
-            if context.get("stage") == "code_review"
-            and context.get("campaign_id") == campaign_id
-            and context.get("review_kind") == "part"
-        ]
-        legacy_campaign = bool(existing) and (
-            existing.get("header_id") == "code-review-part-v1"
-            or (not existing.get("header_id") and "code-review-part-v1" in saved_headers)
-        )
-        review_header = self._legacy_code_review_header() if legacy_campaign else self._code_review_header()
-        shared_hash = _review_patch_sha256(_format_context_prompt(
-            _review_redact(review_header),
-            {name: _review_redact(value).strip() for name, value in shared.items()},
-        ))
-        source_hash = self._campaign_source_hash(review_diff)
-        try:
-            parts, multipart = self._partition_review_segments(
-                review_diff, shared, campaign_id=campaign_id, limit=limit, header=review_header,
-            )
-        except ReviewCampaignError as exc:
-            if not existing:
-                self.state["review_included_files"] = list(review_diff.included_paths)
-                self.state["review_exclusions"] = [
-                    {"path": _safe_review_path(path), "reason": reason}
-                    for path, reason in review_diff.excluded_files
-                ]
-                self.state["review_files_not_reviewed"] = [
-                    {"path": path, "reason": _review_redact(str(exc))}
-                    for path in review_diff.included_paths
-                ]
-                self.state["review_partition_failure"] = {
-                    "campaign_id": campaign_id,
-                    "source_patch_sha256": source_hash,
-                    "shared_context_sha256": shared_hash,
-                    "payload_limit_characters": limit,
-                    "error": _review_redact(str(exc)),
-                }
-                self.state["review_campaign_id"] = campaign_id
-                self._require_save()
-                self._save()
-            raise
-        part_manifest = self._campaign_part_manifest(parts)
-        if existing:
-            if (existing.get("source_patch_sha256") != source_hash
-                    or existing.get("shared_context_sha256") != shared_hash
-                    or existing.get("parts") != part_manifest):
-                raise ReviewCampaignError(
-                    "The target diff, shared review context, or partition changed after the review campaign began. "
-                    "No remaining review calls were made; start a newly authorized workflow for the changed review."
-                )
-            if current_limit > campaign_limit:
-                existing["payload_limit_history"] = existing.get("payload_limit_history", []) + [
-                    {"characters": current_limit, "updated_at": _review_now()},
-                ]
-                existing["payload_limit_characters"] = current_limit
-                self._require_save()
-                self._save()
-            if not self._authorize_call_count(existing.get("required_calls", 0)):
-                raise ReviewCampaignError(
-                    f"This saved review campaign requires {existing.get('required_calls')} Claude calls, but its "
-                    f"persisted authorization allows {authorization_limit}. "
-                    "The existing authorization was not expanded."
-                )
-            return existing, shared, parts
-
-        required_calls = len(parts) + (1 if multipart else 0)
-        authorization_limit = self.authorized_call_limit
-        campaign = _create_campaign_snapshot(
-            campaign_id=campaign_id,
-            created_at=_review_now(),
-            payload_limit_characters=limit,
-            source_patch_sha256=source_hash,
-            shared_context_sha256=shared_hash,
-            required_calls=required_calls,
-            authorized_call_limit=authorization_limit,
-            parts=part_manifest,
-            integration_required=multipart,
-            included_paths=review_diff.included_paths,
-            excluded_files=review_diff.excluded_files,
-            report_contract_version=PART_REVIEW_VALIDATOR_VERSION,
-        )
-        self.state["review_campaign"] = campaign
-        self.state["review_campaign_id"] = campaign_id
-        self.state["review_shared_context_sha256"] = shared_hash
-        self.state["review_included_files"] = list(review_diff.included_paths)
-        self.state["review_exclusions"] = campaign["excluded_files"]
-        self.state["review_files_not_reviewed"] = campaign["files_not_reviewed"]
-        self.state.pop("review_partition_failure", None)
-        self._require_save()
-        self._save()
-        if not self._authorize_call_count(required_calls):
-            campaign.update(_block_campaign_for_authorization(campaign, review_diff.included_paths))
-            self._require_save()
-            self._save()
-            raise ReviewCampaignError(
-                f"This review requires {required_calls} Claude calls (parts plus integration), but this workflow "
-                f"authorizes {authorization_limit}. Existing authorization was not expanded."
-            )
-        campaign["status"] = "in_progress"
-        self._require_save()
-        self._save()
-        return campaign, shared, parts
-
-    def _sync_review_coverage(self, campaign: dict, review_diff: ReviewDiff) -> None:
-        updated = _sync_campaign_coverage(campaign, review_diff.excluded_files)
-        campaign.clear()
-        campaign.update(updated)
-        self.state["review_files_not_reviewed"] = campaign["files_not_reviewed"]
-
     @staticmethod
     def _part_report_validation(report: str, part_id: str, segments: list[ReviewSegment]) -> dict:
         return parse_part_review_report(report, part_id, segments)
@@ -399,268 +196,6 @@ class ReviewCampaign:
     def _integration_report_is_structured(report: str) -> bool:
         return _integration_report_is_structured(report)
 
-    def _run_review_campaign(
-        self, campaign: dict, shared: dict[str, str], parts: list[dict], review_diff: ReviewDiff,
-    ) -> str:
-        campaign["status"] = "in_progress"
-        self._sync_review_coverage(campaign, review_diff)
-        self._require_save()
-        self._save()
-
-        def campaign_input() -> CampaignInput:
-            return _make_campaign_input(
-                campaign, shared, parts, review_diff.excluded_files,
-                proposal_version=self.state.get("proposal_version", 1), transition_at=_review_now(),
-            )
-
-        snapshot = CampaignSnapshot.from_mapping(campaign)
-
-        def accept(transition: CampaignTransition, *, save: bool) -> None:
-            nonlocal snapshot
-            campaign.clear()
-            campaign.update(transition.snapshot.to_mapping())
-            snapshot = transition.snapshot
-            self.state["review_files_not_reviewed"] = campaign.get("files_not_reviewed", [])
-            if save:
-                self._require_save()
-                self._save()
-
-        transition = _advance_review_campaign(snapshot, campaign_input())
-        if transition.decision == "blocked":
-            raise ReviewCampaignError("; ".join(transition.findings) or "Review campaign transition is blocked.")
-        if transition.snapshot != snapshot:
-            accept(transition, save=True)
-        part_indexes = {part["part_id"]: index for index, part in enumerate(parts, start=1)}
-
-        while transition.decision == "request_part":
-            request = transition.request
-            if request is None or transition.part_id is None:
-                raise ReviewCampaignError("Review campaign requested a part without a request value.")
-            part = next(item for item in parts if item["part_id"] == transition.part_id)
-            record = next(item for item in campaign["part_reviews"] if item["part_id"] == transition.part_id)
-            recoverable = next((
-                context for context in reversed(self.state.get("claude_contexts", []))
-                if context.get("campaign_id") == campaign["campaign_id"]
-                and context.get("part_id") == part["part_id"]
-                and context.get("call_state") == "completed"
-                and context.get("report") is not None
-                and not any(call.get("prompt_sha256") == context.get("prompt_sha256")
-                            for call in record.get("calls", []))
-            ), None)
-            if recoverable is not None:
-                transition = _advance_review_campaign(snapshot, campaign_input(), PreviousResult(
-                    part_id=part["part_id"],
-                    outcome="completed",
-                    call_state=recoverable["call_state"],
-                    report=recoverable["report"],
-                    prompt_sha256=recoverable.get("prompt_sha256"),
-                    cost_usd=recoverable.get("cost_usd"),
-                    campaign_call_number=recoverable.get("campaign_call_number"),
-                    received_at=_review_now(), recovered=True,
-                ))
-                accept(transition, save=True)
-                if transition.decision == "blocked":
-                    raise ReviewCampaignError(
-                        f"Persisted Claude report for {part['part_id']} is invalid: "
-                        + "; ".join(transition.findings)
-                    )
-                transition = _advance_review_campaign(snapshot, campaign_input())
-                if transition.decision == "blocked":
-                    raise ReviewCampaignError("; ".join(transition.findings) or "Review campaign transition is blocked.")
-                if transition.snapshot != snapshot:
-                    accept(transition, save=True)
-                continue
-
-            retry_count = len(record.get("calls", [])) if isinstance(record.get("calls", []), list) else 0
-            part_trace = self._trace_context("review.part.provider_call", {
-                "review_part_index": part_indexes[part["part_id"]],
-                "review_part_count": len(parts),
-                "retry_count": retry_count,
-            })
-            try:
-                self._require_review_call()
-                with part_trace:
-                    report, manifest = self._call_claude(
-                        request.header, "code_review", request.section_mapping(),
-                        metadata={
-                            "proposal_version": self.state.get("proposal_version", 1),
-                            "header_id": "code-review-part-v2",
-                            "review_kind": "part",
-                            "campaign_id": campaign["campaign_id"],
-                            "part_id": part["part_id"],
-                            "retry_count": retry_count,
-                            "shared_context_sha256": campaign["shared_context_sha256"],
-                            "part_patch_sha256": request.part_patch_sha256,
-                            "payload_limit_chars": campaign["payload_limit_characters"],
-                            "included_files": sorted({segment.path for segment in part["segments"]}),
-                            "excluded_files": campaign["excluded_files"],
-                        },
-                    )
-            except Exception:
-                context = next((
-                    item for item in reversed(self.state.get("claude_contexts", []))
-                    if item.get("campaign_id") == campaign["campaign_id"]
-                    and item.get("part_id") == part["part_id"]
-                ), None)
-                if context is not None and not any(
-                        call.get("prompt_sha256") == context.get("prompt_sha256") for call in record["calls"]):
-                    record["calls"].append({
-                        "prompt_sha256": context.get("prompt_sha256"), "cost_usd": context.get("cost_usd"),
-                        "call_state": context.get("call_state"),
-                        "campaign_call_number": context.get("campaign_call_number"),
-                    })
-                if context is not None and context.get("call_state") == "completed" and context.get("report"):
-                    record["report"] = context["report"]
-                    record["context_sha256"] = context.get("prompt_sha256")
-                    record["status"] = "report_saved"
-                else:
-                    record["status"] = "call_failed"
-                record["segments"] = self._campaign_part_manifest([part])[0]["segments"]
-                self._sync_review_coverage(campaign, review_diff)
-                self._require_save()
-                self._save()
-                raise
-            transition = _advance_review_campaign(snapshot, campaign_input(), PreviousResult(
-                part_id=part["part_id"], outcome="completed",
-                call_state=manifest["call_state"], report=report,
-                prompt_sha256=manifest["prompt_sha256"], cost_usd=manifest.get("cost_usd"),
-                campaign_call_number=manifest.get("campaign_call_number"), received_at=_review_now(),
-            ))
-            accept(transition, save=True)
-            if hasattr(part_trace, "update"):
-                updated_part = next(
-                    item for item in campaign["part_reviews"] if item["part_id"] == part["part_id"]
-                )
-                part_trace.update(review_result=updated_part["status"])
-            if transition.decision == "blocked":
-                raise ReviewCampaignError(
-                    f"Claude report for {part['part_id']} is invalid: "
-                    + "; ".join(transition.findings)
-                    + ". The report remains preserved and the part is unreviewed."
-                )
-            transition = _advance_review_campaign(snapshot, campaign_input())
-            if transition.decision == "blocked":
-                raise ReviewCampaignError("; ".join(transition.findings) or "Review campaign transition is blocked.")
-            if transition.snapshot != snapshot:
-                accept(transition, save=True)
-
-        if transition.decision == "blocked":
-            if transition.reason == "coverage_incomplete" and len(parts) == 1:
-                raise ReviewCampaignError(
-                    "The single-part review cannot complete while changed files remain unreviewed."
-                )
-            raise ReviewCampaignError(
-                "; ".join(transition.findings) or "The review campaign cannot complete while required work remains."
-            )
-
-        if transition.decision == "request_integration":
-            request = transition.request
-            if request is None:
-                raise ReviewCampaignError("Review campaign requested integration without a request value.")
-            integration = campaign["integration_review"]
-            recoverable = next((
-                context for context in reversed(self.state.get("claude_contexts", []))
-                if context.get("campaign_id") == campaign["campaign_id"]
-                and context.get("part_id") == "integration"
-                and context.get("call_state") == "completed"
-                and context.get("report") is not None
-                and not any(call.get("prompt_sha256") == context.get("prompt_sha256")
-                            for call in integration.get("calls", []))
-            ), None)
-            if recoverable is not None:
-                transition = _advance_review_campaign(snapshot, campaign_input(), PreviousResult(
-                    part_id="integration", outcome="completed", call_state=recoverable["call_state"],
-                    report=recoverable["report"], prompt_sha256=recoverable.get("prompt_sha256"),
-                    cost_usd=recoverable.get("cost_usd"),
-                    campaign_call_number=recoverable.get("campaign_call_number"),
-                    received_at=_review_now(), recovered=True,
-                ))
-                accept(transition, save=True)
-                if transition.decision == "blocked":
-                    raise ReviewCampaignError("Persisted Claude integration output is not a complete structured report.")
-            else:
-                retry_count = len(integration.get("calls", [])) if isinstance(integration.get("calls", []), list) else 0
-                integration_trace = self._trace_context("review.integration.provider_call", {
-                    "review_part_count": len(parts),
-                    "retry_count": retry_count,
-                })
-                try:
-                    self._require_review_call()
-                    with integration_trace:
-                        report, manifest = self._call_claude(
-                            request.header, "code_review", request.section_mapping(),
-                            metadata={
-                                "proposal_version": self.state.get("proposal_version", 1),
-                                "header_id": "code-review-integration-v1",
-                                "review_kind": "integration",
-                                "campaign_id": campaign["campaign_id"],
-                                "part_id": "integration",
-                                "retry_count": retry_count,
-                                "shared_context_sha256": campaign["shared_context_sha256"],
-                                "payload_limit_chars": campaign["payload_limit_characters"],
-                                "included_files": campaign["files_reviewed"],
-                                "excluded_files": campaign["excluded_files"],
-                            },
-                        )
-                except Exception:
-                    context = next((
-                        item for item in reversed(self.state.get("claude_contexts", []))
-                        if item.get("campaign_id") == campaign["campaign_id"]
-                        and item.get("part_id") == "integration"
-                    ), None)
-                    if context is not None and not any(
-                            call.get("prompt_sha256") == context.get("prompt_sha256")
-                            for call in integration["calls"]):
-                        integration["calls"].append({
-                            "prompt_sha256": context.get("prompt_sha256"), "cost_usd": context.get("cost_usd"),
-                            "call_state": context.get("call_state"),
-                            "campaign_call_number": context.get("campaign_call_number"),
-                        })
-                    if context is not None and context.get("call_state") == "completed" and context.get("report"):
-                        integration["report"] = context["report"]
-                        integration["context_sha256"] = context.get("prompt_sha256")
-                        integration["status"] = "report_saved"
-                    else:
-                        integration["status"] = "call_failed"
-                    self._require_save()
-                    self._save()
-                    raise
-                transition = _advance_review_campaign(snapshot, campaign_input(), PreviousResult(
-                    part_id="integration", outcome="completed",
-                    call_state=manifest["call_state"], report=report,
-                    prompt_sha256=manifest["prompt_sha256"], cost_usd=manifest.get("cost_usd"),
-                    campaign_call_number=manifest.get("campaign_call_number"), received_at=_review_now(),
-                ))
-                accept(transition, save=True)
-                if hasattr(integration_trace, "update"):
-                    integration_trace.update(review_result=campaign["integration_review"]["status"])
-                if transition.decision == "blocked":
-                    raise ReviewCampaignError(
-                        "Claude returned an incomplete integration report; campaign remains incomplete."
-                    )
-
-        if transition.decision != "complete":
-            raise ReviewCampaignError("The review campaign cannot complete while required work remains.")
-        if campaign["files_not_reviewed"] or any(
-                item["status"] != "reviewed" for item in campaign["part_reviews"]
-        ):
-            raise ReviewCampaignError("The review campaign cannot complete while any required part remains unreviewed.")
-        if len(parts) == 1:
-            self.state["review_campaign_call_count"] = sum(
-                call.get("call_state") != "validation_failed"
-                for call in campaign["part_reviews"][0].get("calls", [])
-            )
-        else:
-            self.state["review_campaign_call_count"] = sum(
-                sum(call.get("call_state") != "validation_failed" for call in record.get("calls", []))
-                for record in campaign["part_reviews"]
-            ) + sum(
-                call.get("call_state") != "validation_failed"
-                for call in campaign["integration_review"].get("calls", [])
-            )
-        self._require_save()
-        self._save()
-        return campaign["consolidated_report"]
 
 def recover_review_campaign(
     state: dict,
@@ -756,8 +291,9 @@ def recover_review_campaign(
                 if expected_calls != saved_calls:
                     errors.append(f"{part_id} campaign call metadata does not preserve each saved provider attempt")
             continue
-        sections = ReviewCampaign(state)._part_sections(
+        sections = part_sections(
             shared, part["segments"], campaign_id=campaign["campaign_id"], part_id=part_id,
+            proposal_version=state.get("proposal_version", 1),
             excluded_count=len(review_diff.excluded_files),
         )
         safe_header = _review_redact(header)
@@ -928,7 +464,10 @@ def recover_review_campaign(
             "source_patch_sha256": source_hash,
         })
 
-        ReviewCampaign(proposed)._sync_review_coverage(proposed_campaign, review_diff)
+        updated_campaign = _sync_campaign_coverage(proposed_campaign, review_diff.excluded_files)
+        proposed_campaign.clear()
+        proposed_campaign.update(updated_campaign)
+        proposed["review_files_not_reviewed"] = proposed_campaign["files_not_reviewed"]
     all_parts_reviewed = all(item.get("status") == "reviewed"
                              for item in proposed_campaign.get("part_reviews", []))
     full_coverage = not proposed_campaign.get("files_not_reviewed")

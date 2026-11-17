@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 
 from workflow.review_models import (
@@ -190,6 +191,24 @@ def _validate_snapshot(snapshot: dict, campaign_input: CampaignInput) -> str | N
     if (snapshot.get("payload_limit_characters") is not None
             and snapshot.get("payload_limit_characters") != campaign_input.payload_limit_characters):
         return "campaign payload limit does not match the immutable campaign input"
+    checkpoints = snapshot.get("part_reviews")
+    if not isinstance(checkpoints, list):
+        return "campaign part checkpoints must be a list"
+    checkpoint_ids = [
+        item.get("part_id") for item in checkpoints if isinstance(item, dict)
+    ]
+    if len(checkpoint_ids) != len(checkpoints) or any(
+        not isinstance(part_id, str) or not part_id.strip() for part_id in checkpoint_ids
+    ):
+        return "campaign contains a malformed part checkpoint"
+    if len(checkpoint_ids) != len(set(checkpoint_ids)):
+        return "campaign contains duplicate part checkpoint IDs"
+    expected_ids = [part.part_id for part in campaign_input.parts]
+    if len(checkpoint_ids) != len(expected_ids) or set(checkpoint_ids) != set(expected_ids):
+        return "campaign part checkpoints do not exactly match the immutable part manifest"
+    integration = snapshot.get("integration_review")
+    if not isinstance(integration, dict):
+        return "campaign integration checkpoint must be an object"
     return None
 
 
@@ -202,7 +221,24 @@ def _append_call(record: dict, result: PreviousResult) -> None:
     })
 
 
-def _apply_result(campaign: dict, campaign_input: CampaignInput, result: PreviousResult) -> tuple[str | None, tuple[str, ...]]:
+def _apply_result(
+    campaign: dict, campaign_input: CampaignInput, result: PreviousResult,
+    expected_identity,
+) -> tuple[str | None, tuple[str, ...]]:
+    if result.request_identity != expected_identity:
+        return "invalid_result", ("provider result identity does not match the outstanding review request",)
+    if result.part_id != expected_identity.part_id:
+        return "invalid_result", ("provider result part ID does not match its request identity",)
+    if not result.recovered and result.prompt_sha256 != expected_identity.prompt_sha256:
+        return "invalid_result", ("provider result prompt hash does not match its request identity",)
+    if not result.recovered and (not isinstance(result.operation_id, str) or not result.operation_id):
+        return "invalid_result", ("provider result has no execution operation identity",)
+    if result.outcome == "completed":
+        if result.call_state != "completed" or not isinstance(result.report, str):
+            return "invalid_result", ("completed provider result has no terminal report",)
+        report_hash = hashlib.sha256(result.report.encode("utf-8")).hexdigest()
+        if result.result_sha256 != report_hash:
+            return "invalid_result", ("provider result hash does not match its report",)
     if result.outcome == "uncertain":
         return "uncertain_result", ("provider outcome is uncertain; the capability cannot authorize a replay",)
     if result.part_id == "integration":
@@ -294,7 +330,13 @@ def advance(
         return CampaignTransition(snapshot, "blocked", reason="input_mismatch", findings=(mismatch,))
 
     if previous_result is not None:
-        reason, findings = _apply_result(campaign, campaign_input, previous_result)
+        expected = _outstanding_request(campaign, campaign_input)
+        if expected is None:
+            return CampaignTransition(
+                snapshot, "blocked", reason="invalid_result",
+                findings=("campaign has no outstanding request for the provider result",),
+            )
+        reason, findings = _apply_result(campaign, campaign_input, previous_result, expected.identity)
         if reason == "uncertain_result":
             return CampaignTransition(snapshot, "blocked", reason=reason, findings=findings)
         if reason == "invalid_result":
@@ -358,3 +400,37 @@ def advance(
         shared_context_sha256=campaign_input.shared_context_sha256,
     )
     return CampaignTransition(snapshot, "request_integration", request=request, part_id="integration")
+
+
+def _outstanding_request(campaign: dict, campaign_input: CampaignInput):
+    """Reconstruct the one request a result is permitted to answer."""
+    checkpoint_by_id = {item["part_id"]: item for item in campaign.get("part_reviews", [])}
+    for part in campaign_input.parts:
+        record = checkpoint_by_id[part.part_id]
+        if record.get("status") == "reviewed":
+            continue
+        return build_part_request(
+            campaign_id=campaign_input.campaign_id, part=part, purpose=campaign_input.purpose,
+            proposal_version=campaign_input.proposal_version,
+            payload_limit_characters=campaign_input.payload_limit_characters,
+            report_contract_version=campaign_input.report_contract_version,
+            source_patch_sha256=campaign_input.source_patch_sha256,
+            shared_context_sha256=campaign_input.shared_context_sha256,
+            shared_context=dict(campaign_input.shared_context),
+            excluded_count=len(campaign_input.excluded_files), header=campaign_input.part_header,
+        )
+    integration = campaign.get("integration_review", {})
+    if (integration.get("required") and integration.get("status") != "reviewed"
+            and not campaign.get("files_not_reviewed")
+            and all(checkpoint_by_id[part.part_id].get("status") == "reviewed"
+                    for part in campaign_input.parts)):
+        return build_integration_request(
+            campaign=campaign, parts=campaign_input.parts,
+            shared_context=dict(campaign_input.shared_context), purpose=campaign_input.purpose,
+            proposal_version=campaign_input.proposal_version,
+            payload_limit_characters=campaign_input.payload_limit_characters,
+            report_contract_version=campaign_input.report_contract_version,
+            source_patch_sha256=campaign_input.source_patch_sha256,
+            shared_context_sha256=campaign_input.shared_context_sha256,
+        )
+    return None

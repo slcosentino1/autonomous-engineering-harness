@@ -6,7 +6,7 @@ import hashlib
 import json
 from collections.abc import Mapping, Sequence
 
-import claude_reviewer
+from workflow import review_text
 
 from workflow.review_models import CampaignPart, ReviewCampaignError, ReviewRequest, ReviewSegment
 
@@ -57,7 +57,7 @@ def integration_review_header() -> str:
 
 
 def redact_review_text(text: str) -> str:
-    return claude_reviewer.redact(text)
+    return review_text.redact(text)
 
 
 def format_context_prompt(header: str, sections: Mapping[str, str]) -> str:
@@ -119,9 +119,9 @@ def serialized_review_fits(header: str, sections: Mapping[str, str], limit: int)
     }
     prompt = format_context_prompt(safe_header, safe_sections)
     try:
-        claude_reviewer.validate_review_invocation(prompt, "aily", limit=limit)
+        review_text.validate_review_invocation(prompt, "aily", limit=limit)
         return True
-    except claude_reviewer.ReviewError as exc:
+    except review_text.ReviewTextError as exc:
         if "above the configured" in str(exc):
             return False
         raise ReviewCampaignError(str(exc)) from exc

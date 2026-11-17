@@ -130,13 +130,13 @@ No provider calls or Harness workflows were executed. Tests use temporary reposi
 
 ## Phase 3B.1 — ReviewCampaign contract and recovery rules
 
-**Status:** Design direction accepted for Phase 3B.2 extraction. The stricter report identity and recovery proposals remain deferred to Phase 3B.3.
+**Status:** Design direction accepted for Phase 3B.2 extraction. The stricter report identity and recovery proposals remain deferred to Phase 3B.4; Phase 3B.3 hardens live execution results only.
 
 See `docs/architecture/phase-3b1-review-campaign-contract.md` for the proposed capability contract, report identity and recovery rules, persistence boundary, transition protocol, test matrix, and decisions requiring approval. No production code, tests, or persisted state formats were changed in Phase 3B.1.
 
 ## Phase 3B.2 — ReviewCampaign pure capability extraction
 
-**Status:** Deterministic review capabilities extracted; workflow lifecycle and recovery remain in the compatibility runner and Orchestrator.
+**Status:** Deterministic review capabilities extracted; at the end of Phase 3B.2, workflow lifecycle and recovery remained in the compatibility runner and Orchestrator.
 
 ### Modules and contracts
 
@@ -165,4 +165,36 @@ See `docs/architecture/phase-3b1-review-campaign-contract.md` for the proposed c
 
 ### Remaining coupling and Phase 3B.3
 
-The current `ReviewCampaign` compatibility runner still receives workflow state and narrow callbacks, and `orchestrator.py` retains compatibility wrappers. Existing context fallback and local recovery still use their current identity checks. Phase 3B.3 owns the Coordinator-side recovery contract, operation-history association, stricter missing-checkpoint identity, and remaining adapter/callback removal. No provider, authorization, budget, operation, persistence, recovery, or workflow-stage policy was changed here.
+At the end of Phase 3B.2, the `ReviewCampaign` compatibility runner still received workflow state and narrow callbacks, and `orchestrator.py` retained compatibility wrappers. Existing context fallback and local recovery still use their current identity checks. Phase 3B.3 moves live campaign orchestration and execution-result association to the Coordinator; strict reconciliation of recovered reports and persisted operation history remains Phase 3B.4 work.
+
+## Phase 3B.3 — Review campaign hardening and Coordinator ownership
+
+**Status:** Implementation complete; final repository validation recorded below.
+
+### Ownership and boundaries
+
+- `Orchestrator` now owns review campaign preparation and execution sequencing, authorization checks, tracing, saves, provider invocation, and live result association. The stateful preparation and execution runner was removed from `workflow/review.py::ReviewCampaign`; its remaining adapter surface is limited to construction/request helpers and local recovery compatibility.
+- `workflow/review_requests.py` now depends on provider-neutral `workflow/review_text.py` for redaction and payload validation. `claude_reviewer` keeps its public wrappers and `ReviewError` behavior by translating the neutral error type at the adapter boundary.
+- `ReviewRequest.identity` is a frozen value containing campaign/part/purpose, proposal version and hash, report contract and header identity, source/shared/part/segment hashes, and the exact prompt hash. `PreviousResult` carries that identity, the execution operation ID, and report hash. Pure `advance()` rejects mismatches without mutating the supplied snapshot.
+- Campaign inputs reject duplicate part IDs. Snapshot validation requires one checkpoint for each manifest ID and accepts checkpoint reordering by stable ID. Manifest construction rejects missing and duplicate IDs before provider work.
+- Before applying a live result, the Coordinator checks returned request metadata, the unique terminal Claude operation, result hash, and the unique linked context record, including its request sections and header hashes. This uses existing state fields and adds no workflow JSON keys.
+
+### Recovery and compatibility boundaries
+
+- Context fallback and local saved-report recovery retain their Phase 3B.2 trust policy. Reconstructing historical requests and joining recovered contexts to operation history are deferred to Phase 3B.4.
+- The persisted campaign/workflow JSON schema is unchanged. No migrations, external provider execution, or Harness workflows were introduced.
+- Prompt construction and the existing redaction patterns remain byte-compatible for valid requests. Approval, budget, authorization, persistence, retry, and recovery ordering remain under the Coordinator's existing policy.
+
+### Files and validation
+
+- Added `harness/workflow/review_text.py`; modified `claude_reviewer.py`, `workflow/review_requests.py`, `workflow/review_models.py`, `workflow/review_partitioning.py`, `workflow/review_campaign.py`, `workflow/review.py`, `orchestrator.py`, `tests/test_review_capability.py`, `tests/test_workflow.py`, and `tests/test_observability.py`.
+- Baseline focused suite — **24 tests passed** before implementation.
+- Focused capability and Coordinator-boundary suites — **20 tests passed**; focused live review, recovery, authorization, retry, budget, and verification regressions also passed.
+- `PYTHONPYCACHEPREFIX=/private/tmp/phase3b3-final-cache python3 -m unittest discover -s tests` — **430 tests passed** in 197.928 seconds.
+- `PYTHONPYCACHEPREFIX=/private/tmp/phase3b3-final-cache python3 -m compileall -q harness tests` — passed.
+- `git diff --check` — passed.
+- No lint or type-check configuration is present in the repository. Tests use fake providers and temporary targets; no real providers or Harness workflow were launched.
+
+### Remaining debt and Phase 3B.4
+
+Saved-context fallback still selects completed reports by campaign and part, then runs current report validation. It does not yet reconstruct the historical prompt or join recovered context IDs against operation history. The Coordinator now rejects mismatches on the live execution path. Phase 3B.4 should characterize and implement strict recovered-report reconciliation without changing the saved workflow schema unless separately approved.
