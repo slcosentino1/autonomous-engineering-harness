@@ -1,0 +1,4 @@
+# Repository-wide ownership. Keep security-sensitive automation under explicit review.
+/* @slcosentino1
+/.github/ @slcosentino1
+/harness/workflow/ @slcosentino1
