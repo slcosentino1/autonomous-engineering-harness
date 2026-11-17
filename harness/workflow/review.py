@@ -197,6 +197,44 @@ class ReviewCampaign:
         return _integration_report_is_structured(report)
 
 
+def reconstruct_campaign_parts(campaign: dict, review_diff: ReviewDiff) -> tuple[list[dict], list[str]]:
+    """Rebuild saved part requests' patch segments from the current diff and manifest."""
+    errors: list[str] = []
+    patch_by_path = dict(review_diff.file_patches)
+    parts: list[dict] = []
+    for saved_part in campaign.get("parts", []):
+        segments: list[ReviewSegment] = []
+        for item in saved_part.get("segments", []):
+            path = item.get("path")
+            patch = patch_by_path.get(path)
+            if patch is None:
+                errors.append(f"saved part {saved_part.get('part_id')} references missing changed path {path!r}")
+                continue
+            lines = patch.splitlines(keepends=True)
+            start, end, count = (item.get("patch_line_start"), item.get("patch_line_end"),
+                                 item.get("patch_line_count"))
+            if (not isinstance(start, int) or isinstance(start, bool)
+                    or not isinstance(end, int) or isinstance(end, bool)
+                    or not isinstance(count, int) or isinstance(count, bool)
+                    or start < 1 or end < start or end > len(lines) or count != len(lines)):
+                errors.append(f"saved patch range is invalid for {path!r}")
+                continue
+            text = "".join(lines[start - 1:end])
+            digest = _review_patch_sha256(text)
+            if digest != item.get("patch_sha256"):
+                errors.append(f"saved patch segment hash no longer matches {path!r}")
+                continue
+            segments.append(ReviewSegment(path, text, start, end, count, digest))
+        parts.append({"part_id": saved_part.get("part_id"), "segments": segments})
+    try:
+        ReviewCampaign._validate_review_partition(review_diff, parts)
+    except ReviewCampaignError as exc:
+        errors.append(str(exc))
+    if ReviewCampaign._campaign_part_manifest(parts) != campaign.get("parts"):
+        errors.append("reconstructed patch partition does not match the saved campaign manifest")
+    return parts, errors
+
+
 def recover_review_campaign(
     state: dict,
     workflow_id: str,
@@ -239,36 +277,8 @@ def recover_review_campaign(
         errors.append("current assignment, proposal, implementation summary, repository context, or review guidance "
                       "does not match the saved shared-context hash")
 
-    patch_by_path = dict(review_diff.file_patches)
-    parts: list[dict] = []
-    for saved_part in campaign.get("parts", []):
-        segments: list[ReviewSegment] = []
-        for item in saved_part.get("segments", []):
-            path = item.get("path")
-            patch = patch_by_path.get(path)
-            if patch is None:
-                errors.append(f"saved part {saved_part.get('part_id')} references missing changed path {path!r}")
-                continue
-            lines = patch.splitlines(keepends=True)
-            start, end, count = (item.get("patch_line_start"), item.get("patch_line_end"),
-                                 item.get("patch_line_count"))
-            if (not isinstance(start, int) or not isinstance(end, int) or not isinstance(count, int)
-                    or start < 1 or end < start or end > len(lines) or count != len(lines)):
-                errors.append(f"saved patch range is invalid for {path!r}")
-                continue
-            text = "".join(lines[start - 1:end])
-            digest = _review_patch_sha256(text)
-            if digest != item.get("patch_sha256"):
-                errors.append(f"saved patch segment hash no longer matches {path!r}")
-                continue
-            segments.append(ReviewSegment(path, text, start, end, count, digest))
-        parts.append({"part_id": saved_part.get("part_id"), "segments": segments})
-    try:
-        ReviewCampaign._validate_review_partition(review_diff, parts)
-    except ReviewCampaignError as exc:
-        errors.append(str(exc))
-    if ReviewCampaign._campaign_part_manifest(parts) != campaign.get("parts"):
-        errors.append("reconstructed patch partition does not match the saved campaign manifest")
+    parts, partition_errors = reconstruct_campaign_parts(campaign, review_diff)
+    errors.extend(partition_errors)
 
     reviews_by_part = {item.get("part_id"): item for item in campaign.get("part_reviews", [])}
     reports_by_part: dict[str, list[dict]] = {}
@@ -276,7 +286,10 @@ def recover_review_campaign(
     for part in parts:
         part_id = part["part_id"]
         record = reviews_by_part.get(part_id)
-        part_contexts = [item for item in context_records if item.get("part_id") == part_id]
+        part_contexts = sorted(
+            (item for item in context_records if item.get("part_id") == part_id),
+            key=lambda item: item.get("campaign_call_number", 0),
+        )
         contexts = [item for item in part_contexts if item.get("call_state") == "completed"]
         if not contexts:
             if record:

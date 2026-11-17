@@ -187,7 +187,8 @@ def build_part_request(
     return _request(
         kind="part", campaign_id=campaign_id, part_id=part.part_id, purpose=purpose,
         proposal_version=proposal_version, payload_limit_characters=payload_limit_characters,
-        report_contract_version=report_contract_version, header_id="code-review-part-v2",
+        report_contract_version=report_contract_version,
+        header_id=("code-review-part-v1" if selected_header == legacy_review_header() else "code-review-part-v2"),
         source_patch_sha256=source_patch_sha256, shared_context_sha256=shared_context_sha256,
         part_patch_sha256=patch_hash, segment_sha256s=tuple(segment.patch_sha256 for segment in part.segments),
         header=selected_header, sections=sections,

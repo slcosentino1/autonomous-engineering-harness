@@ -25,6 +25,7 @@ def make_campaign_input(
     *,
     proposal_version: int,
     transition_at: str,
+    part_header: str | None = None,
 ) -> CampaignInput:
     from workflow.review_requests import review_header
 
@@ -39,7 +40,7 @@ def make_campaign_input(
         payload_limit_characters=campaign.get("payload_limit_characters", 1),
         proposal_version=proposal_version,
         report_contract_version=campaign.get("report_contract_version", PART_REVIEW_VALIDATOR_VERSION),
-        part_header=review_header(),
+        part_header=review_header() if part_header is None else part_header,
         transition_at=transition_at,
     )
 
@@ -212,13 +213,23 @@ def _validate_snapshot(snapshot: dict, campaign_input: CampaignInput) -> str | N
     return None
 
 
-def _append_call(record: dict, result: PreviousResult) -> None:
-    record.setdefault("calls", []).append({
+def _append_call(record: dict, result: PreviousResult) -> bool:
+    call = {
         "prompt_sha256": result.prompt_sha256,
         "cost_usd": result.cost_usd,
         "call_state": result.call_state,
         "campaign_call_number": result.campaign_call_number,
-    })
+    }
+    calls = record.setdefault("calls", [])
+    if result.recovered:
+        same_attempt = [
+            item for item in calls
+            if isinstance(item, dict) and item.get("campaign_call_number") == result.campaign_call_number
+        ]
+        if same_attempt:
+            return len(same_attempt) == 1 and same_attempt[0] == call
+    calls.append(call)
+    return True
 
 
 def _apply_result(
@@ -245,7 +256,8 @@ def _apply_result(
         record = campaign.get("integration_review")
         if not isinstance(record, dict):
             return "invalid_result", ("integration result has no matching campaign record",)
-        _append_call(record, result)
+        if not _append_call(record, result):
+            return "invalid_result", ("recovered integration attempt conflicts with its saved call checkpoint",)
         if result.outcome != "completed" or result.report is None:
             record["status"] = "call_failed"
             return "provider_failed", ()
@@ -260,7 +272,8 @@ def _apply_result(
     record = next((item for item in campaign.get("part_reviews", []) if item.get("part_id") == result.part_id), None)
     if part is None or not isinstance(record, dict):
         return "invalid_result", ("part result does not match the immutable campaign manifest",)
-    _append_call(record, result)
+    if not _append_call(record, result):
+        return "invalid_result", ("recovered part attempt conflicts with its saved call checkpoint",)
     if result.outcome != "completed" or result.report is None:
         record["status"] = "call_failed"
         record["segments"] = campaign_part_manifest([{"part_id": part.part_id, "segments": list(part.segments)}])[0]["segments"]

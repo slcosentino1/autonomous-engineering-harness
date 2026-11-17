@@ -181,7 +181,7 @@ At the end of Phase 3B.2, the `ReviewCampaign` compatibility runner still receiv
 
 ### Recovery and compatibility boundaries
 
-- Context fallback and local saved-report recovery retain their Phase 3B.2 trust policy. Reconstructing historical requests and joining recovered contexts to operation history are deferred to Phase 3B.4.
+- At the end of Phase 3B.3, context fallback and local saved-report recovery still retained their Phase 3B.2 trust policy; reconstructing historical requests and joining recovered contexts to operation history remained for Phase 3B.4.
 - The persisted campaign/workflow JSON schema is unchanged. No migrations, external provider execution, or Harness workflows were introduced.
 - Prompt construction and the existing redaction patterns remain byte-compatible for valid requests. Approval, budget, authorization, persistence, retry, and recovery ordering remain under the Coordinator's existing policy.
 
@@ -197,4 +197,41 @@ At the end of Phase 3B.2, the `ReviewCampaign` compatibility runner still receiv
 
 ### Remaining debt and Phase 3B.4
 
-Saved-context fallback still selects completed reports by campaign and part, then runs current report validation. It does not yet reconstruct the historical prompt or join recovered context IDs against operation history. The Coordinator now rejects mismatches on the live execution path. Phase 3B.4 should characterize and implement strict recovered-report reconciliation without changing the saved workflow schema unless separately approved.
+Phase 3B.4 closes the saved-context gap by reconstructing historical requests and joining recovered contexts to operation history in the Coordinator without changing the workflow schema.
+
+## Phase 3B.4 — Review campaign recovery and reconciliation
+
+**Status:** Implementation complete.
+
+### Coordinator reconciliation
+
+- Before any ReviewCampaign transition, `Orchestrator` reconstructs each part request from the current campaign inputs and existing `review_requests` builders. It reconstructs the integration request only after every part checkpoint is reviewed.
+- Every saved attempt is joined by campaign/part/kind and exact prompt hash to its Claude context and operation. The join requires unique operation IDs and context indexes, matching proposal version and purpose, matching call numbers, consistent terminal state, and the report SHA-256 recorded by the operation.
+- Completed contexts are checked against the reconstructed request sections, header, payload metadata and report. A checkpoint report must equal a report from its completed operation and carry the reconstructed prompt hash. `reviewed` checkpoints also have their report structure checked again.
+- A single completed operation/context can be recovered when the campaign call or report checkpoint is missing, after the attempt is uniquely reconciled. Multiple uncheckpointed results, missing history, missing contexts, duplicate IDs, mismatched reports, or a conflicting checkpoint stop recovery with a diagnostic. Checkpoint ordering remains keyed by part ID.
+- The local `recover-review` path runs the same Coordinator reconciliation before the existing pure report-revalidation capability. Patch segments are reconstructed by a shared helper, and prompt content continues to come from the existing request builders.
+
+### Uncertain calls and compatibility
+
+- An uncertain provider operation still cannot be replayed by ordinary resume. Explicit Claude retry continues to require verified cost and confirmation that the prior provider is inactive; it retains the original operation and starts a new operation ID.
+- When that explicit retry resolves an interrupted code-review call, the Coordinator records its verified cost and attempt identity in the existing campaign call checkpoint. This lets the next resume distinguish the reconciled old attempt from the new attempt without adding workflow JSON fields.
+- The workflow JSON schema is unchanged. Existing prompt builders, approval checks, budget limits, persistence ordering, and lock behavior remain in place. Historical part header v1 requests can be reconstructed from their saved header identity.
+
+### Validation
+
+- Baseline recovery/retry selection before implementation — **6 tests passed**.
+- Focused final recovery batch for missing report/campaign checkpoints and saved part/integration recovery — **4 tests passed**. Additional identity, explicit retry, safe not-started retry, and local-recovery regression batches also passed.
+- `PYTHONPYCACHEPREFIX=/private/tmp/phase3b4-final-cache python3 -m unittest discover -s tests` — **438 tests passed** in 223.499 seconds.
+- `PYTHONPYCACHEPREFIX=/private/tmp/phase3b4-final-cache python3 -m compileall -q harness tests` — passed after implementation.
+- `git diff --check` — passed.
+- No lint or type-check configuration is present in the repository. Tests use fake providers and temporary targets; no real Claude/Aily calls or Harness workflows were launched.
+- No persisted workflow keys or migrations were added. Existing prompt generation remains byte-compatible for current v2 requests; legacy v1 part headers can be reconstructed. Approval, budget, persistence and lock behavior remain under Coordinator ownership.
+- No commit or push was made.
+
+### Remaining risks and review recommendation
+
+- A provider operation that may have launched but has no terminal result remains uncertain. The operator must verify final spend and confirm the provider is inactive before authorizing a retry; that retry uses a fresh operation ID and may repeat paid work.
+- If required operation history has been pruned, or a saved operation/context/report chain is inconsistent, recovery fails closed. Local evidence cannot prove exactly-once execution or recover a result that was never persisted.
+- The modular monolith still relies on the persisted workflow JSON as its local source of truth; a coordinated loss of the operation, context and checkpoint records cannot be distinguished from an operation that was never created.
+
+The Review Campaign recovery work is ready for a global architectural review, with the stated external-operation uncertainty and evidence-loss limits made explicit.

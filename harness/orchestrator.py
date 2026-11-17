@@ -86,6 +86,7 @@ from workflow.review import (
     parse_part_review_report,
     render_review_feedback,
     recover_review_campaign as _recover_review_campaign,
+    reconstruct_campaign_parts as _reconstruct_campaign_parts,
 )
 from workflow.review_input import (
     KNOWN_BINARY_SIGNATURES,
@@ -1494,6 +1495,86 @@ class Orchestrator:
                     raise WorkflowError(
                         "Verified Claude recovery cost exceeds the active call cap or remaining workflow budget."
                     )
+                if operation.get("stage") == "code_review":
+                    history_matches = [
+                        item for item in self.state.get("operation_history", [])
+                        if isinstance(item, dict) and item.get("operation_id") == operation.get("operation_id")
+                    ]
+                    contexts = self.state.get("claude_contexts", [])
+                    linked_contexts = [
+                        item for item in contexts
+                        if isinstance(item, dict) and item.get("operation_id") == operation.get("operation_id")
+                    ]
+                    if len(history_matches) != 1 or len(linked_contexts) != 1:
+                        raise WorkflowError(
+                            "Claude review retry cannot be reconciled to one saved operation and context; leave recovery blocked."
+                        )
+                    context = linked_contexts[0]
+                    context_index = operation.get("context_index")
+                    if (isinstance(context_index, bool) or not isinstance(context_index, int)
+                            or context_index < 0 or context_index >= len(contexts)
+                            or contexts[context_index] is not context):
+                        raise WorkflowError(
+                            "Claude review retry context index is inconsistent; leave recovery blocked."
+                        )
+                    campaign = self.state.get("review_campaign")
+                    if (not isinstance(campaign, dict)
+                            or campaign.get("campaign_id") != operation.get("campaign_id")):
+                        raise WorkflowError(
+                            "Claude review retry has no matching campaign checkpoint; leave recovery blocked."
+                        )
+                    review_kind = context.get("review_kind")
+                    if review_kind == "integration" and context.get("part_id") == "integration":
+                        checkpoint = campaign.get("integration_review")
+                    elif review_kind == "part":
+                        matching_records = [
+                            item for item in campaign.get("part_reviews", [])
+                            if isinstance(item, dict) and item.get("part_id") == operation.get("part_id")
+                        ]
+                        checkpoint = matching_records[0] if len(matching_records) == 1 else None
+                    else:
+                        checkpoint = None
+                    if (not isinstance(checkpoint, dict) or not isinstance(checkpoint.get("calls", []), list)
+                            or any(not isinstance(item, dict) for item in checkpoint.get("calls", []))):
+                        raise WorkflowError(
+                            "Claude review retry has no unique part or integration call checkpoint; leave recovery blocked."
+                        )
+                    call_number = context.get("campaign_call_number")
+                    if (isinstance(call_number, bool) or not isinstance(call_number, int)
+                            or call_number < 1 or context.get("call_state") not in {
+                                "interrupted_unknown_cost", "failed_unknown_cost", "failed",
+                            }):
+                        raise WorkflowError(
+                            "Claude review retry lacks the expected uncertain-attempt context; leave recovery blocked."
+                        )
+                    if (context.get("stage") != "code_review"
+                            or context.get("campaign_id") != campaign.get("campaign_id")
+                            or context.get("part_id") != operation.get("part_id")
+                            or context.get("proposal_version") != operation.get("proposal_version")
+                            or context.get("review_purpose") != operation.get("review_purpose")
+                            or context.get("prompt_sha256") != operation.get("input_sha256")
+                            or context.get("campaign_call_number") != operation.get("call_number")
+                            or (review_kind == "integration") != (context.get("part_id") == "integration")):
+                        raise WorkflowError(
+                            "Claude review retry context does not match its operation identity; leave recovery blocked."
+                        )
+                    saved_attempts = [
+                        item for item in checkpoint["calls"]
+                        if isinstance(item, dict) and item.get("campaign_call_number") == call_number
+                    ]
+                    expected_attempt = {
+                        "prompt_sha256": context.get("prompt_sha256"),
+                        "cost_usd": float(cost),
+                        "call_state": context.get("call_state"),
+                        "campaign_call_number": call_number,
+                    }
+                    if saved_attempts and (len(saved_attempts) != 1 or saved_attempts[0] != expected_attempt):
+                        raise WorkflowError(
+                            "Claude review retry conflicts with an existing campaign call checkpoint; leave recovery blocked."
+                        )
+                    context["cost_usd"] = float(cost)
+                    if not saved_attempts:
+                        checkpoint["calls"].append(expected_attempt)
                 authorization["spent_usd"] = round(float(spent + cost), 4)
                 authorization["budget_unknown"] = False
                 operation["resolution_cost_usd"] = float(cost)
@@ -3649,6 +3730,7 @@ class Orchestrator:
             external["active_call"] = None
             self.state["error"] = str(exc)
             contexts[context_index]["call_state"] = "failed"
+            contexts[context_index]["cost_usd"] = exc.cost_usd
             contexts[context_index]["error"] = redact(str(exc))
             operation_status = "unknown" if exc.cost_usd is None else "failed"
             self._finish_operation(
@@ -4146,7 +4228,8 @@ class Orchestrator:
                 or operation.get("campaign_id") != request.campaign_id
                 or operation.get("part_id") != request.part_id
                 or operation.get("proposal_version") != request.proposal_version
-                or operation.get("review_purpose") != request.purpose):
+                or operation.get("review_purpose") != request.purpose
+                or operation.get("call_number") != manifest.get("campaign_call_number")):
             invalid("terminal operation does not match the request and report")
 
         contexts = self.state.get("claude_contexts", [])
@@ -4187,6 +4270,348 @@ class Orchestrator:
                 or context.get("header_sha256") != _sha256_text(request.header)):
             invalid("linked Claude context header does not match the request")
 
+    def _review_campaign_requests(self, campaign: dict, campaign_input: CampaignInput) -> dict:
+        """Reconstruct the exact part and integration requests from current campaign inputs."""
+        shared = dict(campaign_input.shared_context)
+        requests = {}
+        for part in campaign_input.parts:
+            requests[("part", part.part_id)] = _review_requests.build_part_request(
+                campaign_id=campaign_input.campaign_id,
+                part=part,
+                purpose=campaign_input.purpose,
+                proposal_version=campaign_input.proposal_version,
+                payload_limit_characters=campaign_input.payload_limit_characters,
+                report_contract_version=campaign_input.report_contract_version,
+                source_patch_sha256=campaign_input.source_patch_sha256,
+                shared_context_sha256=campaign_input.shared_context_sha256,
+                shared_context=shared,
+                excluded_count=len(campaign_input.excluded_files),
+                header=campaign_input.part_header,
+            )
+        integration = campaign.get("integration_review", {})
+        if isinstance(integration, dict) and integration.get("required"):
+            if not all(
+                next((item for item in campaign.get("part_reviews", [])
+                      if isinstance(item, dict) and item.get("part_id") == part.part_id), {}).get("status") == "reviewed"
+                for part in campaign_input.parts
+            ):
+                if (integration.get("report") is not None or integration.get("status") == "reviewed"
+                        or any(isinstance(item, dict) and item.get("part_id") == "integration"
+                               for item in self.state.get("claude_contexts", []))):
+                    raise WorkflowError(
+                        "Review campaign evidence is inconsistent: integration evidence exists before every part is reviewed."
+                    )
+            else:
+                requests[("integration", "integration")] = _review_requests.build_integration_request(
+                    campaign=campaign,
+                    parts=campaign_input.parts,
+                    shared_context=shared,
+                    purpose=campaign_input.purpose,
+                    proposal_version=campaign_input.proposal_version,
+                    payload_limit_characters=campaign_input.payload_limit_characters,
+                    report_contract_version=campaign_input.report_contract_version,
+                    source_patch_sha256=campaign_input.source_patch_sha256,
+                    shared_context_sha256=campaign_input.shared_context_sha256,
+                )
+        return requests
+
+    def _validate_review_context_operation(self, request, context: dict, contexts: list[dict]) -> None:
+        """Validate the operation join even when an attempt has no reusable report."""
+        def invalid(message: str) -> None:
+            raise WorkflowError(f"Claude review recovery identity is invalid: {message}.")
+
+        if context.get("call_state") == "validation_failed":
+            if context.get("operation_id") is not None:
+                invalid("pre-launch validation failure unexpectedly references an operation")
+            return
+        operation_id = context.get("operation_id")
+        if not isinstance(operation_id, str) or not operation_id:
+            invalid("persisted Claude attempt has no operation ID")
+        operations = [
+            item for item in self.state.get("operation_history", [])
+            if isinstance(item, dict) and item.get("operation_id") == operation_id
+        ]
+        if len(operations) != 1:
+            invalid("Claude context operation ID does not resolve to exactly one history record")
+        operation = operations[0]
+        context_index = operation.get("context_index")
+        if (isinstance(context_index, bool) or not isinstance(context_index, int)
+                or context_index < 0 or context_index >= len(contexts) or contexts[context_index] is not context):
+            invalid("Claude context does not have a unique persisted context index")
+        expected_stage = "verification" if request.purpose == "verification" else "code_review"
+        if (operation.get("operation_type") != "claude"
+                or operation.get("stage") != expected_stage
+                or operation.get("input_sha256") != request.prompt_sha256
+                or operation.get("campaign_id") != request.campaign_id
+                or operation.get("part_id") != request.part_id
+                or operation.get("proposal_version") != request.proposal_version
+                or operation.get("review_purpose") != request.purpose
+                or operation.get("call_number") != context.get("campaign_call_number")):
+            invalid("operation history does not match the reconstructed request")
+        linked = [item for item in contexts if item.get("operation_id") == operation_id]
+        if len(linked) != 1 or linked[0] is not context:
+            invalid("operation ID does not resolve to exactly one Claude context")
+        expected_statuses = {
+            "submitted": {"started"},
+            "not_started": {"failed"},
+            "failed": {"failed", "unknown"},
+            "failed_unknown_cost": {"unknown"},
+            "interrupted_unknown_cost": {"interrupted"},
+            "completed": {"completed"},
+        }
+        allowed = expected_statuses.get(context.get("call_state"))
+        if allowed is None or operation.get("status") not in allowed:
+            invalid("Claude context and operation terminal states conflict")
+        if context.get("call_state") == "not_started" and operation.get("launch_state") != "not_started":
+            invalid("not-started Claude context has a possibly launched operation")
+        if context.get("call_state") == "completed" and operation.get("launch_state") != "completed":
+            invalid("completed Claude context has no completed launch evidence")
+        if context.get("call_state") == "completed" and operation.get("cost_usd") != context.get("cost_usd"):
+            invalid("completed Claude context cost does not match its terminal operation")
+        if (context.get("call_state") in {"failed", "not_started"}
+                and operation.get("resolution") is None
+                and operation.get("cost_usd") != context.get("cost_usd")):
+            invalid("failed Claude context cost does not match its terminal operation")
+        cost = context.get("cost_usd")
+        if cost is not None and (
+            isinstance(cost, bool) or not isinstance(cost, (int, float))
+            or not math.isfinite(float(cost)) or cost < 0
+        ):
+            invalid("Claude context cost is not a finite nonnegative amount")
+        if (context.get("call_state") in {
+                "interrupted_unknown_cost", "failed_unknown_cost", "failed",
+            } and (context.get("call_state") != "failed" or operation.get("status") == "unknown")):
+            resolution = operation.get("resolution")
+            if resolution is None and context.get("cost_usd") is not None:
+                invalid("unresolved Claude context unexpectedly has a verified cost")
+            if resolution is not None and (
+                resolution != "user_verified_final_provider_cost_and_inactive_call"
+                or operation.get("resolution_cost_usd") != context.get("cost_usd")
+            ):
+                invalid("Claude retry resolution does not match the reconciled context cost")
+
+    def _reconcile_review_campaign_evidence(
+        self, campaign: dict, campaign_input: CampaignInput,
+    ) -> dict[tuple[str, str], list[dict]]:
+        """Join saved campaign calls and reports to unique request, context, and operation evidence."""
+        def invalid(message: str) -> None:
+            raise WorkflowError(f"Review campaign recovery evidence is inconsistent: {message}.")
+
+        records = campaign.get("part_reviews")
+        if not isinstance(records, list):
+            invalid("part checkpoints are missing or malformed")
+        checkpoint_ids = [item.get("part_id") for item in records if isinstance(item, dict)]
+        if len(checkpoint_ids) != len(records) or len(checkpoint_ids) != len(set(checkpoint_ids)):
+            invalid("part checkpoint identities are missing or duplicated")
+        expected_ids = [part.part_id for part in campaign_input.parts]
+        if len(checkpoint_ids) != len(expected_ids) or set(checkpoint_ids) != set(expected_ids):
+            invalid("part checkpoints do not match the reconstructed manifest")
+
+        contexts = self.state.get("claude_contexts", [])
+        if not isinstance(contexts, list) or any(not isinstance(item, dict) for item in contexts):
+            invalid("Claude context history is malformed")
+        operations = self.state.get("operation_history", [])
+        if not isinstance(operations, list) or any(not isinstance(item, dict) for item in operations):
+            invalid("operation history is malformed")
+        requests = self._review_campaign_requests(campaign, campaign_input)
+        candidates: dict[tuple[str, str], list[dict]] = {}
+
+        def reconcile_record(kind: str, part_id: str, record: dict) -> None:
+            request = requests.get((kind, part_id))
+            if request is None:
+                if record.get("report") is not None or record.get("status") in {"reviewed", "report_saved"}:
+                    invalid(f"{kind} {part_id} has a saved report but its request cannot be reconstructed")
+                return
+            calls = record.get("calls", [])
+            if not isinstance(calls, list) or any(not isinstance(item, dict) for item in calls):
+                invalid(f"{kind} {part_id} call history is malformed")
+
+            def valid_cost(value: object) -> bool:
+                if value is None:
+                    return True
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+                    return False
+                try:
+                    return math.isfinite(float(value))
+                except (OverflowError, ValueError):
+                    return False
+
+            for call in calls:
+                call_number = call.get("campaign_call_number")
+                call_cost = call.get("cost_usd")
+                if (call.get("prompt_sha256") != request.prompt_sha256
+                        or not isinstance(call.get("call_state"), str)
+                        or isinstance(call_number, bool) or not isinstance(call_number, int) or call_number < 1
+                        or not valid_cost(call_cost)):
+                    invalid(f"{kind} {part_id} call checkpoint identity or cost is malformed")
+            related = [
+                item for item in contexts
+                if item.get("stage") == "code_review"
+                and item.get("campaign_id") == campaign_input.campaign_id
+                and item.get("review_kind") == kind
+                and item.get("part_id") == part_id
+            ]
+            if any(
+                item.get("stage") == "code_review"
+                and item.get("campaign_id") == campaign_input.campaign_id
+                and item.get("part_id") == part_id
+                and item.get("review_kind") != kind
+                for item in contexts
+            ):
+                invalid(f"{kind} {part_id} has campaign context with a conflicting review kind")
+            for context in related:
+                call_number = context.get("campaign_call_number")
+                if (context.get("prompt_sha256") != request.prompt_sha256
+                        or not isinstance(context.get("call_state"), str)
+                        or isinstance(call_number, bool) or not isinstance(call_number, int)
+                        or call_number < 1 or not valid_cost(context.get("cost_usd"))):
+                    invalid(f"{kind} {part_id} context identity or cost is malformed")
+            request_contexts = [
+                item for item in contexts
+                if item.get("prompt_sha256") == request.prompt_sha256
+            ]
+            if any(
+                item.get("stage") != "code_review"
+                or item.get("campaign_id") != campaign_input.campaign_id
+                or item.get("review_kind") != kind or item.get("part_id") != part_id
+                for item in request_contexts
+            ):
+                invalid(f"{kind} {part_id} has a context with the exact prompt but conflicting request metadata")
+            expected_stage = "verification" if request.purpose == "verification" else "code_review"
+            request_operations = [
+                item for item in operations
+                if item.get("operation_type") == "claude"
+                and item.get("input_sha256") == request.prompt_sha256
+            ]
+            for operation in request_operations:
+                if (operation.get("stage") != expected_stage
+                        or operation.get("campaign_id") != campaign_input.campaign_id
+                        or operation.get("part_id") != part_id
+                        or operation.get("proposal_version") != request.proposal_version
+                        or operation.get("review_purpose") != request.purpose):
+                    invalid(f"{kind} {part_id} has an operation with the exact prompt but conflicting request metadata")
+                operation_contexts = [
+                    item for item in contexts if item.get("operation_id") == operation.get("operation_id")
+                ]
+                if (len(operation_contexts) != 1
+                        or not any(operation_contexts[0] is context for context in related)):
+                    invalid(f"{kind} {part_id} has a matching operation without one linked context")
+            call_signatures = Counter(
+                (item.get("prompt_sha256"), item.get("cost_usd"), item.get("call_state"),
+                 item.get("campaign_call_number")) for item in calls
+            )
+            context_signatures = Counter(
+                (item.get("prompt_sha256"), item.get("cost_usd"), item.get("call_state"),
+                 item.get("campaign_call_number")) for item in related
+            )
+            call_numbers = [
+                item.get("campaign_call_number") for item in related
+                if item.get("call_state") != "validation_failed"
+            ]
+            if len(call_numbers) != len(set(call_numbers)):
+                invalid(f"{kind} {part_id} has duplicate campaign call numbers")
+            if call_signatures - context_signatures:
+                invalid(f"{kind} {part_id} checkpoint calls have no matching Claude context")
+
+            for context in related:
+                if context.get("prompt_sha256") != request.prompt_sha256:
+                    invalid(f"{kind} {part_id} context was produced from a different request")
+                self._validate_review_context_operation(request, context, contexts)
+
+            uncheckpointed: list[dict] = []
+            uncheckpointed_reports: list[dict] = []
+            remaining_calls = call_signatures.copy()
+            for context in sorted(related, key=lambda item: item["campaign_call_number"]):
+                signature = (
+                    context.get("prompt_sha256"), context.get("cost_usd"), context.get("call_state"),
+                    context.get("campaign_call_number"),
+                )
+                if remaining_calls[signature]:
+                    remaining_calls[signature] -= 1
+                    continue
+                uncheckpointed.append(context)
+                if context.get("call_state") == "completed":
+                    if not isinstance(context.get("report"), str):
+                        invalid(f"{kind} {part_id} completed context has no persisted report")
+                    self._validate_review_execution_result(request, context["report"], context)
+                    uncheckpointed_reports.append(context)
+                elif context.get("call_state") in {"validation_failed", "not_started"}:
+                    continue
+                elif (context.get("call_state") == "failed"
+                        and next(item for item in operations
+                                 if item.get("operation_id") == context.get("operation_id")).get("status") == "failed"
+                        and context.get("cost_usd") is not None):
+                    continue
+                else:
+                    invalid(f"{kind} {part_id} has an uncheckpointed uncertain provider attempt")
+
+            completed = [item for item in related if item.get("call_state") == "completed"]
+            for context in completed:
+                if not isinstance(context.get("report"), str):
+                    invalid(f"{kind} {part_id} completed context has no persisted report")
+                self._validate_review_execution_result(request, context["report"], context)
+
+            report = record.get("report")
+            status = record.get("status")
+            if report is not None:
+                if not isinstance(report, str) or not report:
+                    invalid(f"{kind} {part_id} checkpoint report is malformed")
+                matching = [item for item in completed if item.get("report") == report]
+                if not matching:
+                    invalid(f"{kind} {part_id} checkpoint report has no matching completed operation")
+                if record.get("context_sha256") != request.prompt_sha256:
+                    invalid(f"{kind} {part_id} checkpoint prompt identity does not match the reconstructed request")
+                latest_number = max(item["campaign_call_number"] for item in completed)
+                latest = [item for item in matching if item["campaign_call_number"] == latest_number]
+                if status in {"reviewed", "report_saved"} and len(latest) != 1:
+                    invalid(f"{kind} {part_id} saved report does not identify one latest completed call")
+            elif status in {"reviewed", "report_saved"}:
+                invalid(f"{kind} {part_id} is marked {status} without a report")
+
+            if status == "reviewed":
+                valid = (
+                    self._part_report_is_structured(report, part_id, list(
+                        next(part for part in campaign_input.parts if part.part_id == part_id).segments
+                    )) if kind == "part" else self._integration_report_is_structured(report)
+                )
+                if not valid:
+                    invalid(f"{kind} {part_id} is marked reviewed with an invalid structured report")
+            if len(uncheckpointed_reports) > 1:
+                invalid(f"{kind} {part_id} has multiple completed results without checkpoints")
+            report_candidates = uncheckpointed_reports
+            if (not report_candidates and report is None
+                    and status not in {"reviewed", "report_saved"}):
+                checkpointed_completed = [
+                    context for context in completed
+                    if call_signatures[(
+                        context.get("prompt_sha256"), context.get("cost_usd"), context.get("call_state"),
+                        context.get("campaign_call_number"),
+                    )] > 0
+                ]
+                if checkpointed_completed:
+                    latest_number = max(item["campaign_call_number"] for item in checkpointed_completed)
+                    report_candidates = [
+                        item for item in checkpointed_completed
+                        if item["campaign_call_number"] == latest_number
+                    ]
+                    if len(report_candidates) != 1:
+                        invalid(f"{kind} {part_id} has ambiguous completed reports without a report checkpoint")
+            safe_attempts = [item for item in uncheckpointed if item.get("call_state") != "completed"]
+            if uncheckpointed or report_candidates:
+                if report is not None and status in {"reviewed", "report_saved"}:
+                    invalid(f"{kind} {part_id} has a checkpoint conflicting with a newer completed result")
+                candidates[(kind, part_id)] = safe_attempts + report_candidates
+
+        records_by_id = {item["part_id"]: item for item in records}
+        for part in campaign_input.parts:
+            reconcile_record("part", part.part_id, records_by_id[part.part_id])
+        integration = campaign.get("integration_review", {})
+        if not isinstance(integration, dict):
+            invalid("integration checkpoint is malformed")
+        if integration.get("required"):
+            reconcile_record("integration", "integration", integration)
+        return candidates
+
     def _run_review_campaign(
         self, campaign: dict, shared: dict[str, str], parts: list[dict], review_diff: ReviewDiff,
     ) -> str:
@@ -4198,14 +4623,52 @@ class Orchestrator:
     def _run_review_campaign_impl(
         self, campaign: dict, shared: dict[str, str], parts: list[dict], review_diff: ReviewDiff,
     ) -> str:
+        initial_input = _make_campaign_input(
+            campaign, shared, parts, review_diff.excluded_files,
+            proposal_version=self.state.get("proposal_version", 1), transition_at=now(),
+            part_header=(
+                _ReviewCampaign._legacy_code_review_header()
+                if campaign.get("header_id") == "code-review-part-v1"
+                else _ReviewCampaign._code_review_header()
+            ),
+        )
+        recovered_contexts = self._reconcile_review_campaign_evidence(campaign, initial_input)
         campaign["status"] = "in_progress"
         self._sync_review_coverage(campaign, review_diff)
         self._save()
+        attempts_checkpointed = False
+        for (kind, part_id), contexts in recovered_contexts.items():
+            for context in contexts:
+                if context.get("call_state") == "completed":
+                    continue
+                if kind == "integration":
+                    record = campaign["integration_review"]
+                else:
+                    record = next(item for item in campaign["part_reviews"] if item["part_id"] == part_id)
+                record.setdefault("calls", []).append({
+                    "prompt_sha256": context.get("prompt_sha256"),
+                    "cost_usd": context.get("cost_usd"),
+                    "call_state": context.get("call_state"),
+                    "campaign_call_number": context.get("campaign_call_number"),
+                })
+                record["status"] = "call_failed"
+                if kind == "part":
+                    part = next(item for item in parts if item["part_id"] == part_id)
+                    record["segments"] = _review_partitioning.campaign_part_manifest([part])[0]["segments"]
+                attempts_checkpointed = True
+        if attempts_checkpointed:
+            self._sync_review_coverage(campaign, review_diff)
+            self._save()
 
         def campaign_input() -> CampaignInput:
             return _make_campaign_input(
                 campaign, shared, parts, review_diff.excluded_files,
                 proposal_version=self.state.get("proposal_version", 1), transition_at=now(),
+                part_header=(
+                    _ReviewCampaign._legacy_code_review_header()
+                    if campaign.get("header_id") == "code-review-part-v1"
+                    else _ReviewCampaign._code_review_header()
+                ),
             )
 
         snapshot = CampaignSnapshot.from_mapping(campaign)
@@ -4219,7 +4682,7 @@ class Orchestrator:
             if save:
                 self._save()
 
-        transition = _advance_review_campaign(snapshot, campaign_input())
+        transition = _advance_review_campaign(snapshot, initial_input)
         if transition.decision == "blocked":
             raise WorkflowError("; ".join(transition.findings) or "Review campaign transition is blocked.")
         if transition.snapshot != snapshot:
@@ -4232,16 +4695,12 @@ class Orchestrator:
                 raise WorkflowError("Review campaign requested a part without a request value.")
             part = next(item for item in parts if item["part_id"] == transition.part_id)
             record = next(item for item in campaign["part_reviews"] if item["part_id"] == transition.part_id)
-            recoverable = next((
-                context for context in reversed(self.state.get("claude_contexts", []))
-                if context.get("campaign_id") == campaign["campaign_id"]
-                and context.get("part_id") == part["part_id"]
-                and context.get("call_state") == "completed"
-                and context.get("report") is not None
-                and not any(call.get("prompt_sha256") == context.get("prompt_sha256")
-                            for call in record.get("calls", []))
-            ), None)
-            if recoverable is not None:
+            recoverable_matches = [
+                item for item in recovered_contexts.get(("part", part["part_id"]), [])
+                if item.get("call_state") == "completed"
+            ]
+            if recoverable_matches:
+                recoverable = recoverable_matches[0]
                 transition = _advance_review_campaign(snapshot, campaign_input(), PreviousResult(
                     part_id=part["part_id"],
                     outcome="completed",
@@ -4280,7 +4739,7 @@ class Orchestrator:
                         request.header, "code_review", request.section_mapping(),
                         metadata={
                             "proposal_version": self.state.get("proposal_version", 1),
-                            "header_id": "code-review-part-v2",
+                            "header_id": request.header_id,
                             "review_kind": "part",
                             "campaign_id": campaign["campaign_id"],
                             "part_id": part["part_id"],
@@ -4292,20 +4751,33 @@ class Orchestrator:
                             "excluded_files": campaign["excluded_files"],
                         },
                     )
-            except Exception:
-                context = next((
-                    item for item in reversed(self.state.get("claude_contexts", []))
-                    if item.get("campaign_id") == campaign["campaign_id"]
-                    and item.get("part_id") == part["part_id"]
-                ), None)
-                if context is not None and not any(
-                        call.get("prompt_sha256") == context.get("prompt_sha256") for call in record["calls"]):
+            except Exception as exc:
+                checkpointed_numbers = {item.get("campaign_call_number") for item in record["calls"]}
+                contexts = [
+                    item for item in self.state.get("claude_contexts", [])
+                    if isinstance(item, dict) and item.get("stage") == "code_review"
+                    and item.get("campaign_id") == campaign["campaign_id"]
+                    and item.get("review_kind") == "part" and item.get("part_id") == part["part_id"]
+                    and item.get("prompt_sha256") == request.prompt_sha256
+                    and item.get("campaign_call_number") not in checkpointed_numbers
+                ]
+                context = contexts[0] if len(contexts) == 1 else None
+                if context is not None:
                     record["calls"].append({
                         "prompt_sha256": context.get("prompt_sha256"), "cost_usd": context.get("cost_usd"),
                         "call_state": context.get("call_state"),
                         "campaign_call_number": context.get("campaign_call_number"),
                     })
                 if context is not None and context.get("call_state") == "completed" and context.get("report"):
+                    try:
+                        self._validate_review_execution_result(request, context["report"], context)
+                    except WorkflowError as validation_error:
+                        record["status"] = "call_failed"
+                        record["segments"] = _review_partitioning.campaign_part_manifest([part])[0]["segments"]
+                        self._sync_review_coverage(campaign, review_diff)
+                        self.state["error"] = str(validation_error)
+                        self._save()
+                        raise validation_error from exc
                     record["report"] = context["report"]
                     record["context_sha256"] = context.get("prompt_sha256")
                     record["status"] = "report_saved"
@@ -4357,16 +4829,12 @@ class Orchestrator:
             if request is None:
                 raise WorkflowError("Review campaign requested integration without a request value.")
             integration = campaign["integration_review"]
-            recoverable = next((
-                context for context in reversed(self.state.get("claude_contexts", []))
-                if context.get("campaign_id") == campaign["campaign_id"]
-                and context.get("part_id") == "integration"
-                and context.get("call_state") == "completed"
-                and context.get("report") is not None
-                and not any(call.get("prompt_sha256") == context.get("prompt_sha256")
-                            for call in integration.get("calls", []))
-            ), None)
-            if recoverable is not None:
+            recoverable_matches = [
+                item for item in recovered_contexts.get(("integration", "integration"), [])
+                if item.get("call_state") == "completed"
+            ]
+            if recoverable_matches:
+                recoverable = recoverable_matches[0]
                 transition = _advance_review_campaign(snapshot, campaign_input(), PreviousResult(
                     part_id="integration", outcome="completed", call_state=recoverable["call_state"],
                     report=recoverable["report"], prompt_sha256=recoverable.get("prompt_sha256"),
@@ -4403,21 +4871,31 @@ class Orchestrator:
                                 "excluded_files": campaign["excluded_files"],
                             },
                         )
-                except Exception:
-                    context = next((
-                        item for item in reversed(self.state.get("claude_contexts", []))
-                        if item.get("campaign_id") == campaign["campaign_id"]
-                        and item.get("part_id") == "integration"
-                    ), None)
-                    if context is not None and not any(
-                            call.get("prompt_sha256") == context.get("prompt_sha256")
-                            for call in integration["calls"]):
+                except Exception as exc:
+                    checkpointed_numbers = {item.get("campaign_call_number") for item in integration["calls"]}
+                    contexts = [
+                        item for item in self.state.get("claude_contexts", [])
+                        if isinstance(item, dict) and item.get("stage") == "code_review"
+                        and item.get("campaign_id") == campaign["campaign_id"]
+                        and item.get("review_kind") == "integration" and item.get("part_id") == "integration"
+                        and item.get("prompt_sha256") == request.prompt_sha256
+                        and item.get("campaign_call_number") not in checkpointed_numbers
+                    ]
+                    context = contexts[0] if len(contexts) == 1 else None
+                    if context is not None:
                         integration["calls"].append({
                             "prompt_sha256": context.get("prompt_sha256"), "cost_usd": context.get("cost_usd"),
                             "call_state": context.get("call_state"),
                             "campaign_call_number": context.get("campaign_call_number"),
                         })
                     if context is not None and context.get("call_state") == "completed" and context.get("report"):
+                        try:
+                            self._validate_review_execution_result(request, context["report"], context)
+                        except WorkflowError as validation_error:
+                            integration["status"] = "call_failed"
+                            self.state["error"] = str(validation_error)
+                            self._save()
+                            raise validation_error from exc
                         integration["report"] = context["report"]
                         integration["context_sha256"] = context.get("prompt_sha256")
                         integration["status"] = "report_saved"
@@ -5136,6 +5614,46 @@ def _recover_code_review(runner: Orchestrator, workflow_id: str, *, apply: bool)
     except Exception as exc:
         raise WorkflowError(f"Could not safely reconstruct the saved target diff: {redact(str(exc))}") from exc
     shared = runner._code_review_shared_context(review_diff)
+    parts, partition_errors = _reconstruct_campaign_parts(campaign, review_diff)
+    if not partition_errors:
+        context_headers = {
+            item.get("header_id") for item in state.get("claude_contexts", [])
+            if isinstance(item, dict) and item.get("stage") == "code_review"
+            and item.get("campaign_id") == campaign.get("campaign_id")
+            and item.get("review_kind") == "part" and item.get("call_state") == "completed"
+        }
+        if context_headers == {"code-review-part-v1"}:
+            part_header = _ReviewCampaign._legacy_code_review_header()
+        elif context_headers == {"code-review-part-v2"}:
+            part_header = _ReviewCampaign._code_review_header()
+        else:
+            part_header = None
+        try:
+            if part_header is None:
+                detail = (
+                    "no completed part context is available to reconstruct saved report requests"
+                    if not context_headers else "saved contexts identify conflicting or unsupported prompt contracts"
+                )
+                raise WorkflowError(f"Review campaign recovery evidence is inconsistent: {detail}.")
+            campaign_input = _make_campaign_input(
+                campaign, shared, parts, review_diff.excluded_files,
+                proposal_version=state.get("proposal_version", 1), transition_at=now(),
+                part_header=part_header,
+            )
+            runner._reconcile_review_campaign_evidence(campaign, campaign_input)
+        except WorkflowError as exc:
+            return {
+                "workflow_id": workflow_id,
+                "target": str(runner.target),
+                "mode": "apply" if apply else "dry-run",
+                "provider_invocations": 0,
+                "persisted_reports": 0,
+                "valid_reports": 0,
+                "invalid_reports": 1,
+                "errors": [str(exc)],
+                "applied": False,
+                "claude_spent_usd": state.get("authorization", {}).get("claude_aily", {}).get("spent_usd"),
+            }
     result, proposed = Orchestrator._campaign_helper(lambda: _recover_review_campaign(
         state, workflow_id, runner.target, review_diff, shared, apply=apply,
     ))

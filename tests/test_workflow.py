@@ -2401,6 +2401,11 @@ class WorkflowTests(unittest.TestCase):
         for context in state["claude_contexts"]:
             if context.get("stage") == "code_review" and context.get("review_kind") == "part":
                 context["report"] = original_report
+                operation = next(
+                    item for item in state["operation_history"]
+                    if item.get("operation_id") == context.get("operation_id")
+                )
+                operation["result_sha256"] = hashlib.sha256(original_report.encode("utf-8")).hexdigest()
         part["status"] = "invalid_report"
         part.setdefault("validation_history", []).append({
             "validator_version": "part-review-v1", "valid": False,
@@ -3643,6 +3648,14 @@ class WorkflowTests(unittest.TestCase):
         part_two_operations = [item for item in code_review_operations if item.get("part_id") == "part-000002"]
         self.assertEqual(len(part_two_operations), 2)
         self.assertNotEqual(part_two_operations[0]["operation_id"], part_two_operations[1]["operation_id"])
+        part_two_checkpoint = next(
+            item for item in completed["review_campaign"]["part_reviews"]
+            if item.get("part_id") == "part-000002"
+        )
+        self.assertEqual(len(part_two_checkpoint["calls"]), 2)
+        self.assertEqual(part_two_checkpoint["calls"][0]["call_state"], "interrupted_unknown_cost")
+        self.assertEqual(part_two_checkpoint["calls"][0]["cost_usd"], 0.01)
+        self.assertEqual(part_two_checkpoint["calls"][1]["call_state"], "completed")
         part_one_contexts = [
             item for item in completed["claude_contexts"]
             if item.get("stage") == "code_review" and item.get("part_id") == "part-000001"
@@ -3720,6 +3733,56 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(recovered["calls"][0]["prompt_sha256"], context["prompt_sha256"])
         self.assertEqual(len(claude.prompts), calls_before_resume)
 
+    def test_claude_review_known_not_started_attempt_is_checkpointed_before_safe_retry(self):
+        changed = {"modules/recovery/not_started.py": "def recover():\n    return 'retry safely'\n"}
+        codex = FakeCodex("# Proposal\nRetry only calls proven not launched.\n", self.refined(), "Implemented.\n")
+        self.implement_files(codex, changed)
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05),
+            response_factory=lambda _prompt, _budget, _executable: claude_reviewer.ReviewResult(
+                "Decision: APPROVED\nNo acceptance-blocking findings.", 0.02,
+            ),
+        )
+        runner = orchestrator.Orchestrator(
+            self.target, task="Retry a Claude call that never launched", budget_usd=1.0,
+            workflow_id="claude-not-started-recovery", process_runner=codex, claude_runner=claude,
+        )
+        runner.start()
+
+        class InterruptedBeforeLaunch(orchestrator.Orchestrator):
+            interrupted = False
+
+            def _operation_launching(self, operation_id):
+                operation = self._operation(operation_id)
+                if (operation is not None and operation.get("stage") == "code_review"
+                        and not self.interrupted):
+                    self.interrupted = True
+                    raise KeyboardInterrupt()
+                return super()._operation_launching(operation_id)
+
+        with self.assertRaises(KeyboardInterrupt):
+            InterruptedBeforeLaunch(
+                self.target, workflow_id="claude-not-started-recovery", process_runner=codex,
+                claude_runner=claude,
+            ).approve()
+
+        completed = orchestrator.Orchestrator(
+            self.target, workflow_id="claude-not-started-recovery", process_runner=codex,
+            claude_runner=claude,
+        ).resume()
+
+        self.assertEqual(completed["status"], "complete")
+        operations = [
+            item for item in completed["operation_history"]
+            if item.get("operation_type") == "claude" and item.get("stage") == "code_review"
+        ]
+        self.assertEqual(len(operations), 2)
+        self.assertNotEqual(operations[0]["operation_id"], operations[1]["operation_id"])
+        self.assertEqual(operations[0]["launch_state"], "not_started")
+        self.assertEqual(len([prompt for prompt in claude.prompts if "Complete patch" in prompt]), 1)
+        calls = completed["review_campaign"]["part_reviews"][0]["calls"]
+        self.assertEqual([item["call_state"] for item in calls], ["not_started", "completed"])
+
     def test_local_recovery_dry_run_revalidates_reports_without_writing_or_calling_provider(self):
         runner, claude, saved = self.create_completed_review_for_recovery("local-review-dry-run")
         before = runner.state_path.read_bytes()
@@ -3786,6 +3849,11 @@ class WorkflowTests(unittest.TestCase):
         for context in saved["claude_contexts"]:
             if context.get("stage") == "code_review" and context.get("review_kind") == "part":
                 context["report"] = bad_report
+                operation = next(
+                    item for item in saved["operation_history"]
+                    if item.get("operation_id") == context.get("operation_id")
+                )
+                operation["result_sha256"] = hashlib.sha256(bad_report.encode("utf-8")).hexdigest()
         runner.state_path.write_text(json.dumps(saved, indent=2) + "\n", encoding="utf-8")
         before = runner.state_path.read_bytes()
         prompts_before = len(claude.prompts)
@@ -3795,6 +3863,133 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(any("individually headed finding blocks" in error for error in result["errors"]))
         self.assertEqual(runner.state_path.read_bytes(), before)
         self.assertEqual(len(claude.prompts), prompts_before)
+
+    def test_local_recovery_rejects_missing_operation_history(self):
+        runner, _claude, saved = self.create_completed_review_for_recovery("local-review-missing-operation")
+        operation_id = next(
+            context["operation_id"] for context in saved["claude_contexts"]
+            if context.get("stage") == "code_review" and context.get("review_kind") == "part"
+        )
+        saved["operation_history"] = [
+            item for item in saved["operation_history"] if item.get("operation_id") != operation_id
+        ]
+        runner.state_path.write_text(json.dumps(saved, indent=2) + "\n", encoding="utf-8")
+        before = runner.state_path.read_bytes()
+
+        result = orchestrator.recover_code_review(self.target, "local-review-missing-operation", apply=True)
+
+        self.assertFalse(result["applied"])
+        self.assertTrue(any("exactly one history record" in error for error in result["errors"]))
+        self.assertEqual(runner.state_path.read_bytes(), before)
+
+    def test_local_recovery_rejects_missing_claude_context(self):
+        runner, _claude, saved = self.create_completed_review_for_recovery("local-review-missing-context")
+        saved["claude_contexts"] = [
+            item for item in saved["claude_contexts"]
+            if not (item.get("stage") == "code_review" and item.get("review_kind") == "part")
+        ]
+        runner.state_path.write_text(json.dumps(saved, indent=2) + "\n", encoding="utf-8")
+        before = runner.state_path.read_bytes()
+
+        result = orchestrator.recover_code_review(self.target, "local-review-missing-context", apply=True)
+
+        self.assertFalse(result["applied"])
+        self.assertTrue(result["errors"])
+        self.assertEqual(runner.state_path.read_bytes(), before)
+
+    def test_local_recovery_rejects_terminal_report_hash_conflict(self):
+        runner, _claude, saved = self.create_completed_review_for_recovery("local-review-report-hash")
+        operation = next(
+            item for item in saved["operation_history"]
+            if item.get("operation_type") == "claude" and item.get("stage") == "code_review"
+        )
+        operation["result_sha256"] = "0" * 64
+        runner.state_path.write_text(json.dumps(saved, indent=2) + "\n", encoding="utf-8")
+        before = runner.state_path.read_bytes()
+
+        result = orchestrator.recover_code_review(self.target, "local-review-report-hash", apply=True)
+
+        self.assertFalse(result["applied"])
+        self.assertTrue(any("terminal operation does not match" in error for error in result["errors"]))
+        self.assertEqual(runner.state_path.read_bytes(), before)
+
+    def test_local_recovery_rejects_duplicate_operation_identity(self):
+        runner, _claude, saved = self.create_completed_review_for_recovery("local-review-duplicate-operation")
+        operation = next(
+            item for item in saved["operation_history"]
+            if item.get("operation_type") == "claude" and item.get("stage") == "code_review"
+        )
+        saved["operation_history"].append(copy.deepcopy(operation))
+        runner.state_path.write_text(json.dumps(saved, indent=2) + "\n", encoding="utf-8")
+        before = runner.state_path.read_bytes()
+
+        result = orchestrator.recover_code_review(self.target, "local-review-duplicate-operation", apply=True)
+
+        self.assertFalse(result["applied"])
+        self.assertTrue(any("exactly one history record" in error for error in result["errors"]))
+        self.assertEqual(runner.state_path.read_bytes(), before)
+
+    def test_local_recovery_rejects_checkpoint_report_without_matching_context(self):
+        runner, _claude, saved = self.create_completed_review_for_recovery("local-review-conflicting-report")
+        part = saved["review_campaign"]["part_reviews"][0]
+        part["report"] += "\nConflicting checkpoint content.\n"
+        runner.state_path.write_text(json.dumps(saved, indent=2) + "\n", encoding="utf-8")
+        before = runner.state_path.read_bytes()
+
+        result = orchestrator.recover_code_review(self.target, "local-review-conflicting-report", apply=True)
+
+        self.assertFalse(result["applied"])
+        self.assertTrue(any("no matching completed operation" in error for error in result["errors"]))
+        self.assertEqual(runner.state_path.read_bytes(), before)
+
+    def test_resume_recovers_completed_context_when_campaign_report_checkpoint_is_missing(self):
+        runner, claude, saved = self.create_completed_review_for_recovery("resume-missing-campaign-report")
+        part = saved["review_campaign"]["part_reviews"][0]
+        part["status"] = "pending"
+        part["report"] = None
+        part.pop("context_sha256", None)
+        runner.state_path.write_text(json.dumps(saved, indent=2) + "\n", encoding="utf-8")
+        prompts_before = len(claude.prompts)
+
+        completed = orchestrator.Orchestrator(
+            self.target, workflow_id="resume-missing-campaign-report", process_runner=runner.process_runner,
+            claude_runner=claude,
+        ).resume()
+
+        self.assertEqual(len(claude.prompts), prompts_before)
+        self.assertEqual(completed["status"], "complete")
+        recovered = completed["review_campaign"]["part_reviews"][0]
+        self.assertEqual(recovered["status"], "reviewed")
+        self.assertEqual(recovered["report"], saved["claude_contexts"][-1]["report"])
+        self.assertEqual(len(recovered["calls"]), 1)
+
+    def test_local_recovery_rejects_context_request_identity_mismatches(self):
+        runner, _claude, saved = self.create_completed_review_for_recovery("local-review-context-identity")
+        context_index = next(
+            index for index, item in enumerate(saved["claude_contexts"])
+            if item.get("stage") == "code_review" and item.get("review_kind") == "part"
+        )
+        cases = (
+            ("campaign", lambda item: item.update(campaign_id="another-campaign")),
+            ("part", lambda item: item.update(part_id="another-part")),
+            ("proposal", lambda item: item.update(proposal_version=item["proposal_version"] + 1)),
+            ("prompt", lambda item: item.update(prompt_sha256="f" * 64)),
+            ("operation", lambda item: item.update(operation_id="missing-operation")),
+        )
+        for label, mutate in cases:
+            with self.subTest(identity=label):
+                changed = copy.deepcopy(saved)
+                mutate(changed["claude_contexts"][context_index])
+                runner.state_path.write_text(json.dumps(changed, indent=2) + "\n", encoding="utf-8")
+                before = runner.state_path.read_bytes()
+
+                result = orchestrator.recover_code_review(
+                    self.target, "local-review-context-identity", apply=True,
+                )
+
+                self.assertFalse(result["applied"])
+                self.assertTrue(result["errors"])
+                self.assertEqual(runner.state_path.read_bytes(), before)
 
     def test_local_recovery_rejects_changed_target_diff_without_mutation(self):
         runner, claude, _saved = self.create_completed_review_for_recovery("local-review-changed-diff")
@@ -3868,6 +4063,8 @@ class WorkflowTests(unittest.TestCase):
                 context.get("part_id") == part_record["part_id"] and context.get("report")
                 for context in state_before["claude_contexts"]
             ))
+            state_before["review_campaign"]["part_reviews"].reverse()
+            runner.state_path.write_text(json.dumps(state_before, indent=2) + "\n", encoding="utf-8")
             prompts_before_resume = len(claude.prompts)
             completed = orchestrator.Orchestrator(
                 self.target, workflow_id="persisted-report-recovery", process_runner=codex,
