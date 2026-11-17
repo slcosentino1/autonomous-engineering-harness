@@ -8,9 +8,7 @@ from unittest.mock import patch
 from contextlib import redirect_stderr
 from io import StringIO
 
-import orchestrator
-import claude_reviewer
-from test_workflow import FakeCodex, FakeClaude, make_target, WorkflowTests
+from test_workflow import FakeCodex, FakeClaude, make_target, WorkflowTests, orchestrator, claude_reviewer
 
 
 class ApprovalConditionsTests(unittest.TestCase):
