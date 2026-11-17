@@ -296,6 +296,11 @@ def main(
         command.add_argument("--workflow-id", required=True)
         command.add_argument("--codex", default=CODEX_EXECUTABLE)
         command.add_argument("--aily", default=claude_reviewer.AILY_EXECUTABLE)
+        if name == "approve":
+            command.add_argument(
+                "--conditions-file",
+                help="UTF-8 file containing additional conditions attached to human approval",
+            )
         if name == "resume":
             budget = command.add_mutually_exclusive_group()
             budget.add_argument(
@@ -439,7 +444,17 @@ def main(
                     args.target, workflow_id=args.workflow_id, codex=args.codex, aily=args.aily,
                 )
             if args.command == "approve":
-                state = runner.approve()
+                conditions = ""
+                if args.conditions_file:
+                    try:
+                        conditions = Path(args.conditions_file).expanduser().read_text(encoding="utf-8")
+                    except OSError as exc:
+                        raise workflow_error(
+                            f"Could not read approval conditions file: {args.conditions_file}"
+                        ) from exc
+                    except UnicodeError as exc:
+                        raise workflow_error("Approval conditions file must be valid UTF-8.") from exc
+                state = runner.approve(conditions=conditions)
             elif args.command == "resume":
                 recovery_arguments = {
                     "recovery_action": args.recovery_action,

@@ -2140,11 +2140,16 @@ class Orchestrator:
         self._begin_execution_trace("start")
         return self.run_pending()
 
-    def approve(self) -> dict:
-        state = self._execute_locked(self._approve_locked, target_lock=True)
+    def approve(self, conditions: str | None = None) -> dict:
+        normalized_conditions = conditions.strip() if isinstance(conditions, str) else ""
+        if len(normalized_conditions) > 12_000:
+            raise WorkflowError("Approval conditions must not exceed 12,000 characters.")
+        state = self._execute_locked(
+            lambda: self._approve_locked(normalized_conditions), target_lock=True,
+        )
         return self._maybe_publish_github_pr(state)
 
-    def _approve_locked(self) -> dict:
+    def _approve_locked(self, conditions: str = "") -> dict:
         self._load(preflight_tracing=True)
         if self.state.get("status") != "awaiting_approval":
             raise WorkflowError("This workflow is not waiting for implementation approval.")
@@ -2168,7 +2173,12 @@ class Orchestrator:
                 "approved_at": now(),
             }
         self._begin_execution_trace("approve")
-        self.state["implementation_approved_at"] = {"time": now(), "method": "explicit approve command"}
+        self.state["implementation_approved_at"] = {
+            "time": now(),
+            "method": "explicit approve command",
+            "conditions_sha256": hashlib.sha256(conditions.encode("utf-8")).hexdigest(),
+        }
+        self.state["approval_conditions"] = conditions
         if ledger_snapshot is not None:
             self.state["commitment_ledger_approval"] = ledger_snapshot
         self.state["status"] = "running"
@@ -4264,6 +4274,13 @@ class Orchestrator:
                         f"{COMMITMENT_LEDGER_GUIDANCE}\n\n{PLANNING_PRINCIPLES}\n\n{skill_guidance}\n\n"
                         f"Assignment:\n{self.state['task']}\n\nApproved proposal:\n{self.state['proposal']}"
                     )
+                    approval_conditions = self.state.get("approval_conditions", "")
+                    if approval_conditions:
+                        prompt += (
+                            "\n\nHuman approval conditions (additional implementation constraints; "
+                            "preserve the approved proposal and commitment ledger):\n"
+                            f"{approval_conditions}"
+                        )
                     self.state["implementation_summary"] = self._run_codex(prompt, sandbox="workspace-write")
                     self._capture_commitment_evidence(self.state["implementation_summary"])
                     self.state["stage"] = "code_review"
