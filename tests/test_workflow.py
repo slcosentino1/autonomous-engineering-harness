@@ -854,6 +854,71 @@ class ReviewCampaignBoundaryTests(unittest.TestCase):
         self.assertEqual(calls[0][1], "code_review")
         self.assertGreater(len(saves), 1)
 
+    def test_part_trace_result_uses_part_identity_when_saved_checkpoints_are_reordered(self):
+        patches = (("src/first.py", "first = 1\n"), ("src/second.py", "second = 2\n"))
+        parts = []
+        for index, (path, patch) in enumerate(patches, start=1):
+            segment = review_contracts.ReviewSegment(
+                path, patch, 1, 1, 1, review_contracts._review_patch_sha256(patch),
+            )
+            parts.append({"part_id": f"part-{index:06d}", "segments": [segment]})
+        part_reviews = [
+            {"part_id": part["part_id"], "status": "pending", "report": None, "calls": []}
+            for part in reversed(parts)
+        ]
+        campaign = {
+            "campaign_id": "reordered-campaign",
+            "status": "in_progress",
+            "purpose": "initial",
+            "header_id": "code-review-part-v2",
+            "report_contract_version": "part-review-v2",
+            "source_patch_sha256": "source-hash",
+            "shared_context_sha256": "shared-hash",
+            "payload_limit_characters": 10000,
+            "parts": review_contracts.ReviewCampaign._campaign_part_manifest(parts),
+            "part_reviews": part_reviews,
+            "integration_review": {"required": False, "status": "not_required", "report": None, "calls": []},
+            "files_reviewed": [],
+            "files_not_reviewed": [
+                {"path": path, "reason": "pending"} for path, _patch in patches
+            ],
+            "excluded_files": [],
+        }
+        state = {"review_campaign": campaign, "claude_contexts": [], "proposal_version": 1}
+        trace_results = []
+
+        class TraceSpan:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def update(self, **metadata):
+                trace_results.append(metadata["review_result"])
+
+        def request_review(_header, _stage, _sections, *, metadata):
+            return "unstructured report", {
+                "prompt_sha256": "prompt-hash", "cost_usd": 0.05, "call_state": "completed",
+                "campaign_call_number": 1,
+            }
+
+        campaign_ops = review_contracts.ReviewCampaign(
+            state,
+            save_state=lambda: None,
+            request_review=request_review,
+            trace_span=lambda *_args: TraceSpan(),
+        )
+        first_diff = review_contracts.ReviewDiff(
+            patches[0][1], (patches[0][0],), (), (patches[0],),
+        )
+
+        with self.assertRaises(review_contracts.ReviewCampaignError):
+            campaign_ops._run_review_campaign(campaign, {"Assignment": "Review this change"}, parts, first_diff)
+
+        self.assertEqual(trace_results, ["invalid_report"])
+        self.assertEqual(campaign["part_reviews"][1]["status"], "invalid_report")
+
 
 class WorkspaceModuleTests(unittest.TestCase):
     def setUp(self):
@@ -3496,6 +3561,190 @@ class WorkflowTests(unittest.TestCase):
             [part["status"] for part in completed["review_campaign"]["part_reviews"]],
             ["reviewed"] * len(completed["review_campaign"]["parts"]),
         )
+
+    def test_three_part_uncertain_campaign_call_requires_explicit_retry(self):
+        changed = {
+            f"modules/recovery/file_{index}.py": (
+                f"def operation_{index}():\n" + "    return 'campaign recovery evidence'\n" * 20
+            )
+            for index in range(12)
+        }
+        codex = FakeCodex("# Proposal\nPreserve review checkpoints.\n", self.refined(), "Implemented modules.\n")
+        self.implement_files(codex, changed)
+        interrupted = {"value": False}
+
+        def respond(prompt, _budget, _executable):
+            if "final independent integration review" in prompt:
+                return claude_reviewer.ReviewResult("Decision: APPROVED\nNo integration defects.", 0.02)
+            part_id = re.search(r"(?m)^Part ID: (part-\d+)$", prompt).group(1)
+            if part_id == "part-000002" and not interrupted["value"]:
+                interrupted["value"] = True
+                raise KeyboardInterrupt()
+            return claude_reviewer.ReviewResult("Decision: APPROVED\nNo acceptance-blocking findings.", 0.02)
+
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05),
+            response_factory=respond,
+        )
+        runner = orchestrator.Orchestrator(
+            self.target, task="Review multipart recovery", budget_usd=1.0, workflow_id="campaign-uncertain-part",
+            process_runner=codex, claude_runner=claude,
+        )
+        runner.start()
+
+        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "16000"}):
+            with self.assertRaises(KeyboardInterrupt):
+                orchestrator.Orchestrator(
+                    self.target, workflow_id="campaign-uncertain-part", process_runner=codex,
+                    claude_runner=claude,
+                ).approve()
+
+            interrupted_state = json.loads(runner.state_path.read_text(encoding="utf-8"))
+            campaign = interrupted_state["review_campaign"]
+            self.assertGreaterEqual(len(campaign["parts"]), 3)
+            self.assertEqual(campaign["part_reviews"][0]["status"], "reviewed")
+            self.assertEqual(campaign["part_reviews"][1]["status"], "pending")
+            self.assertTrue(all(item["status"] == "pending" for item in campaign["part_reviews"][2:]))
+            self.assertEqual(interrupted_state["status"], "recovery_required")
+            self.assertTrue(interrupted_state["authorization"]["claude_aily"]["budget_unknown"])
+
+            operations_before_resume = list(interrupted_state["operation_history"])
+            uncertain_operation = operations_before_resume[-1]
+            self.assertEqual(uncertain_operation["operation_type"], "claude")
+            self.assertEqual(uncertain_operation["stage"], "code_review")
+            self.assertEqual(uncertain_operation["status"], "interrupted")
+            self.assertEqual(uncertain_operation["launch_state"], "launching")
+            uncertain_id = uncertain_operation["operation_id"]
+            prompts_before_resume = len(claude.prompts)
+
+            with self.assertRaisesRegex(orchestrator.WorkflowError, "requires recovery"):
+                orchestrator.Orchestrator(
+                    self.target, workflow_id="campaign-uncertain-part", process_runner=codex,
+                    claude_runner=claude,
+                ).resume()
+            after_default_resume = json.loads(runner.state_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [item["operation_id"] for item in after_default_resume["operation_history"]],
+                [item["operation_id"] for item in operations_before_resume],
+            )
+            self.assertEqual(len(claude.prompts), prompts_before_resume)
+
+            with self.assertRaisesRegex(orchestrator.WorkflowError, "confirm the prior provider call is inactive"):
+                orchestrator.Orchestrator(
+                    self.target, workflow_id="campaign-uncertain-part", process_runner=codex,
+                    claude_runner=claude,
+                ).resume(recovery_action="retry", verified_claude_cost_usd=0.01)
+            with self.assertRaisesRegex(orchestrator.WorkflowError, "exceeds the active call cap"):
+                orchestrator.Orchestrator(
+                    self.target, workflow_id="campaign-uncertain-part", process_runner=codex,
+                    claude_runner=claude,
+                ).resume(
+                    recovery_action="retry",
+                    verified_claude_cost_usd=uncertain_operation["cap_usd"] + 0.01,
+                    confirm_provider_inactive=True,
+                )
+            self.assertEqual(len(claude.prompts), prompts_before_resume)
+
+            completed = orchestrator.Orchestrator(
+                self.target, workflow_id="campaign-uncertain-part", process_runner=codex,
+                claude_runner=claude,
+            ).resume(
+                recovery_action="retry", verified_claude_cost_usd=0.01,
+                confirm_provider_inactive=True,
+            )
+
+        self.assertEqual(completed["status"], "complete")
+        self.assertEqual(completed["review_campaign"]["status"], "complete")
+        self.assertEqual(
+            [item["status"] for item in completed["review_campaign"]["part_reviews"]],
+            ["reviewed"] * len(completed["review_campaign"]["parts"]),
+        )
+        operations = completed["operation_history"]
+        old_operation = next(item for item in operations if item["operation_id"] == uncertain_id)
+        self.assertEqual(old_operation["resolution_cost_usd"], 0.01)
+        self.assertEqual(old_operation["resolution"], "user_verified_final_provider_cost_and_inactive_call")
+        code_review_operations = [
+            item for item in operations if item["operation_type"] == "claude" and item["stage"] == "code_review"
+        ]
+        part_two_operations = [item for item in code_review_operations if item.get("part_id") == "part-000002"]
+        self.assertEqual(len(part_two_operations), 2)
+        self.assertNotEqual(part_two_operations[0]["operation_id"], part_two_operations[1]["operation_id"])
+        part_one_contexts = [
+            item for item in completed["claude_contexts"]
+            if item.get("stage") == "code_review" and item.get("part_id") == "part-000001"
+        ]
+        self.assertEqual(len(part_one_contexts), 1)
+        self.assertIn(old_operation, operations)
+
+    def test_completed_review_report_recovers_when_campaign_checkpoint_is_missing(self):
+        changed = {"modules/recovery/single_part.py": "def recover():\n    return 'saved report'\n"}
+        codex = FakeCodex("# Proposal\nPersist provider results.\n", self.refined(), "Implemented.\n")
+        self.implement_files(codex, changed)
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05),
+            response_factory=lambda _prompt, _budget, _executable: claude_reviewer.ReviewResult(
+                "Decision: APPROVED\nNo acceptance-blocking findings.", 0.02,
+            ),
+        )
+        runner = orchestrator.Orchestrator(
+            self.target, task="Recover a saved report", budget_usd=1.0, workflow_id="report-without-checkpoint",
+            process_runner=codex, claude_runner=claude,
+        )
+        runner.start()
+
+        class InterruptedAfterProviderCheckpoint(orchestrator.Orchestrator):
+            interrupted = False
+
+            def _call_claude(self, header, stage, sections, *, metadata=None):
+                report, manifest = super()._call_claude(header, stage, sections, metadata=metadata)
+                if stage == "code_review" and (metadata or {}).get("review_kind") == "part" and not self.interrupted:
+                    self.interrupted = True
+                    raise KeyboardInterrupt()
+                return report, manifest
+
+        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "14000"}):
+            with self.assertRaises(KeyboardInterrupt):
+                InterruptedAfterProviderCheckpoint(
+                    self.target, workflow_id="report-without-checkpoint", process_runner=codex,
+                    claude_runner=claude,
+                ).approve()
+            saved = json.loads(runner.state_path.read_text(encoding="utf-8"))
+            part = saved["review_campaign"]["part_reviews"][0]
+            self.assertEqual(part["status"], "pending")
+            context = next(
+                item for item in saved["claude_contexts"]
+                if item.get("campaign_id") == saved["review_campaign"]["campaign_id"]
+                and item.get("part_id") == part["part_id"]
+            )
+            self.assertEqual(context["call_state"], "completed")
+            self.assertTrue(context["report"])
+            operation = next(
+                item for item in saved["operation_history"] if item["operation_id"] == context["operation_id"]
+            )
+            self.assertEqual(operation["status"], "completed")
+            calls_before_resume = len(claude.prompts)
+
+            source_file = self.target / next(iter(changed))
+            source_file.write_text(changed[next(iter(changed))] + "# changed after review result\n", encoding="utf-8")
+            with self.assertRaisesRegex(orchestrator.WorkflowError, "Target changed outside the completed write operation"):
+                orchestrator.Orchestrator(
+                    self.target, workflow_id="report-without-checkpoint", process_runner=codex,
+                    claude_runner=claude,
+                ).resume()
+            self.assertEqual(len(claude.prompts), calls_before_resume)
+            source_file.write_text(changed[next(iter(changed))], encoding="utf-8")
+
+            completed = orchestrator.Orchestrator(
+                self.target, workflow_id="report-without-checkpoint", process_runner=codex,
+                claude_runner=claude,
+            ).resume()
+
+        recovered = completed["review_campaign"]["part_reviews"][0]
+        self.assertEqual(completed["status"], "complete")
+        self.assertEqual(recovered["report"], context["report"])
+        self.assertEqual(recovered["status"], "reviewed")
+        self.assertEqual(recovered["calls"][0]["prompt_sha256"], context["prompt_sha256"])
+        self.assertEqual(len(claude.prompts), calls_before_resume)
 
     def test_local_recovery_dry_run_revalidates_reports_without_writing_or_calling_provider(self):
         runner, claude, saved = self.create_completed_review_for_recovery("local-review-dry-run")

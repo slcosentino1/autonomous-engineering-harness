@@ -97,3 +97,72 @@ No external provider calls or Harness workflow were executed. Tests use controll
 ### Deviations and remaining risks
 
 No Phase 0 invariant or persisted-state schema changed. A regression test that previously treated an injected-runner exception after the persisted launching checkpoint as an ordinary failed workflow now requires recovery: without a PID or terminal result, execution is uncertain and must not be retried automatically. The test-injected runner interface can report a PID only after it returns; the production Popen path persists its PID before output collection, as before. ReviewCampaign, evidence/delivery ownership, and Coordinator relocation remain later-phase work. Phase 3 has not started.
+
+## Phase 3A — ReviewCampaign characterization and recovery tests
+
+**Status:** Characterization and focused regression tests complete; no production refactor performed.
+
+### Findings
+
+- `ReviewCampaign` still receives and mutates Orchestrator's authoritative workflow-state dictionary. It owns campaign planning/partitioning, report validation, coverage, and per-part/integration snapshot evolution; save, provider, call-count authorization, and trace callbacks reach back into Orchestrator.
+- Orchestrator owns authorization, budget, operation IDs/history, provider invocation, process identity, terminal Claude context persistence, recovery resolution, and stage transitions. Terminal provider context/operation results are persisted before the campaign part checkpoint.
+- A completed report whose campaign checkpoint is absent can be reused by normal resume using campaign ID, part ID, completed call state, report, and prompt-hash de-duplication, followed by report structure validation. This path does not reconstruct and compare the prompt or verify the context `operation_id` against operation history. Local `recover_code_review` has broader prompt/source/report checks but requires call metadata to be internally consistent and is not the same repair path.
+- A launched Claude operation with no terminal result is recovery-required. Default resume does not repeat it. Unknown spend blocks later paid calls. Explicit retry requires verified cost, confirmation that the prior provider call is inactive, and cap/remaining-budget validation; it records resolution on the old operation and creates a new operation ID. Paid work may repeat; exactly-once execution is not guaranteed.
+
+See `phase-3a-review-campaign-characterization.md` for lifecycle, state/callback inventory, sequence diagrams, test gap analysis, and a proposed snapshot/result boundary. See `phase-3a-review-recovery-matrix.md` for the scenario matrix.
+
+### Tests and validation
+
+- Added `WorkflowTests.test_three_part_uncertain_campaign_call_requires_explicit_retry`: checks a completed first part, uncertain second operation, pending later parts, default-resume blocking, cost/inactive confirmation, and explicit retry with retained old operation history and a new ID.
+- Added `WorkflowTests.test_completed_review_report_recovers_when_campaign_checkpoint_is_missing`: interrupts after the fake provider result and operation/context are saved but before the campaign checkpoint; resume recovers the exact report without a second call.
+- The missing-checkpoint test also changes the reviewed source before resume, verifies the target fingerprint gate rejects reuse without another call, restores the source, then verifies recovery.
+- Focused run of both new tests — **2 passed**.
+- `python3 -m unittest discover -s tests` — **411 tests passed** in 206.279 seconds.
+- `PYTHONPYCACHEPREFIX=/private/tmp/phase3a-compileall-cache python3 -m compileall -q harness tests` — passed. The exact command without the cache prefix was attempted, but the sandbox denied writing `tests/__pycache__`; the external cache prefix compiled the same sources without writing into the checkout.
+- `git diff --check` — passed after the final changes.
+
+### Preconditions for Phase 3B
+
+Agree on the minimum immutable campaign inputs/result and Coordinator-owned operation/persistence contract. Decide whether normal saved-context reuse must validate operation ID, proposal version, and reconstructed prompt/section hashes. Add focused tests for reviewed-record tampering, the campaign-level source-hash guard independent of the earlier target-fingerprint guard, and resume after all review checkpoints but before stage advancement. Then extract deterministic transitions without changing authorization, budget, provider invocation, operation history, or workflow schema.
+
+No provider calls or Harness workflows were executed. Tests use temporary repositories and local fake providers.
+
+
+## Phase 3B.1 — ReviewCampaign contract and recovery rules
+
+**Status:** Design direction accepted for Phase 3B.2 extraction. The stricter report identity and recovery proposals remain deferred to Phase 3B.3.
+
+See `docs/architecture/phase-3b1-review-campaign-contract.md` for the proposed capability contract, report identity and recovery rules, persistence boundary, transition protocol, test matrix, and decisions requiring approval. No production code, tests, or persisted state formats were changed in Phase 3B.1.
+
+## Phase 3B.2 — ReviewCampaign pure capability extraction
+
+**Status:** Deterministic review capabilities extracted; workflow lifecycle and recovery remain in the compatibility runner and Orchestrator.
+
+### Modules and contracts
+
+- Added `workflow/review_models.py` for immutable review inputs, source segments, campaign snapshots, requests, provider outcomes, validations, and transitions. The snapshot wrapper uses the existing persisted campaign JSON shape; its contract version is in memory only.
+- Added `workflow/review_partitioning.py` for adaptive lossless partitioning, source and segment hashes, manifests, ordering, and partition validation.
+- Added `workflow/review_requests.py` for byte-stable part and integration prompts, ordered sections, redaction, request hashes, and ephemeral proposal/segment identity.
+- Added `workflow/review_validation.py` for part/integration report checks, typed `ReportValidation` findings, validated-report rendering, and feedback formatting. The existing dictionary parser remains available as a compatibility API.
+- Added `workflow/review_campaign.py` for campaign snapshot creation, authorization-blocked snapshot values, coverage evolution, and pure `advance(snapshot, input, previous_result)` decisions.
+- `workflow/review_input.py` now imports `ReviewDiff` directly from the value module, removing its dependency on the campaign runner.
+
+`ReviewCampaign` remains the compatibility runner for current provider callbacks, trace spans, workflow saves, and report recovery. The Orchestrator continues to own authorization, budget and spend, operation IDs/history, Claude context persistence, process identity, provider execution, workflow locks and stages, retry/recovery decisions, and target fingerprint checks. Phase 3B.2 does not add strict operation-history joins or change existing recovery trust rules.
+
+### Compatibility and tests
+
+- Compared a representative part request with the pre-extraction implementation at `HEAD`: section mapping and final prompt bytes match; the prompt SHA-256 remains `03a5307d6c80026f4aa1f6d5682f07f0455da0f22cd142458a2bad6101ce0ad2`.
+- Compared adaptive partition output against the pre-extraction implementation: the partition manifest matches for a three-part, three-segment fixture.
+- Compared part and integration request sections from a two-part fixture: all three provider requests match the pre-extraction implementation.
+- Added `tests/test_review_capability.py` with 13 focused tests for deterministic partitioning, boundaries and exclusions, immutable requests/snapshots, report validation, coverage, transitions, invalid and uncertain outcomes, and existing campaign JSON keys.
+- Added a workflow regression verifying part trace results follow part identity when persisted part checkpoints are reordered.
+- Focused capability, trace, and workflow recovery set — **17 tests passed**, including both Phase 3A recovery tests.
+- Final full-suite run, `PYTHONPYCACHEPREFIX=/private/tmp/phase3b2-final-cache python3 -m unittest discover -s tests` — **425 tests passed** in 179.135 seconds. This includes both Phase 3A recovery tests.
+- `PYTHONPYCACHEPREFIX=/private/tmp/phase3b2-final-cache python3 -m compileall -q harness tests` — passed.
+- `git diff --check` — passed.
+- No real external providers or Harness workflows were invoked; workflow integration tests use fakes and temporary repositories.
+- No persisted schema fields or migrations were added. Proposal hashes and snapshot versions exist only in capability values; the serialized campaign keys remain unchanged. The final review also corrected trace status lookup to resolve the transitioned part by `part_id`, preserving accurate trace metadata when saved checkpoints are reordered.
+
+### Remaining coupling and Phase 3B.3
+
+The current `ReviewCampaign` compatibility runner still receives workflow state and narrow callbacks, and `orchestrator.py` retains compatibility wrappers. Existing context fallback and local recovery still use their current identity checks. Phase 3B.3 owns the Coordinator-side recovery contract, operation-history association, stricter missing-checkpoint identity, and remaining adapter/callback removal. No provider, authorization, budget, operation, persistence, recovery, or workflow-stage policy was changed here.

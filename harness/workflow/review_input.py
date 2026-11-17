@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Callable
 
 from workflow import workspace
-from workflow.review import ReviewDiff
+from workflow.review_models import ReviewDiff
 
 
 OS_METADATA_NAMES = {
