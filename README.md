@@ -1,12 +1,11 @@
 # Autonomous Engineering Harness
 
-A small Python workflow that plans an assignment, waits for approval, implements it with Codex, and reviews the resulting change with Claude through Aily.
+A Python-based engineering workflow that coordinates Codex and Claude across planning, human approval, implementation, independent review, bounded correction, verification, and delivery. It is designed to make agent-driven changes auditable and controlled rather than simply chaining CLI calls.
 
 ## Requirements
 
 - Python 3.11 or newer
 - Codex CLI (`codex`)
-- Aily CLI (`aily`) for Claude plan and code reviews
 - A Git target repository
 
 The harness core uses only the Python standard library and has no `requirements.txt`. Optional Langfuse tracing uses the pinned SDK in [`requirements-tracing.txt`](requirements-tracing.txt). The harness and tracing SDK require Python 3.11 or newer. The SDK supports Langfuse Cloud or self-hosted Langfuse v4.59.0 or newer; if the project is on an older self-hosted server, upgrade the server before installing this tracing SDK.
@@ -37,15 +36,15 @@ There are no core packages to install. `.venv/` is ignored by Git. If you use an
 
 Each stage is recorded in one small JSON state file. `resume` retries only the failed stage. It does not replan completed work or cross the approval gate.
 
-Starting the workflow writes one persistent authorization into that state. It binds normal development operations to the exact target and workflow ID, authorizes the configured Claude/Aily reviews within the declared budget, and is reused on every stage and resume. The saved scope is checked before resuming; approval and resume commands do not request or replace the authorization.
+Starting the workflow writes one persistent authorization into that state. It binds normal development operations to the exact target and workflow ID, authorizes the configured Claude reviews within the declared budget, and is reused on every stage and resume. The saved scope is checked before resuming; approval and resume commands do not request or replace the authorization.
 
 ## Start a workflow
 
-Provide an absolute target path and assignment. Claude/Aily calls default to a total budget of USD 2.00; override it with `--budget-usd`. The workflow prints and stores the effective budget. A Codex model is optional; without `--model`, the CLI's configured default is used.
+Provide an absolute target path and assignment. Claude calls default to a total budget of USD 2.00; override it with `--budget-usd`. The workflow prints and stores the effective budget. A Codex model is optional; without `--model`, the CLI's configured default is used.
 
 New workflows authorize at most 32 Claude code-review calls by default across the initial review, post-correction verification, parts, integration reviews, and retries. Set `--max-code-review-calls` from 1 to 64 to authorize a different total. The limit is saved at workflow start and never expands on resume. If the saved call budget cannot cover a minimum verification campaign, correction is stopped before Codex is invoked. A larger resulting diff can still require more calls than remain; in that case verification fails closed and delivery is blocked. Existing workflows keep their saved limit.
 
-New workflows also save execution limits in the target-bound authorization: at most 8 Codex calls, a 3,600-second Codex call timeout, a 900-second Claude/Aily call timeout, and 24 hours of active workflow runtime by default. Override them at `start` with `--max-codex-calls`, `--codex-timeout-seconds`, `--claude-timeout-seconds`, or `--workflow-timeout-seconds`. Limits are persisted and reused on resume. Codex and Claude call counts, measured provider runtime, active workflow runtime, and correction attempts are persisted in `state.json`. Per-call timeouts and aggregate runtime limits stop later calls once exhausted. Existing authorizations without these limits remain readable and receive the current defaults for work they resume; their earlier consumption cannot be reconstructed when old state has no usage evidence.
+New workflows also save execution limits in the target-bound authorization: at most 8 Codex calls, a 3,600-second Codex call timeout, a 900-second Claude call timeout, and 24 hours of active workflow runtime by default. Override them at `start` with `--max-codex-calls`, `--codex-timeout-seconds`, `--claude-timeout-seconds`, or `--workflow-timeout-seconds`. Limits are persisted and reused on resume. Codex and Claude call counts, measured provider runtime, active workflow runtime, and correction attempts are persisted in `state.json`. Per-call timeouts and aggregate runtime limits stop later calls once exhausted. Existing authorizations without these limits remain readable and receive the current defaults for work they resume; their earlier consumption cannot be reconstructed when old state has no usage evidence.
 
 ```sh
 python /path/to/autonomous-engineering-harness/harness/orchestrator.py start \
@@ -59,7 +58,7 @@ For example, `--budget-usd 0.75` overrides the budget, and `--model MODEL_NAME` 
 
 GitHub Issues can supply task text to the local Harness. The Harness remains responsible for planning, local approval, implementation, review, recovery, and delivery. Install and authenticate the GitHub CLI (`gh auth login`), then configure an operator-controlled repository allowlist before importing:
 
-The `harness/orchestrator.py` entry point loads the optional `harness/.env` file before reading configuration. Values already set in the parent environment take precedence. The file uses simple `KEY=value` assignments; shell commands and variable expansion are not evaluated. `.env` files are ignored by Git. GitHub CLI authentication can use `GH_TOKEN`, `GH_ENTERPRISE_TOKEN`, or `GITHUB_TOKEN` from this file or the parent environment. These authentication variables are passed only to the `gh` subprocess. Codex and Claude/Aily receive an isolated GitHub CLI config path, no GitHub or Langfuse credential variables, no SSH agent variables, and no global Git credential helpers. Langfuse credentials remain available to the Harness tracing client and its local preflight only.
+The `harness/orchestrator.py` entry point loads the optional `harness/.env` file before reading configuration. Values already set in the parent environment take precedence. The file uses simple `KEY=value` assignments; shell commands and variable expansion are not evaluated. `.env` files are ignored by Git. GitHub CLI authentication can use `GH_TOKEN`, `GH_ENTERPRISE_TOKEN`, or `GITHUB_TOKEN` from this file or the parent environment. These authentication variables are passed only to the `gh` subprocess. Codex and Claude receive an isolated GitHub CLI config path, no GitHub or Langfuse credential variables, no SSH agent variables, and no global Git credential helpers. Langfuse credentials remain available to the Harness tracing client and its local preflight only.
 
 ```sh
 export HARNESS_GITHUB_ALLOWED_REPOSITORIES="github.com/OWNER/REPO"
@@ -104,7 +103,7 @@ Langfuse receives the invocation and finish timestamps as safe metadata. Because
 
 The authorization saved at `start` records whether tracing is enabled, its fixed metadata scope, and a hash of the authorized Langfuse endpoint. It never stores credentials. Approval, revision, and resume reuse that saved setting and endpoint; older workflows without an observability scope remain tracing-disabled. Trace data is buffered locally while the workflow lock is held and exported only after the operation releases the lock. Langfuse initialization, export, and shutdown failures do not affect workflow results.
 
-Elapsed `duration_ms` values come from the harness monotonic clock and cover root executions, stages, provider calls, and review parts. The adapter buffers observations until after execution and records elapsed duration as metadata; `duration_ms` is the authoritative duration. Aily-reported Claude cost is also attached as native generation `cost_details.total`; token usage and model names are omitted when the provider does not report them.
+Elapsed `duration_ms` values come from the harness monotonic clock and cover root executions, stages, provider calls, and review parts. The adapter buffers observations until after execution and records elapsed duration as metadata; `duration_ms` is the authoritative duration. Provider-reported Claude cost is also attached as native generation `cost_details.total`; token usage and model names are omitted when the provider does not report them.
 
 The workflow prints its ID and proposal path. Review the proposal, then explicitly approve it:
 
@@ -143,7 +142,7 @@ python /path/to/autonomous-engineering-harness/harness/orchestrator.py resume \
 
 ### Explicit budget changes on resume
 
-An explicitly authorized resume can also change the saved Claude/Aily total budget:
+An explicitly authorized resume can also change the saved Claude total budget:
 
 ```sh
 python /path/to/autonomous-engineering-harness/harness/orchestrator.py resume \
@@ -155,13 +154,13 @@ python /path/to/autonomous-engineering-harness/harness/orchestrator.py resume \
   --set-budget-limit 3.71
 ```
 
-Use one option per command. `--extend-budget` adds a positive finite USD amount with at most two decimal places to the current total; `--set-budget-limit` supplies the new absolute total, including prior spend. The absolute limit may be lowered or set equal to the current limit, but cannot be below accumulated spend. A saved change is recorded under `authorization.claude_aily.budget_changes` in `state.json`, including its timestamp, operation, old and new limits, requested amount, spend, remaining budget, workflow and authorization IDs, command, and failed stage. The resume command prints the applied limit and remaining amount before retrying. If less than one cent remains, the change stays authorized and the failed stage remains untried. Changes also remain saved if the stage retry fails; a later plain `resume` uses the saved limit without extending it again. Check the applied summary or saved history before repeating an extension, since each repeated extension is a new addition. Omitting both options preserves the existing resume behavior.
+Use one option per command. `--extend-budget` adds a positive finite USD amount with at most two decimal places to the current total; `--set-budget-limit` supplies the new absolute total, including prior spend. The absolute limit may be lowered or set equal to the current limit, but cannot be below accumulated spend. A saved change is recorded in the provider budget-change history in `state.json`, including its timestamp, operation, old and new limits, requested amount, spend, remaining budget, workflow and authorization IDs, command, and failed stage. The resume command prints the applied limit and remaining amount before retrying. If less than one cent remains, the change stays authorized and the failed stage remains untried. Changes also remain saved if the stage retry fails; a later plain `resume` uses the saved limit without extending it again. Check the applied summary or saved history before repeating an extension, since each repeated extension is a new addition. Omitting both options preserves the existing resume behavior.
 
 Workflow files are stored under `.engineering/workflows/WORKFLOW_ID/` in the target: `state.json`, `proposal.md`, and, on completion, `delivery.md`.
 
 Each Codex operation record in `state.json` includes the exact UTF-8 input hash and size, raw captured stdout/stderr hashes and sizes, the final-message file hash when available, exit status, timestamps, and monotonic duration. Stream hashes cover the bytes captured by the subprocess pipes; when a test runner supplies text instead of bytes, the harness hashes its UTF-8 encoding and records that representation. `result_sha256` remains the hash of the trimmed, normalized final response used by workflow recovery, so it is distinct from the raw stdout and final-message file hashes. Timeouts are marked partial, while streams unavailable after interruption are marked unavailable or not captured.
 
-Provider CLIs run in a separate process group/session. On timeout or `KeyboardInterrupt`, the Harness sends a termination signal and escalates to a forceful kill after a short grace period where the platform supports it. This stops local child processes; it cannot prove that a remote provider request already accepted by Aily or Codex was cancelled. Interrupted Claude calls therefore retain unknown-cost protection, and interrupted write-capable Codex calls require explicit recovery and target inspection. A cancellation or timeout does not advance the workflow stage. The active workflow runtime limit pauses while awaiting human approval; crash recovery conservatively accounts for time spent while a saved workflow was still marked running.
+Provider CLIs run in a separate process group/session. On timeout or `KeyboardInterrupt`, the Harness sends a termination signal and escalates to a forceful kill after a short grace period where the platform supports it. This stops local child processes; it cannot prove that a remote provider request already accepted by a provider was cancelled. Interrupted Claude calls therefore retain unknown-cost protection, and interrupted write-capable Codex calls require explicit recovery and target inspection. A cancellation or timeout does not advance the workflow stage. The active workflow runtime limit pauses while awaiting human approval; crash recovery conservatively accounts for time spent while a saved workflow was still marked running.
 
 Proposal versions, completed review reports, implementation/correction summaries, the reviewed patch, and the target fingerprint are associated by SHA-256 evidence in `state.json`. Before writing `delivery.md`, the Harness checks that the saved proposal and review reports still match their recorded hashes and that the eligible target patch and target fingerprint still match the final review snapshot. It records a hash of `delivery.md` after writing; `status` and `resume` check completed delivery integrity again. A mismatch, missing artifact, unavailable fingerprint, or incomplete final verification prevents delivery or is reported as an integrity failure. These hashes detect accidental or subsequent content changes when the state file remains trustworthy; they do not prove authenticity against someone able to rewrite both artifacts and state.
 
@@ -185,7 +184,7 @@ Initial and final fingerprints are point-in-time snapshots, not an operation log
 - Code review keeps one call when the complete prompt fits. Otherwise, changed files are grouped using their actual paths and names, and each part is sized from its complete serialized prompt. A file that still does not fit is split only at conservative patch boundaries; when no safe split fits, the campaign stops and records the file as unreviewed. Every eligible patch segment is assigned once, with a hash and line range.
 - Every part receives the same hashed assignment, approved proposal, implementation summary, repository instructions, relevant skill application, inferred module map, and independent architecture/product/engineering review rubric. Multi-part campaigns review the individual reports together in a final integration call; the consolidated report is not complete until all assigned files and that integration review are complete.
 - Claude reviews as an independent senior architect, backend engineer, product engineer, and technical reviewer. It verifies requirements and challenges the approved design, assesses proportionality, and distinguishes Must fix, Should fix, and Optional improvements. Optional improvements do not trigger the correction stage by themselves.
-- `HARNESS_CLAUDE_MAX_PAYLOAD_CHARS` sets the positive-integer preflight limit for the complete serialized prompt after redaction and formatting. It defaults to 200,000 characters; set it higher explicitly before invoking the orchestrator when needed. The effective limit, character count, UTF-8 byte count, and prompt hash are recorded for each validated context attempt. This is a harness setting, not a claim about Claude's or Aily's provider limit; those limits are not established by this integration.
+- `HARNESS_CLAUDE_MAX_PAYLOAD_CHARS` sets the positive-integer preflight limit for the complete serialized prompt after redaction and formatting. It defaults to 200,000 characters; set it higher explicitly before invoking the orchestrator when needed. The effective limit, character count, UTF-8 byte count, and prompt hash are recorded for each validated context attempt. This is a harness setting, not a claim about the provider's request limit; that limit is not established by this integration.
 - Each Claude call records the prompt SHA-256, character count, proposal version, review iteration or campaign part, shared-context hash, per-section hashes, call status and reported cost in `state.json`.
 - Planning and implementation prompts include applicable `AGENTS.md` contents, the Engineering Judgment & Proportional Design guidance, and the full content of stage-selected skills. Claude plan and code reviews receive the full selected skill content as prompt context; Claude does not load skills from its own filesystem.
 - Codex and Claude prompts omit the full file-path inventory when it exceeds 32,000 characters and direct the reviewer to focused repository searches instead.
@@ -199,8 +198,8 @@ Initial and final fingerprints are point-in-time snapshots, not an operation log
 - Review context excludes sensitive files, metadata, binaries, symlinks, and source files that exceed the bounded context limits. Pre-existing regular-file snapshots preserve up to 2 MiB per file and 16 MiB total; if relevant baseline content exceeds those limits, the Harness records it as unavailable and blocks evidence that depends on it. It does not stage, reset, stash, clean, or rewrite user changes.
 - Code reviews receive the complete eligible patch across one or more requests. A payload limit applies to each request, including shared context and part content. No source is silently truncated. If the shared context or an indivisible file segment cannot fit, the workflow stops with an explicit unreviewed reason.
 - The review report contract, part validation, and local `recover-review` behavior are documented in [docs/code-review-pipeline.md](docs/code-review-pipeline.md).
-- The one `--budget-usd` limit applies across Claude calls. Aily receives the remaining amount as a hard call cap. Actual reported costs are accumulated. If a call's cost is unknown or an invocation is interrupted, further Claude calls stop.
-- The workflow authorization allows at most two plan reviews and the saved maximum number of calls for one logical code-review campaign. Individual parts and the integration review share the same budget. Existing one-call authorizations are never silently expanded. The Aily data scope remains the assignment, proposal, implementation/validation summary, and relevant redacted code changes.
+- The one `--budget-usd` limit applies across Claude calls. The configured provider receives the remaining amount as a hard call cap. Actual reported costs are accumulated. If a call's cost is unknown or an invocation is interrupted, further Claude calls stop.
+- The workflow authorization allows at most two plan reviews and the saved maximum number of calls for one logical code-review campaign. Individual parts and the integration review share the same budget. Existing one-call authorizations are never silently expanded. The external review data scope remains the assignment, proposal, implementation/validation summary, and relevant redacted code changes.
 - The workflow authorization does not include commits, pushes, merges, deployments, publication, or shared-infrastructure changes. Those require separate explicit authorization. Codex is instructed to preserve unrelated files and changes.
 
 These are workflow guardrails. They do not override OS, provider, or organization permissions, and they are not an OS-level process sandbox.
@@ -213,4 +212,13 @@ python -m compileall -q harness tests
 git diff --check
 ```
 
-The workflow tests use fake Codex and Aily processes; they do not contact external services.
+The workflow tests use fake provider processes; they do not contact external services.
+
+
+## Project ownership and permissions
+
+Copyright © 2026 Sebastian Cosentino. All rights reserved.
+
+This repository is public for viewing and evaluation. Unless you have separate, express written permission from the copyright holder, no license is granted to use, copy, modify, adapt, publish, distribute, sublicense, or create derivative works from this project's code or documentation. Public visibility on GitHub does not place this project in the public domain or make it open source.
+
+The project may include references to and integrations with third-party tools. Their names and trademarks belong to their respective owners; this notice applies only to original material in this repository.
