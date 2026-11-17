@@ -38,10 +38,10 @@ from workflow import authorization as _authorization
 from workflow import cli as _cli
 from workflow import persistence as _persistence
 from workflow import process_locks as _process_locks
-from workflow import process_control as _process_control
 from workflow import planning as _planning
 from workflow import planning_review as _planning_review
 from workflow import execution as _execution
+from workflow import codex_executor as _codex_executor
 from workflow import review_input as _review_input
 from workflow import skills as _skills
 from workflow import traceability as _traceability
@@ -537,80 +537,32 @@ def _sha256_text(value: str) -> str | None:
 
 
 def build_codex_command(
-    executable: str, target: Path, sandbox: str, output_path: Path, model: str | None = None,
-    *, read_only_authorized_urls: list[str] | None = None,
+    executable: str,
+    target: Path,
+    sandbox: str,
+    output_path: Path,
+    model: str | None = None,
+    *,
+    read_only_authorized_urls: list[str] | None = None,
     disabled_user_mcp_servers: list[str] | None = None,
 ) -> list[str]:
-    """Build the installed CLI's supported command; approval policy is a root option."""
-    command = [executable]
-    authorized_urls = sorted(set(read_only_authorized_urls or [])) if sandbox == "read-only" else []
-    command.extend(["--ask-for-approval", "never", "exec"])
-    command.extend([
-        "--json", "--ephemeral", "--disable", "plugins",
-        "--sandbox", sandbox, "--cd", str(target),
-        "--output-last-message", str(output_path),
-    ])
-    user_mcp_servers: list[str] = []
-    if sandbox == "read-only":
-        if disabled_user_mcp_servers is None:
-            raise WorkflowError("Read-only Codex calls require explicit user MCP isolation.")
-        if any(not isinstance(name, str) or not name for name in disabled_user_mcp_servers):
-            raise WorkflowError(
-                "Configured Codex MCP server names are invalid; planning stopped before provider execution."
-            )
-        user_mcp_servers = sorted(set(disabled_user_mcp_servers))
-    if authorized_urls and "documentation_reader" in user_mcp_servers:
-        raise WorkflowError(
-            "Read-only documentation access cannot use the configured MCP name 'documentation_reader'."
+    """Compatibility facade for Codex command construction."""
+    try:
+        return _codex_executor.build_codex_command(
+            executable, target, sandbox, output_path, model,
+            read_only_authorized_urls=read_only_authorized_urls,
+            disabled_user_mcp_servers=disabled_user_mcp_servers,
         )
-    mcp_entries = [f"{json.dumps(name)} = {{ enabled = false }}" for name in user_mcp_servers]
-    if authorized_urls:
-        docs_args = [
-            str(Path(__file__).resolve().parent / "tools" / "read_documentation_url.py"),
-            *[
-                item
-                for url in authorized_urls
-                for item in ("--authorized-url-sha256", authorized_url_sha256(url))
-            ],
-        ]
-        mcp_entries.append(
-            f'"documentation_reader" = {{ enabled = true, command = {json.dumps(sys.executable)}, '
-            f"args = {json.dumps(docs_args)} }}"
-        )
-    mcp_config = "mcp_servers={ " + ", ".join(mcp_entries) + " }" if mcp_entries else "mcp_servers={}"
-    command.extend(["-c", mcp_config])
-    if model is not None:
-        command.extend(["--model", model])
-    command.append("-")
-    return command
+    except _codex_executor.CodexExecutionConfigurationError as exc:
+        raise WorkflowError(str(exc)) from exc
 
 
 def _configured_codex_mcp_servers(environ=None) -> list[str]:
-    """Return user-configured MCP names so read-only calls can disable them explicitly."""
-    env = os.environ if environ is None else environ
-    configured_home = env.get("CODEX_HOME")
-    codex_home = Path(configured_home).expanduser() if configured_home else Path.home() / ".codex"
-    config_path = codex_home / "config.toml"
+    """Compatibility facade for isolated Codex MCP configuration discovery."""
     try:
-        config_text = config_path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return []
-    except (OSError, UnicodeError) as exc:
-        raise WorkflowError(
-            "Could not inspect Codex user configuration to isolate MCP servers; planning stopped before provider execution."
-        ) from exc
-    try:
-        config = tomllib.loads(config_text)
-    except tomllib.TOMLDecodeError as exc:
-        raise WorkflowError(
-            "Codex user configuration is invalid; planning stopped before provider execution to preserve MCP isolation."
-        ) from exc
-    servers = config.get("mcp_servers", {})
-    if not isinstance(servers, dict) or any(not isinstance(name, str) or not name for name in servers):
-        raise WorkflowError(
-            "Codex user MCP configuration is invalid; planning stopped before provider execution."
-        )
-    return sorted(servers)
+        return _codex_executor.configured_codex_mcp_servers(environ)
+    except _codex_executor.CodexExecutionConfigurationError as exc:
+        raise WorkflowError(str(exc)) from exc
 
 
 def _planning_read_only_authorized_urls(stage: str, task: str) -> list[str]:
@@ -3093,81 +3045,16 @@ class Orchestrator:
             self._active_codex_persisted_status = previous_persisted_status
 
     def _codex_cli_version(self) -> str | None:
-        """Read the configured CLI version without making a provider call; optional metadata only."""
+        """Read optional CLI version metadata without making a provider request."""
         if self._codex_cli_version_checked:
             return self._codex_cli_version_cache
         self._codex_cli_version_checked = True
-        if self.process_runner is not subprocess.run:
-            return None
-        try:
-            with tempfile.TemporaryDirectory(prefix="harness-codex-version-") as isolated_config:
-                result = subprocess.run(
-                    [self.codex, "--version"],
-                    cwd=str(self.target),
-                    env=_workspace.provider_env(isolated_config),
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    timeout=3,
-                    check=False,
-                )
-        except (OSError, subprocess.SubprocessError, ValueError):
-            return None
-        if result.returncode != 0:
-            return None
-        version_bytes, _source = _output_bytes(result.stdout)
-        if version_bytes is None:
-            return None
-        version = version_bytes.decode("utf-8", "replace").strip().splitlines()
-        if not version or len(version[0]) > 96:
-            return None
-        if re.fullmatch(r"(?:codex-cli|codex)\s+v?[0-9][A-Za-z0-9.+-]*", version[0], re.IGNORECASE):
-            self._codex_cli_version_cache = version[0]
-        return self._codex_cli_version_cache
-
-    def _run_process_with_pid(self, command: list[str], *, operation_id: str, **kwargs):
-        """Run the normal subprocess interface while persisting a child PID when available."""
-        timeout = kwargs.pop("timeout", None)
-        check = kwargs.pop("check", False)
-        input_data = kwargs.pop("input", None)
-        self._operation_launching(operation_id)
-        if self.process_runner is subprocess.run:
-            process = subprocess.Popen(
-                command,
-                stdin=subprocess.PIPE if input_data is not None else kwargs.pop("stdin", None),
-                **_process_control.process_group_options(),
-                **kwargs,
-            )
-            try:
-                self._operation_process_started(operation_id, process.pid)
-            except BaseException:
-                _process_control.terminate_process_group(process)
-                process.communicate()
-                raise
-            try:
-                stdout, stderr = process.communicate(input=input_data, timeout=timeout)
-            except subprocess.TimeoutExpired as exc:
-                _process_control.terminate_process_group(process)
-                stdout, stderr = process.communicate()
-                raise subprocess.TimeoutExpired(
-                    command, timeout, output=stdout, stderr=stderr,
-                ) from exc
-            except KeyboardInterrupt:
-                _process_control.terminate_process_group(process)
-                process.communicate()
-                raise
-            result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
-            if check and result.returncode:
-                raise subprocess.CalledProcessError(result.returncode, command, output=stdout, stderr=stderr)
-            return result
-
-        result = self.process_runner(
-            command, input=input_data, timeout=timeout, check=check, **kwargs,
+        self._codex_cli_version_cache = _codex_executor.read_cli_version(
+            self.codex,
+            self.target,
+            process_runner=self.process_runner,
         )
-        process_id = getattr(result, "pid", None)
-        if isinstance(process_id, int) and not isinstance(process_id, bool) and process_id > 0:
-            self._operation_process_started(operation_id, process_id)
-        return result
+        return self._codex_cli_version_cache
 
     def _run_codex_impl(self, prompt: str, *, sandbox: str) -> str:
         with tempfile.TemporaryDirectory(prefix="harness-codex-result-") as output_dir:
@@ -3254,17 +3141,62 @@ class Orchestrator:
             self._update_active_codex_trace(operation)
             invocation_started = time.monotonic()
             try:
-                result = self._run_process_with_pid(
-                    command,
-                    operation_id=operation["operation_id"],
-                    cwd=str(self.target),
-                    input=effective_prompt_bytes,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=call_timeout,
-                    check=False,
-                    env=_workspace.provider_env(Path(output_dir) / "isolated-github-config"),
+                execution_environment = _codex_executor.prepare_provider_environment(
+                    Path(output_dir) / "isolated-github-config",
                 )
+                execution_request = _codex_executor.CodexExecutionRequest(
+                    operation_id=operation["operation_id"],
+                    command=tuple(command),
+                    prompt_bytes=effective_prompt_bytes,
+                    working_directory=self.target,
+                    timeout_seconds=call_timeout,
+                    environment=execution_environment,
+                )
+                self._operation_launching(operation["operation_id"])
+                execution_result = _codex_executor.CodexExecutor(
+                    process_runner=self.process_runner,
+                ).execute(
+                    execution_request,
+                    on_process_started=lambda process_id: self._operation_process_started(
+                        operation["operation_id"], process_id,
+                    ),
+                )
+                if execution_result.operation_id != operation["operation_id"]:
+                    raise _codex_executor.CodexExecutionUncertainError(
+                        "Codex executor returned a result for another operation.",
+                        error_category="OperationIdMismatch",
+                    )
+                tracked_process_id = operation.get("process_id")
+                if (execution_result.process_id is not None
+                        and tracked_process_id != execution_result.process_id):
+                    raise _codex_executor.CodexExecutionUncertainError(
+                        "Codex executor process identity was not persisted against the active operation.",
+                        error_category="ProcessIdMismatch",
+                    )
+                if execution_result.outcome == "timed_out":
+                    raise subprocess.TimeoutExpired(
+                        command,
+                        call_timeout,
+                        output=execution_result.stdout,
+                        stderr=execution_result.stderr,
+                    )
+                if execution_result.outcome == "cancelled":
+                    raise KeyboardInterrupt()
+                if execution_result.outcome == "launch_failed":
+                    raise _codex_executor.CodexLaunchError(
+                        execution_result.error_message or "Codex could not start.",
+                        error_category=execution_result.error_category or "CodexLaunchError",
+                    )
+                if execution_result.outcome == "result_unavailable":
+                    raise _codex_executor.CodexExecutionUncertainError(
+                        execution_result.error_message or "Codex execution result is unavailable.",
+                        error_category=execution_result.error_category or "CodexResultUnavailable",
+                    )
+                if execution_result.outcome not in {"completed", "nonzero_exit"}:
+                    raise _codex_executor.CodexExecutionUncertainError(
+                        "Codex executor returned an unsupported outcome.",
+                        error_category="InvalidExecutionOutcome",
+                    )
             except subprocess.TimeoutExpired as exc:
                 invocation_finished = time.monotonic()
                 partial_stdout, stdout_representation = _output_bytes(exc.output)
@@ -3324,16 +3256,36 @@ class Orchestrator:
                 self._finish_operation(
                     operation["operation_id"], status="failed",
                     outcome=f"Codex could not start: {redact(str(exc))}",
-                    error_category=type(exc).__name__, launch_state="not_started", evidence=stream_evidence,
+                    error_category=getattr(exc, "error_category", type(exc).__name__),
+                    launch_state="not_started", evidence=stream_evidence,
                 )
                 raise WorkflowError(f"Codex could not start: {redact(str(exc))}") from exc
+            except _codex_executor.CodexExecutionUncertainError as exc:
+                invocation_finished = time.monotonic()
+                stream_evidence = _codex_stream_evidence(
+                    None, None, stdout_status="unavailable", stderr_status="unavailable",
+                    stdout_truncated=None, stderr_truncated=None,
+                )
+                stream_evidence.update({
+                    "stdout_capture_representation": "unavailable",
+                    "stderr_capture_representation": "unavailable",
+                    "duration_ms": max(0, round((invocation_finished - invocation_started) * 1000)),
+                })
+                self._finish_operation(
+                    operation["operation_id"], status="interrupted",
+                    outcome="Codex may have started, but no trustworthy terminal result was captured; target changes require inspection.",
+                    error_category=exc.error_category, evidence=stream_evidence,
+                )
+                raise WorkflowError(
+                    "Codex execution result is uncertain; inspect the target and workflow status before retrying."
+                ) from exc
             invocation_finished = time.monotonic()
             if sandbox == "workspace-write":
                 operation["target_fingerprint_after"] = self._fingerprint_repository(self.target)
-            stdout_raw, stdout_representation = _output_bytes(result.stdout)
-            stderr_raw, stderr_representation = _output_bytes(result.stderr)
-            stdout = result.stdout.decode("utf-8", "replace") if isinstance(result.stdout, bytes) else str(result.stdout or "")
-            stderr = result.stderr.decode("utf-8", "replace") if isinstance(result.stderr, bytes) else str(result.stderr or "")
+            stdout_raw, stdout_representation = _output_bytes(execution_result.stdout)
+            stderr_raw, stderr_representation = _output_bytes(execution_result.stderr)
+            stdout = execution_result.stdout.decode("utf-8", "replace") if isinstance(execution_result.stdout, bytes) else str(execution_result.stdout or "")
+            stderr = execution_result.stderr.decode("utf-8", "replace") if isinstance(execution_result.stderr, bytes) else str(execution_result.stderr or "")
             stdout_status = "unavailable" if stdout_raw is None else "empty" if not stdout_raw else "complete"
             stderr_status = "unavailable" if stderr_raw is None else "empty" if not stderr_raw else "complete"
             stream_evidence = _codex_stream_evidence(
@@ -3347,8 +3299,25 @@ class Orchestrator:
                 "stderr_capture_representation": stderr_representation,
                 "duration_ms": max(0, round((invocation_finished - invocation_started) * 1000)),
             })
-            if output_path.exists():
-                last_message_raw = output_path.read_bytes()
+            try:
+                output_exists = output_path.exists()
+                last_message_raw = output_path.read_bytes() if output_exists else None
+            except OSError as exc:
+                stream_evidence.update({
+                    "last_message_file_sha256": None,
+                    "last_message_file_bytes": None,
+                    "last_message_file_status": "unavailable",
+                })
+                self._finish_operation(
+                    operation["operation_id"], status="interrupted",
+                    outcome="Codex completed but its final message could not be read; recovery is required.",
+                    exit_code=execution_result.exit_code, error_category=type(exc).__name__,
+                    evidence=stream_evidence,
+                )
+                raise WorkflowError(
+                    "Codex completed without a readable final message; inspect target changes before retrying."
+                ) from exc
+            if last_message_raw is not None:
                 stream_evidence.update({
                     "last_message_file_sha256": hashlib.sha256(last_message_raw).hexdigest(),
                     "last_message_file_bytes": len(last_message_raw),
@@ -3361,19 +3330,19 @@ class Orchestrator:
                     "last_message_file_bytes": None,
                     "last_message_file_status": "missing",
                 })
-            if result.returncode:
+            if execution_result.exit_code:
                 detail = redact(stderr.strip() or _json_line_message(stdout) or "Codex returned no diagnostic output.")
                 self._finish_operation(
                     operation["operation_id"], status="failed",
-                    outcome=f"Codex exited with status {result.returncode}: {detail}",
-                    exit_code=result.returncode, error_category="CodexExitError", evidence=stream_evidence,
+                    outcome=f"Codex exited with status {execution_result.exit_code}: {detail}",
+                    exit_code=execution_result.exit_code, error_category="CodexExitError", evidence=stream_evidence,
                 )
-                raise WorkflowError(f"Codex exited with status {result.returncode}: {detail}")
+                raise WorkflowError(f"Codex exited with status {execution_result.exit_code}: {detail}")
             if stream_evidence.get("codex_cli_turn_status") == "failed":
                 self._finish_operation(
                     operation["operation_id"], status="failed",
                     outcome="Codex JSONL reported a failed turn.",
-                    exit_code=result.returncode, error_category="CodexReportedTurnFailure", evidence=stream_evidence,
+                    exit_code=execution_result.exit_code, error_category="CodexReportedTurnFailure", evidence=stream_evidence,
                 )
                 raise WorkflowError("Codex JSONL reported a failed turn.")
             if last_message_raw is not None:
@@ -3385,7 +3354,7 @@ class Orchestrator:
             if not message:
                 self._finish_operation(
                     operation["operation_id"], status="failed", outcome="Codex returned an empty response.",
-                    exit_code=result.returncode, error_category="EmptyCodexResponse", evidence=stream_evidence,
+                    exit_code=execution_result.exit_code, error_category="EmptyCodexResponse", evidence=stream_evidence,
                 )
                 raise WorkflowError("Codex returned an empty response.")
             stream_evidence.update({
@@ -3398,7 +3367,7 @@ class Orchestrator:
                     operation["model_source"] = "codex_jsonl_event"
             self._finish_operation(
                 operation["operation_id"], status="completed", outcome="Codex returned a response.",
-                exit_code=result.returncode, result_text=message,
+                exit_code=execution_result.exit_code, result_text=message,
                 result_sha256=hashlib.sha256(message.encode("utf-8")).hexdigest(), launch_state="completed",
                 evidence=stream_evidence,
             )

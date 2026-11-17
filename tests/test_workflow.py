@@ -1310,6 +1310,49 @@ class CodexInvocationEvidenceTests(unittest.TestCase):
         with runner._workflow_lock():
             return runner._run_codex(prompt, sandbox="workspace-write")
 
+    def test_operation_and_pid_are_persisted_before_codex_result_finalization(self):
+        runner, _unused_process = self.invoke()
+        observed = []
+
+        def process_runner(command, **kwargs):
+            persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
+            operation = persisted["operation_history"][-1]
+            self.assertEqual(operation["status"], "started")
+            self.assertEqual(operation["launch_state"], "launching")
+            self.assertEqual(persisted["active_operation_id"], operation["operation_id"])
+            observed.append(("process", operation["operation_id"]))
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            output_path.write_bytes(b"Persisted response")
+            return SimpleNamespace(
+                returncode=0, stdout=b"", stderr=b"", pid=27182,
+            )
+
+        runner.process_runner = process_runner
+        finish_operation = runner._finish_operation
+
+        def observe_terminal_persistence(operation_id, **kwargs):
+            if kwargs.get("status") == "completed":
+                persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
+                operation = next(
+                    item for item in persisted["operation_history"]
+                    if item["operation_id"] == operation_id
+                )
+                self.assertEqual(operation["status"], "started")
+                self.assertEqual(operation["launch_state"], "launched")
+                self.assertEqual(operation["process_id"], 27182)
+                self.assertIsNone(operation["result_text"])
+                observed.append(("pid-persisted", operation_id))
+            finish_operation(operation_id, **kwargs)
+
+        runner._finish_operation = observe_terminal_persistence
+        self.assertEqual(self.run_locked(runner), "Persisted response")
+        self.assertEqual([event for event, _operation_id in observed], ["process", "pid-persisted"])
+        self.assertEqual(observed[0][1], observed[1][1])
+        final_operation = runner.state["operation_history"][-1]
+        self.assertEqual(final_operation["status"], "completed")
+        self.assertEqual(final_operation["process_id"], 27182)
+        self.assertEqual(final_operation["result_text"], "Persisted response")
+
     @staticmethod
     def export_trace(tracer):
         class Client:
@@ -1475,6 +1518,48 @@ class CodexInvocationEvidenceTests(unittest.TestCase):
         self.assertEqual(operation["last_message_file_sha256"], hashlib.sha256(b"").hexdigest())
         self.assertIsNone(operation["reported_usage"])
         self.assertEqual(operation["usage_source"], "not_reported")
+
+    def test_launch_failure_is_not_confused_with_an_uncertain_started_process(self):
+        runner, _process = self.invoke(process_error=FileNotFoundError("Codex executable missing"))
+
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "could not start"):
+            self.run_locked(runner)
+
+        operation = runner.state["operation_history"][-1]
+        self.assertEqual(operation["status"], "failed")
+        self.assertEqual(operation["launch_state"], "not_started")
+        self.assertEqual(operation["error_category"], "FileNotFoundError")
+
+    def test_unavailable_post_launch_result_remains_interrupted(self):
+        runner, _process = self.invoke(process_error=RuntimeError("process result was lost"))
+
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "result is uncertain"):
+            self.run_locked(runner)
+
+        operation = runner.state["operation_history"][-1]
+        self.assertEqual(operation["status"], "interrupted")
+        self.assertEqual(operation["launch_state"], "launching")
+        self.assertEqual(operation["error_category"], "RuntimeError")
+        self.assertIsNone(operation["result_text"])
+
+    def test_unreadable_final_message_after_process_exit_requires_recovery(self):
+        runner, _process = self.invoke(stdout=b'{"type":"turn.completed"}\n')
+        read_bytes = Path.read_bytes
+
+        def fail_for_last_message(path):
+            if path.name == "last-message.md":
+                raise PermissionError("cannot read final message")
+            return read_bytes(path)
+
+        with patch.object(Path, "read_bytes", fail_for_last_message):
+            with self.assertRaisesRegex(orchestrator.WorkflowError, "without a readable final message"):
+                self.run_locked(runner)
+
+        operation = runner.state["operation_history"][-1]
+        self.assertEqual(operation["status"], "interrupted")
+        self.assertEqual(operation["error_category"], "PermissionError")
+        self.assertEqual(operation["last_message_file_status"], "unavailable")
+        self.assertIsNone(operation["result_text"])
 
     def test_nonzero_exit_records_streams_exit_status_and_failure(self):
         stdout = b'{"type":"item.completed","item":{"type":"command_execution"}}\n'
@@ -1926,7 +2011,7 @@ class WorkflowTests(unittest.TestCase):
             self.target, task="Add a feature", budget_usd=1.0, workflow_id="crash-before-launch",
             process_runner=FakeCodex("# Proposal\nPlan.\n", self.refined()),
         )
-        with patch.object(runner, "_run_process_with_pid", side_effect=KeyboardInterrupt()):
+        with patch.object(runner, "_operation_launching", side_effect=KeyboardInterrupt()):
             with self.assertRaises(KeyboardInterrupt):
                 runner.start()
         persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
@@ -5801,20 +5886,30 @@ class WorkflowExecutionFingerprintTests(unittest.TestCase):
             recovery_state["execution_fingerprint"]["final"]["target"]["status"], "captured",
         )
 
-    def test_failed_workflow_captures_final_target_fingerprint(self):
+    def test_uncertain_codex_outcome_requires_recovery_and_captures_final_target_fingerprint(self):
+        calls = 0
+
         def failing_codex(_command, **_kwargs):
+            nonlocal calls
+            calls += 1
             raise RuntimeError("simulated command failure")
 
         runner = orchestrator.Orchestrator(
-            self.target, task="Fail safely", workflow_id="failed-final-fingerprint",
+            self.target, task="Fail safely", workflow_id="uncertain-final-fingerprint",
             process_runner=failing_codex, claude_runner=FakeClaude(),
         )
         with self.assertRaisesRegex(orchestrator.WorkflowError, "Workflow stopped at planning"):
             runner.start()
 
         state = json.loads(runner.state_path.read_text(encoding="utf-8"))
-        self.assertEqual(state["status"], "failed")
+        operation = state["operation_history"][-1]
+        self.assertEqual(state["status"], "recovery_required")
+        self.assertEqual(operation["status"], "interrupted")
+        self.assertEqual(operation["launch_state"], "launching")
+        self.assertIsNone(operation["result_text"])
+        self.assertEqual(state["recovery"]["operation_id"], operation["operation_id"])
         self.assertEqual(state["execution_fingerprint"]["final"]["target"]["status"], "captured")
+        self.assertEqual(calls, 1)
 
     def test_legacy_state_without_fingerprints_remains_resumable(self):
         runner, _codex, _claude = self.make_runner("legacy-no-fingerprints")

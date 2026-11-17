@@ -52,3 +52,48 @@ A one-off comparison evaluated the original prompt expressions from base HEAD an
 No deviations from the Phase 0 recommendations. The stage loop and Orchestrator class were not relocated. Provider selection and arguments, operation IDs, save-before-launch ordering, state JSON, approval/rejection gates, plan-review limits, recovery behavior, timeouts, evidence provenance, delivery gates, and optional observability were not intentionally changed. The full test suite and byte-identical prompt comparison passed. No Harness workflow or external provider call was executed; workflow tests use local fakes.
 
 Remaining technical debt is intentionally outside Phase 1: the Orchestrator still owns lifecycle and Codex execution mechanics; `ReviewCampaign` remains coupled to mutable workflow state and callbacks; evidence and delivery gates remain in the lifecycle owner. Later phases should continue with dedicated recovery characterization before extracting those stateful responsibilities. Phase 2 has not started.
+
+## Phase 2 — Codex executor extraction
+
+**Status:** Complete; final verification passed.
+
+### Lifecycle traced and preserved
+
+1. The stage builds its prompt. _run_codex opens the Codex trace span, then calls _run_codex_impl.
+2. _run_codex_impl builds the persistent authorization prefix, applies the existing read-only documentation and MCP isolation rules, builds the Codex command through workflow/codex_executor.py, encodes and hashes the effective prompt, and checks for an eligible completed operation to reuse.
+3. For a new invocation, the Orchestrator checks the Codex call limit, derives the timeout, reads optional CLI version metadata, creates the operation ID and operation record, and persists the record and invocation_at before execution.
+4. The Orchestrator prepares the isolated provider environment and request, marks the operation launching, and persists that transition before calling the executor.
+5. With the real subprocess runner, the executor starts Codex in a new process group/session. It immediately calls the narrow on_process_started(pid) callback. The Orchestrator associates the PID with the request's operation ID, marks it launched, and persists it before the executor sends prompt bytes or collects stdout/stderr.
+6. The executor captures both streams and normalizes the observed outcome. Timeouts and cancellation terminate and reap the process group through workflow/process_control.py; timeout results retain partial stdout/stderr. An injected test runner has no process-start hook, so its optional PID can only be reported after that runner returns, matching the previous injected-runner behavior.
+7. The Orchestrator validates the operation ID and persisted PID, applies the existing timeout/cancellation/launch/uncertain policy, fingerprints target changes, parses JSONL and stream evidence, reads the last-message file, evaluates exit and turn status, and persists the terminal result, usage/evidence, and accounting.
+8. A completed result remains reusable after a parent interruption before stage advancement. A launched operation without a trustworthy persisted terminal result remains recovery-required and is not automatically replayed. Launch failure before a process is created is recorded as not started and remains safely retryable under existing recovery behavior.
+
+### Contract and responsibility split
+
+workflow/codex_executor.py defines frozen CodexExecutionRequest and CodexExecutionResult dataclasses.
+
+The request contains only the already-constructed operation ID, command, prompt bytes, working directory, timeout, and prepared environment. The result associates observations with that operation ID and reports one of completed, launch_failed, nonzero_exit, timed_out, cancelled, or result_unavailable, plus exit code, captured streams, duration, PID, and error details.
+
+The Codex executor owns command construction, Codex configuration/environment preparation, optional CLI version lookup, subprocess invocation, output capture, timeout/cancellation mechanics, and normalized process results. It imports the existing process-control module for process-group behavior.
+
+The Orchestrator continues to own authorization and budget checks, operation IDs and records, all authoritative persistence (including launch and PID checkpoints), workflow state, accounting, evidence/provenance, recovery decisions, trace association, and stage transitions. It does not pass workflow state or itself to the executor. The PID callback accepts only an integer process identifier and closes over the already-created operation ID.
+
+The executor imports no Orchestrator, CLI, or workflow state, and contains no lifecycle, authorization, budget, retry, or evidence-association policy. Claude/Aily execution and ReviewCampaign were not changed. The persisted workflow schema, prompts, stages, and transitions were not changed.
+
+### Phase 2 files and verification
+
+- harness/workflow/codex_executor.py — explicit execution contract, Codex command/configuration helpers, and process invocation.
+- harness/orchestrator.py — delegates execution to the executor while retaining operation creation, persistence, evidence, accounting, and recovery.
+- tests/test_codex_executor.py — contract, command/process inputs, normalized outcomes, PID ordering, timeout, cancellation, and process-group child cleanup.
+- tests/test_workflow.py — save-before-launch/PID ordering, launch-failure versus uncertain-outcome behavior, unreadable result recovery, and the updated launch-checkpoint test.
+- docs/architecture/modular-v2-migration.md — Phase 2 lifecycle, contract, ownership, and recovery record.
+- Focused verification: 9 executor/process-control tests, 30 Codex evidence/guidance tests, and 5 launch/recovery tests passed.
+- python3 -m unittest discover -s tests — 409 tests passed in 181.619 seconds.
+- python3 -m compileall -q harness tests — passed.
+- git diff --check — passed.
+
+No external provider calls or Harness workflow were executed. Tests use controlled local subprocesses, fakes, and temporary repositories.
+
+### Deviations and remaining risks
+
+No Phase 0 invariant or persisted-state schema changed. A regression test that previously treated an injected-runner exception after the persisted launching checkpoint as an ordinary failed workflow now requires recovery: without a PID or terminal result, execution is uncertain and must not be retried automatically. The test-injected runner interface can report a PID only after it returns; the production Popen path persists its PID before output collection, as before. ReviewCampaign, evidence/delivery ownership, and Coordinator relocation remain later-phase work. Phase 3 has not started.
