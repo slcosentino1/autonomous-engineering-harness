@@ -452,6 +452,8 @@ def main(
                         raise workflow_error(
                             f"Could not read approval conditions file: {args.conditions_file}"
                         ) from exc
+                    except UnicodeError as exc:
+                        raise workflow_error("Approval conditions file must be valid UTF-8.") from exc
                 state = runner.approve(conditions=conditions)
             elif args.command == "resume":
                 recovery_arguments = {
