@@ -65,7 +65,10 @@ class ApprovalConditionsTests(unittest.TestCase):
     def test_conditions_survive_resume_after_interrupted_implementation(self):
         codex = FakeCodex("# Proposal\nPlan.\n", WorkflowTests.refined(), "partial implementation")
         claude = FakeClaude(
-            claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05),
+            claude_reviewer.ReviewResult("Decision: APPROVED\\nPlan is adequate.", 0.05),
+            response_factory=lambda *_args: claude_reviewer.ReviewResult(
+                "Decision: APPROVED\\nNo acceptance-blocking findings.", 0.05,
+            ),
         )
 
         def interrupt(index, _command, _kwargs):
