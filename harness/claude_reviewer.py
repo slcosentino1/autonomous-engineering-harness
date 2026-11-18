@@ -31,9 +31,10 @@ SECRET_PATTERNS = (
 class ReviewError(RuntimeError):
     """A failed Aily invocation, with any cost metadata that was observable."""
 
-    def __init__(self, message: str, *, cost_usd: float | None = None):
+    def __init__(self, message: str, *, cost_usd: float | None = None, diagnostics: dict | None = None):
         super().__init__(message)
         self.cost_usd = cost_usd
+        self.diagnostics = diagnostics or {}
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,39 @@ def validate_review_invocation(prompt: str, executable: str, *, limit: int | Non
     except UnicodeEncodeError as exc:
         raise ReviewError("Aily executable is not valid UTF-8 text; no paid call was made.") from exc
     return validate_review_payload(prompt, limit=limit)
+
+
+def _safe_provider_diagnostics(stdout: str, *, exit_code: int | None, budget_usd: float) -> dict:
+    """Extract a small allowlist of provider metadata; never retain result/prompt text."""
+    envelope = {}
+    try:
+        parsed = json.loads(stdout)
+        if isinstance(parsed, dict):
+            envelope = parsed
+    except (json.JSONDecodeError, TypeError):
+        pass
+    error = envelope.get("error")
+    if not isinstance(error, dict):
+        error = {}
+    kind = error.get("type") or envelope.get("error_type") or envelope.get("subtype")
+    request_id = envelope.get("request_id") or envelope.get("requestId") or error.get("request_id")
+    raw_cost = envelope.get("total_cost_usd")
+    cost = None
+    if isinstance(raw_cost, (int, float)) and not isinstance(raw_cost, bool):
+        if math.isfinite(float(raw_cost)) and raw_cost >= 0:
+            cost = float(raw_cost)
+    def safe_label(value, limit):
+        if not isinstance(value, str):
+            return None
+        value = re.sub(r"[\x00-\x1f\x7f]", "", redact(value)).strip()
+        return value[:limit] or None
+    return {
+        "provider_error_type": safe_label(kind, 120) or ("ProviderReportedError" if envelope.get("is_error") else "AilyProcessExit"),
+        "exit_code": exit_code,
+        "limit_usd": float(budget_usd),
+        "reported_cost_usd": cost,
+        "provider_request_id": safe_label(request_id, 160),
+    }
 
 
 def _decode(stdout: str) -> tuple[str, float | None]:
@@ -202,16 +236,18 @@ def review(
             raise ReviewError(f"Aily command arguments could not be passed safely: {redact(str(exc))}") from exc
 
     stdout = result.stdout.decode("utf-8", "replace") if isinstance(result.stdout, bytes) else str(result.stdout or "")
-    stderr = result.stderr.decode("utf-8", "replace") if isinstance(result.stderr, bytes) else str(result.stderr or "")
+    diagnostics = _safe_provider_diagnostics(stdout, exit_code=result.returncode, budget_usd=budget_usd)
     try:
         text, cost = _decode(stdout)
     except ReviewError as exc:
+        diagnostics["reported_cost_usd"] = exc.cost_usd
         if result.returncode != 0:
-            raise ReviewError(str(exc), cost_usd=exc.cost_usd) from exc
-        raise
+            raise ReviewError(str(exc), cost_usd=exc.cost_usd, diagnostics=diagnostics) from exc
+        raise ReviewError(str(exc), cost_usd=exc.cost_usd, diagnostics=diagnostics) from exc
     if result.returncode != 0:
-        detail = redact(stderr.strip()) or "Aily returned no diagnostic output."
-        raise ReviewError(f"Aily exited with status {result.returncode}: {detail}", cost_usd=cost)
+        diagnostics["reported_cost_usd"] = cost
+        # Keep diagnostic state metadata-only. stderr may echo prompt content.
+        raise ReviewError(f"Aily exited with status {result.returncode}.", cost_usd=cost, diagnostics=diagnostics)
     if not text:
         raise ReviewError("Claude returned an empty review report.", cost_usd=cost)
     return ReviewResult(text=text, cost_usd=cost)

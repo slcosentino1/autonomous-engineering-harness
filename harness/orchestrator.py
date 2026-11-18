@@ -3654,6 +3654,9 @@ class Orchestrator:
             review_purpose=review_purpose,
         )
         manifest["operation_id"] = operation["operation_id"]
+        diagnostic_request_id = str(uuid.uuid4())
+        manifest["diagnostic_request_id"] = diagnostic_request_id
+        operation["diagnostic_request_id"] = diagnostic_request_id
         operation["call_number"] = code_review_call_number
         contexts.append(manifest)
         external["active_call"] = {
@@ -3684,11 +3687,18 @@ class Orchestrator:
             self.state["error"] = str(exc)
             contexts[context_index]["call_state"] = "failed"
             contexts[context_index]["error"] = redact(str(exc))
+            diagnostics = {
+                key: value for key, value in (exc.diagnostics or {}).items()
+                if key in {"provider_error_type", "exit_code", "limit_usd", "reported_cost_usd", "provider_request_id"}
+            }
+            diagnostics["diagnostic_request_id"] = diagnostic_request_id
+            contexts[context_index]["provider_diagnostic"] = diagnostics
             operation_status = "unknown" if exc.cost_usd is None else "failed"
             self._finish_operation(
                 operation["operation_id"], status=operation_status,
                 outcome=f"Claude invocation failed: {redact(str(exc))}",
                 error_category=type(exc).__name__, cost_usd=exc.cost_usd, duration_ms=duration_ms,
+                evidence={"provider_diagnostic": diagnostics},
             )
             raise WorkflowError(str(exc)) from exc
         except KeyboardInterrupt:
