@@ -3616,7 +3616,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(claude.prompts), calls_before_resume)
         self.assertEqual(completed["review_campaign"]["integration_review"]["status"], "reviewed")
 
-    def test_unknown_part_spend_blocks_all_later_campaign_calls(self):
+    def test_unknown_part_spend_is_recorded_but_does_not_block_later_campaign_calls(self):
         changed = {
             f"modules/records/part_{index}.py": (
                 f"def operation_{index}():\n" + "    return 'record operation'\n" * 50
@@ -3638,20 +3638,22 @@ class WorkflowTests(unittest.TestCase):
         )
         runner.start()
         with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "14000"}):
-            with self.assertRaisesRegex(orchestrator.WorkflowError, "previous call has no recorded cost"):
-                orchestrator.Orchestrator(
-                    self.target, workflow_id="unknown-part-spend", process_runner=codex,
-                    claude_runner=claude,
-                ).approve()
-        state = json.loads(runner.state_path.read_text(encoding="utf-8"))
-        self.assertTrue(state["authorization"]["claude_aily"]["budget_unknown"])
-        self.assertEqual(len(claude.prompts), 2)  # plan plus one part; no later part or integration call
-        self.assertEqual(state["review_campaign"]["status"], "in_progress")
-        with self.assertRaisesRegex(orchestrator.WorkflowError, "no recorded cost"):
-            orchestrator.Orchestrator(
+            completed = orchestrator.Orchestrator(
                 self.target, workflow_id="unknown-part-spend", process_runner=codex,
                 claude_runner=claude,
-            ).resume()
+            ).approve()
+        state = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertTrue(state["authorization"]["claude_aily"]["budget_unknown"])
+        self.assertGreater(len(claude.prompts), 2)  # later parts and integration continue
+        self.assertEqual(state["review_campaign"]["status"], "complete")
+        self.assertEqual(completed["status"], "complete")
+        prompts_before_resume = len(claude.prompts)
+        resumed = orchestrator.Orchestrator(
+            self.target, workflow_id="unknown-part-spend", process_runner=codex,
+            claude_runner=claude,
+        ).resume()
+        self.assertEqual(resumed["status"], "complete")
+        self.assertEqual(len(claude.prompts), prompts_before_resume)
 
     def test_existing_single_call_authorization_does_not_expand_for_multipart_review(self):
         changed = {

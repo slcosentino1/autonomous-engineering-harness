@@ -2865,9 +2865,9 @@ class Orchestrator:
         elif recovery_action is not None or verified_claude_cost_usd is not None:
             raise WorkflowError("No recovery action is pending for this workflow.")
         authorization = validate_workflow_authorization(self.state, self.target, self.workflow_id)
-        if (authorization["claude_aily"]["budget_unknown"]
-                and self.state.get("stage", "").startswith(("plan_review", "code_review", "verification"))):
-            raise WorkflowError(self.state.get("error") or "Claude review stopped because spend is unknown.")
+        # TEMPORARY: a completed Aily review without cost metadata remains visible as
+        # budget_unknown, but it no longer blocks a saved-stage retry. Restore this guard
+        # after Aily reports reliable per-call costs. Interrupted calls still require recovery.
         if budget_change_requested:
             if not (self.state.get("status") == "failed" or recovery_resolved):
                 raise WorkflowError("Budget changes are available only when resuming a saved failed stage.")
@@ -3468,8 +3468,8 @@ class Orchestrator:
             raise WorkflowError("Claude review requires the workflow process lock.")
         authorization = validate_workflow_authorization(self.state, self.target, self.workflow_id)
         external = authorization["claude_aily"]
-        if external["budget_unknown"]:
-            raise WorkflowError("Claude review stopped because a previous call has no recorded cost.")
+        # TEMPORARY: allow the workflow to continue when a completed Aily call omits cost.
+        # Keep budget_unknown in state/status so the missing accounting remains explicit.
         if external["permitted_data"] not in (
             _authorization.LEGACY_CLAUDE_DATA_SCOPE, CLAUDE_DATA_SCOPE,
         ):
@@ -4423,8 +4423,6 @@ class Orchestrator:
                     if campaign.get("status") != "complete":
                         raise WorkflowError("Correction is blocked because the initial review campaign is incomplete.")
                     external = self.state["authorization"]["claude_aily"]
-                    if external.get("budget_unknown") is True:
-                        raise WorkflowError("Correction is blocked because Claude spend is unknown and verification cannot be authorized safely.")
                     limits = self._execution_limits()
                     usage = self._resource_usage()
                     remaining_claude_calls = limits["max_claude_calls"] - usage["claude_calls"]
@@ -4755,10 +4753,8 @@ def _recover_code_review(runner: Orchestrator, workflow_id: str, *, apply: bool)
     if state.get("workflow_id") != workflow_id or state.get("target") != str(runner.target):
         raise WorkflowError("Workflow state belongs to another target or workflow ID.")
     authorization = validate_workflow_authorization(state, runner.target, workflow_id)
-    if authorization["claude_aily"].get("active_call") or authorization["claude_aily"].get("budget_unknown"):
-        raise WorkflowError(
-            "Local review recovery is unsafe while a Claude call is active or its cost is unknown."
-        )
+    if authorization["claude_aily"].get("active_call"):
+        raise WorkflowError("Local review recovery is unsafe while a Claude call is active.")
     if state.get("status") != "failed" or state.get("stage") != "code_review":
         raise WorkflowError("Local code-review recovery requires a failed workflow at the code_review stage.")
     campaign = state.get("review_campaign")

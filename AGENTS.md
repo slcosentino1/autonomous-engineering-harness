@@ -17,7 +17,7 @@ This repository contains a small workflow tool. Product code and project-specifi
 
 - Keep ordinary target work inside the explicit target. Preserve unrelated existing files and changes.
 - Do not transmit credentials, environment files, or unrelated pre-existing changes to Claude. Claude receives a redacted patch and proposal in a restricted temporary review context.
-- Claude/Aily calls use a workflow budget of USD 2.00 by default; `--budget-usd` overrides it. Each call is capped to the remaining amount. If a call has no recorded cost, stop further Claude calls.
+- Claude/Aily calls use a workflow budget of USD 2.00 by default; `--budget-usd` overrides it. Each call is capped to the remaining amount based on known spend. TEMPORARY EXCEPTION (2026-11-18): a completed Aily call with missing cost metadata does not block subsequent calls; keep `budget_unknown` visible and restore the blocking guard when per-call cost reporting is reliable. Only known costs count toward the cap during this exception, so actual spend may exceed the configured budget. Interrupted calls still require recovery.
 - Do not commit, push, merge, deploy, publish, or change shared infrastructure without explicit authorization. Respect operating-system and organization permissions.
 - Do not run a workflow against an Ohpen repository unless the user explicitly asks for it.
 
