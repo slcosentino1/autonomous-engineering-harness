@@ -439,7 +439,7 @@ def junit_test_results(target: Path, artifact_path: str, expected_sha256: str | 
             file_path = Path(file_name)
             if file_path.is_absolute():
                 try:
-                    file_name = file_path.resolve().relative_to(root).as_posix()
+                    file_name = file_path.resolve().relative_to(target.resolve()).as_posix()
                 except ValueError as exc:
                     raise TraceabilityError("JUnit testcase path resolves outside the target") from exc
             test_id = file_name.replace("\\", "/") + "::" + name
