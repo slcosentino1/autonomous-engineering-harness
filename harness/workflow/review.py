@@ -11,13 +11,13 @@ from collections import Counter
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable
 
 import claude_reviewer
 
 
-PART_REVIEW_VALIDATOR_VERSION = "part-review-v2"
+PART_REVIEW_VALIDATOR_VERSION = "part-review-v3"
 CLAUDE_MAX_PAYLOAD_ENV = claude_reviewer.MAX_REVIEW_PAYLOAD_ENV
 
 
@@ -94,6 +94,53 @@ PART_REVIEW_SEVERITIES = ("Must fix", "Should fix", "Optional improvement")
 PART_REVIEW_SECTIONS = (
     "Files reviewed", "Findings", "Cross-component concerns", "Overall assessment",
 )
+
+_REVIEW_COUNT_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+}
+
+
+def _paths_claimed_by_review_entry(entry: str, assigned_paths: set[str]) -> set[str]:
+    """Expand exact paths and explicit scoped groups, bounded by this part's assignment."""
+    tokens = re.findall(r"`([^`]+)`", entry)
+    if not tokens:
+        tokens = [entry.split(" — ", 1)[0].strip()]
+
+    claimed: set[str] = set()
+    for raw_token in tokens:
+        token = raw_token.strip()
+        if token in assigned_paths:
+            claimed.add(token)
+            continue
+
+        if any(marker in token for marker in "*?["):
+            if re.search(r"\b(?:all|every|each)\b", entry, re.I):
+                claimed.update(
+                    path for path in assigned_paths
+                    if PurePosixPath(path).match(token)
+                )
+            continue
+
+        if token.endswith("/"):
+            count_match = re.search(
+                r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+"
+                r"(?:[a-z][a-z-]*\s+){0,2}(?:files?|documents?|paths?)\b",
+                entry,
+                re.I,
+            )
+            if count_match is None:
+                continue
+            count_label = count_match.group(1).casefold()
+            expected_count = int(count_label) if count_label.isdigit() else _REVIEW_COUNT_WORDS[count_label]
+            directory = token.rstrip("/")
+            matches = {
+                path for path in assigned_paths
+                if PurePosixPath(path).parent.as_posix() == directory
+            }
+            if len(matches) == expected_count:
+                claimed.update(matches)
+    return claimed
 
 
 def _normalize_review_text(value: str) -> str:
@@ -211,17 +258,11 @@ def parse_part_review_report(report: str, expected_part_id: str, segments: list[
 
     files_section = sections.get("Files reviewed", "")
     listed_paths: set[str] = set()
+    assigned_paths = {segment.path for segment in segments}
     for line in files_section.splitlines():
         item = re.match(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)(.*?)\s*$", line)
-        if not item:
-            continue
-        entry = item.group(1)
-        quoted = re.findall(r"`([^`]+)`", entry)
-        if quoted:
-            listed_paths.update(quoted)
-        else:
-            listed_paths.add(entry.split(" — ", 1)[0].strip())
-    assigned_paths = {segment.path for segment in segments}
+        if item:
+            listed_paths.update(_paths_claimed_by_review_entry(item.group(1), assigned_paths))
     missing_paths = sorted(assigned_paths - listed_paths)
     if missing_paths:
         errors.append("Files reviewed is missing assigned path(s): " + ", ".join(missing_paths))
@@ -636,6 +677,8 @@ class ReviewCampaign:
             "`Decision: CHANGES_REQUESTED` line, followed by exactly one `Part ID: <id>` line. "
             "Use the sections `Files reviewed`, `Findings`, `Cross-component concerns`, and `Overall assessment` "
             "in that order. Markdown heading markers are allowed on the Part ID and section lines. "
+            "Under `Files reviewed`, enumerate every assigned path individually, using its exact path as supplied; "
+            "do not group files by directory or use globs. Do not list unchanged context files as reviewed. "
             "Represent every finding in its own uniquely labeled `### Finding F1` block. Include exactly one "
             "non-empty field for each of: "
             "`Severity`, `Category`, `File/location`, `Description`, `Impact and reasoning`, and "
