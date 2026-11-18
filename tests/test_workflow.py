@@ -146,7 +146,7 @@ class CodexGuidanceTests(unittest.TestCase):
 
     def test_default_claude_payload_limit_is_increased(self):
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(claude_reviewer.max_review_payload_chars(), 200_000)
+            self.assertEqual(claude_reviewer.max_review_payload_chars(), 600_000)
 
     def test_exact_documentation_urls_are_authorized_only_in_read_only_plan_stages(self):
         self.assertEqual(
