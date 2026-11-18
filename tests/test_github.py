@@ -498,7 +498,7 @@ class GithubBridgeTests(unittest.TestCase):
             {"id": 10, "issue_url": "https://api.github.com/repos/acme/widget/issues/42", "body": marker},
             {"id": 11, "issue_url": "https://api.github.com/repos/acme/widget/issues/42", "body": marker},
         ]
-        api, calls = self.report_api(comments=comments)
+        api, calls = self.report_api(comments=[comments])
         with self.assertRaisesRegex(github.GithubError, "Multiple comments"):
             self.report(workflow_id, api)
         self.assertFalse(any(call[2].get("method") in {"POST", "PATCH"} for call in calls))
