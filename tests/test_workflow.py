@@ -3201,11 +3201,11 @@ class WorkflowTests(unittest.TestCase):
 
     def test_large_review_uses_adaptive_parts_shared_context_and_integration(self):
         changed = {
-            "services/ledger/engine.py": "def calculate():\n" + "    value = 1  # ledger operation\n" * 45,
-            "services/ledger/model.py": "class LedgerModel:\n" + "    value = 'entry'\n" * 45,
-            "checks/ledger/test_engine.py": "def test_calculate():\n" + "    assert 1 == 1\n" * 45,
-            "contracts/ledger.contract": "ledger request contract\n" * 45,
-            "plugins/codec/custom.data": "codec mapping row\n" * 45,
+            "services/ledger/engine.py": "def calculate():\n" + "    value = 1  # ledger operation\n" * 110,
+            "services/ledger/model.py": "class LedgerModel:\n" + "    value = 'entry'\n" * 110,
+            "checks/ledger/test_engine.py": "def test_calculate():\n" + "    assert 1 == 1\n" * 110,
+            "contracts/ledger.contract": "ledger request contract\n" * 110,
+            "plugins/codec/custom.data": "codec mapping row\n" * 110,
         }
         codex = FakeCodex("# Proposal\nA small service with explicit contracts.\n", self.refined(), "Implemented all changed modules.\n")
 
