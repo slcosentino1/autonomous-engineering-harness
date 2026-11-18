@@ -412,13 +412,11 @@ class GithubBridgeTests(unittest.TestCase):
         imported = self.import_issue()
         return imported["workflow_id"]
 
-    def report_api(self, *, comments=None, fail_write=False, login="operator"):
+    def report_api(self, *, comments=None, fail_write=False):
         calls = []
 
         def api(host, route, **kwargs):
             calls.append((host, route, kwargs))
-            if route == "user":
-                return {"login": login} if login else {}
             if route.endswith("/comments") and kwargs.get("paginate"):
                 return comments if comments is not None else []
             if kwargs.get("method") in {"POST", "PATCH"}:
@@ -472,18 +470,36 @@ class GithubBridgeTests(unittest.TestCase):
                  "user": {"login": "attacker"}, "body": marker}
         owned = {"id": 2, "issue_url": "https://api.github.com/repos/acme/widget/issues/42",
                  "user": {"login": "operator"}, "body": marker}
+        registry_path = self.target / github.REGISTRY_PATH
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        registry["issues"]["github.com/acme/widget#42"]["comment_id"] = 2
+        registry_path.write_text(json.dumps(registry), encoding="utf-8")
         api, calls = self.report_api(comments=[[], [spoof, owned]])
         self.report(workflow_id, api)
+        self.assertFalse(any(call[1] == "user" for call in calls))
         methods = [call[2].get("method") for call in calls]
         self.assertIn("PATCH", methods)
         self.assertNotIn("POST", methods)
         update = next(call for call in calls if call[2].get("method") == "PATCH")
         self.assertEqual(update[1], "repos/acme/widget/issues/comments/2")
 
-    def test_report_fails_closed_without_authenticated_identity(self):
+    def test_report_does_not_require_user_endpoint_and_posts_when_no_marker_exists(self):
         workflow_id = self.report_setup()
-        api, calls = self.report_api(login=None)
-        with self.assertRaisesRegex(github.GithubError, "authenticated GitHub login"):
+        api, calls = self.report_api()
+        result = self.report(workflow_id, api)
+        self.assertFalse(any(call[1] == "user" for call in calls))
+        self.assertTrue(any(call[2].get("method") == "POST" for call in calls))
+        self.assertEqual(result["comment_id"], 200)
+
+    def test_report_fails_closed_when_multiple_unbound_comments_share_marker(self):
+        workflow_id = self.report_setup()
+        marker = f"<!-- harness-workflow:{workflow_id} -->"
+        comments = [
+            {"id": 10, "issue_url": "https://api.github.com/repos/acme/widget/issues/42", "body": marker},
+            {"id": 11, "issue_url": "https://api.github.com/repos/acme/widget/issues/42", "body": marker},
+        ]
+        api, calls = self.report_api(comments=comments)
+        with self.assertRaisesRegex(github.GithubError, "Multiple comments"):
             self.report(workflow_id, api)
         self.assertFalse(any(call[2].get("method") in {"POST", "PATCH"} for call in calls))
 
