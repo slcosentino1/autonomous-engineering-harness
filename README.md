@@ -205,6 +205,10 @@ Initial and final fingerprints are point-in-time snapshots, not an operation log
 
 These are workflow guardrails. They do not override OS, provider, or organization permissions, and they are not an OS-level process sandbox.
 
+## Deferred follow-ups
+
+- Reduce code-review prompt size. In AskDoc issue 20, one review prompt contained 338,175 characters: 132,707 selected source context, 87,403 complete patch, 37,072 approved proposal, 27,534 commitment/evidence ledger, 23,776 implementation summary, and 14,376 relevant skills. Investigate removing redundant context while preserving full eligible patch coverage. Lowering the payload limit alone is not compression; it can split the review into more calls and repeat shared context.
+
 ## Development checks
 
 ```sh
