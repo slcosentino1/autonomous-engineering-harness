@@ -211,7 +211,10 @@ def _api(
     except OSError as exc:
         raise GithubError("Could not start GitHub CLI; check the local installation and authentication.") from exc
     if result.returncode:
-        raise GithubError("GitHub request failed; check `gh auth status`, repository access, and permissions.")
+        # Keep diagnostics actionable without forwarding stderr, which may contain sensitive data.
+        status_match = re.search(r"\bHTTP\s+(\d{3})\b", result.stderr or "", re.IGNORECASE)
+        status = f" (HTTP {status_match.group(1)})" if status_match else ""
+        raise GithubError(f"GitHub {method} {route} failed{status}; check token access and repository permissions.")
     try:
         return json.loads(result.stdout)
     except (TypeError, json.JSONDecodeError) as exc:
@@ -990,32 +993,28 @@ def report_workflow(
                 if record.get("state") == "reserved":
                     raise GithubError("The GitHub Issue import is reserved but the workflow has not started.")
                 raise GithubError("Correlated workflow state is missing; manual reconciliation is required.")
-            login_result = api(host, "user")
-            login = login_result.get("login") if isinstance(login_result, dict) else None
-            if not isinstance(login, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,39}", login):
-                raise GithubError("Could not determine the authenticated GitHub login; no comment was changed.")
             marker = f"<!-- harness-workflow:{workflow_id} -->"
             pages = api(host, f"repos/{owner}/{repository}/issues/{number}/comments", paginate=True)
             if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
                 raise GithubError("GitHub returned an invalid paginated comment response.")
             comments = [comment for page in pages for comment in page]
-            candidate = None
-            for comment in comments:
-                author_login = (
-                    comment.get("user", {}).get("login")
-                    if isinstance(comment, dict) and isinstance(comment.get("user"), dict) else None
-                )
-                if (not _comment_matches_issue(comment, host, owner, repository, number)
-                        or not isinstance(author_login, str)
-                        or author_login.lower() != login.lower()
-                        or not isinstance(comment.get("body"), str)
-                        or marker not in comment["body"]):
-                    continue
-                if comment.get("id") == record.get("comment_id"):
-                    candidate = comment
-                    break
-                if candidate is None:
-                    candidate = comment
+            matching = [
+                comment for comment in comments
+                if (_comment_matches_issue(comment, host, owner, repository, number)
+                    and isinstance(comment.get("body"), str)
+                    and marker in comment["body"])
+            ]
+            saved_comment_id = record.get("comment_id")
+            candidate = next(
+                (comment for comment in matching if comment.get("id") == saved_comment_id),
+                None,
+            )
+            if candidate is None:
+                if len(matching) > 1:
+                    raise GithubError(
+                        "Multiple comments contain this workflow marker; manual reconciliation is required."
+                    )
+                candidate = matching[0] if matching else None
             body = render_report(workflow_id, state)
             if candidate is not None:
                 comment_id = candidate.get("id")
