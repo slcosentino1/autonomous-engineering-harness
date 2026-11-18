@@ -1007,9 +1007,9 @@ class FakePublicationApi:
         self.assertNotIn("shell", observed)
 
         def failed_runner(command, **kwargs):
-            return subprocess.CompletedProcess(command, 1, "", "token=very-secret-value")
+            return subprocess.CompletedProcess(command, 1, "", "HTTP 403: token=very-secret-value")
 
-        with self.assertRaisesRegex(github.GithubError, "request failed") as failed:
+        with self.assertRaisesRegex(github.GithubError, r"GET user failed \(HTTP 403\)") as failed:
             github._api("github.com", "user", runner=failed_runner)
         self.assertNotIn("very-secret-value", str(failed.exception))
 
