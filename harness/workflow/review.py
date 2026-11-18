@@ -677,8 +677,6 @@ class ReviewCampaign:
             "`Decision: CHANGES_REQUESTED` line, followed by exactly one `Part ID: <id>` line. "
             "Use the sections `Files reviewed`, `Findings`, `Cross-component concerns`, and `Overall assessment` "
             "in that order. Markdown heading markers are allowed on the Part ID and section lines. "
-            "Under `Files reviewed`, enumerate every assigned path individually, using its exact path as supplied; "
-            "do not group files by directory or use globs. Do not list unchanged context files as reviewed. "
             "Represent every finding in its own uniquely labeled `### Finding F1` block. Include exactly one "
             "non-empty field for each of: "
             "`Severity`, `Category`, `File/location`, `Description`, `Impact and reasoning`, and "
