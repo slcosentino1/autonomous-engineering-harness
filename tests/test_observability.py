@@ -827,11 +827,18 @@ class ObservabilityTests(unittest.TestCase):
             def span(self, *, name, metadata):
                 return self.generation(name=name, metadata=metadata)
 
-        runner = object.__new__(orchestrator.Orchestrator)
+        class ExecutionState(dict):
+            def operation(self, _operation_id):
+                return None
+
+        runner = object.__new__(orchestrator.WorkflowExecution)
+        runner.workflow_state = ExecutionState(stage="implementation")
         runner._tracer = RecordingTracer()
         runner.workflow_id = "provider-test"
-        runner.state = {"stage": "implementation"}
         runner.model = "gpt-known-model"
+        runner._active_codex_trace_context = None
+        runner._active_codex_operation_id = None
+        runner._active_codex_persisted_status = None
         runner._run_codex_impl = lambda _prompt, *, sandbox: "done"
         self.assertEqual(runner._run_codex("private prompt", sandbox="workspace-write"), "done")
 
@@ -843,7 +850,7 @@ class ObservabilityTests(unittest.TestCase):
         self.assertNotIn("workflow_id", codex)
 
         runner.model = None
-        runner.state = {"stage": "code_review"}
+        runner.workflow_state["stage"] = "code_review"
         runner._call_claude_impl = lambda *_args, **_kwargs: (
             "report", {"cost_usd": 0.125, "campaign_call_number": 2},
         )

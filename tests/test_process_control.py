@@ -7,14 +7,30 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "harness"))
 
-from workflow.process_control import process_group_options, terminate_process_group
+from workflow.process_control import process_group_options, process_presence, terminate_process_group
 
 
 class ProcessControlTests(unittest.TestCase):
+    def test_process_presence_treats_a_live_pid_as_unverified(self):
+        with patch("workflow.process_control.os.kill") as kill:
+            self.assertEqual(process_presence(123), "present_unverified")
+            kill.assert_called_once_with(123, 0)
+
+    def test_process_presence_distinguishes_missing_permission_and_invalid_ids(self):
+        with patch("workflow.process_control.os.kill", side_effect=ProcessLookupError):
+            self.assertEqual(process_presence(123), "not_running")
+        with patch("workflow.process_control.os.kill", side_effect=PermissionError):
+            self.assertEqual(process_presence(123), "present_unverified")
+        with patch("workflow.process_control.os.kill", side_effect=OSError):
+            self.assertEqual(process_presence(123), "unknown")
+        self.assertEqual(process_presence(True), "not_recorded")
+        self.assertEqual(process_presence(None), "not_recorded")
+
     def test_provider_starts_in_a_separate_process_group(self):
         options = process_group_options()
         if os.name == "nt":

@@ -220,7 +220,7 @@ print("DONE " + json.dumps({{"status": state["status"], "budget_unknown": state[
             runner.state["authorization"]["claude_aily"]["active_call"] = {
                 "stage": "plan_review_1", "started_at": "test", "cap_usd": 0.875,
             }
-            runner._save()
+            runner.execution._save()
 
         with self.assertRaisesRegex(orchestrator.WorkflowError, "prior Claude call ended without a recorded result"):
             orchestrator.Orchestrator(

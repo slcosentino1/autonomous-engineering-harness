@@ -18,6 +18,21 @@ def process_group_options() -> dict:
     return {"start_new_session": True}
 
 
+def process_presence(process_id: object) -> str:
+    """Report best-effort PID presence without treating a reused PID as ownership proof."""
+    if isinstance(process_id, bool) or not isinstance(process_id, int) or process_id <= 0:
+        return "not_recorded"
+    try:
+        os.kill(process_id, 0)
+    except ProcessLookupError:
+        return "not_running"
+    except PermissionError:
+        return "present_unverified"
+    except OSError:
+        return "unknown"
+    return "present_unverified"
+
+
 def terminate_process_group(process: subprocess.Popen, *, grace_seconds: int = PROCESS_TERMINATION_GRACE_SECONDS) -> None:
     """Stop a provider and descendants where the operating system exposes group signals."""
     if os.name == "nt":

@@ -80,7 +80,7 @@ class DeliveryReportTests(unittest.TestCase):
             valid_plan_review_count=valid_plan_review_count,
             structured_review_feedback=structured_review_feedback,
             claude_max_payload_env="HARNESS_CLAUDE_MAX_PAYLOAD_CHARS",
-            default_claude_payload_chars=200_000,
+            default_claude_payload_chars=600_000,
         )
 
     def test_normal_completed_report_preserves_sections_and_format(self):
@@ -96,6 +96,7 @@ class DeliveryReportTests(unittest.TestCase):
         self.assertIn("- Completed: 2026-11-13T10:20:30Z", report)
         self.assertIn("- Codex model: Codex CLI default", report)
         self.assertIn("- Claude spend recorded: $0.1250 / $2.00", report)
+        self.assertIn("Claude context payload limit: HARNESS_CLAUDE_MAX_PAYLOAD_CHARS (default 600,000 characters)", report)
         self.assertIn("## Implementation\n\nImplemented the feature and ran its checks.", report)
         self.assertIn("Claude plan-review iterations: 1 valid of 2 maximum.", report)
         self.assertIn("## Structured code-review feedback", report)

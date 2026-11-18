@@ -6,9 +6,14 @@ import hashlib
 import json
 import re
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
+
+from claude_reviewer import redact
+from workflow import persistence as _persistence
+from workflow import workspace as _workspace
+from workflow.state import WorkflowError
 
 
 LEDGER_SCHEMA_VERSION = 1
@@ -910,3 +915,475 @@ def evaluate_ledger(
         "partial_delivery_policy": ledger.get("partial_delivery_policy"),
         "commitments": results,
     }
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+def _fingerprint_repository(target: Path) -> dict:
+    try:
+        fingerprint = _workspace.repository_fingerprint(target, redactor=redact)
+    except _workspace.WorkspaceError as exc:
+        raise WorkflowError(str(exc)) from exc
+    return {"status": "captured", "captured_at": _now(), **fingerprint}
+
+
+def capture_commitment_evidence(state, target: Path, report: str) -> None:
+    """Bind Codex's references to the completed implementation/correction operation."""
+    if state.get("traceability_required") is not True:
+        return
+    approval = state.get("commitment_ledger_approval")
+    ledger = approval.get("ledger") if isinstance(approval, dict) else None
+    if not isinstance(ledger, dict):
+        state["commitment_evidence"] = {"error": "approved commitment ledger is unavailable"}
+        return
+    operation_history = state.get("operation_history", [])
+    if not isinstance(operation_history, list):
+        operation_history = []
+    operation = next((
+        item for item in reversed(operation_history)
+        if isinstance(item, dict) and item.get("operation_type") == "codex"
+        and item.get("stage") in {"implementation", "correction"} and item.get("status") == "completed"
+    ), None)
+    try:
+        evidence = parse_codex_evidence(report, ledger)
+        if evidence is None:
+            raise TraceabilityError("Codex did not return a harness-evidence block")
+        if operation is None:
+            raise TraceabilityError("no completed implementation operation can own the evidence")
+        operation_id = operation.get("operation_id")
+        history = state.get("operation_history", [])
+        if (not isinstance(operation_id, str)
+                or not isinstance(history, list)
+                or sum(isinstance(item, dict) and item.get("operation_id") == operation_id for item in history) != 1):
+            raise TraceabilityError("implementation operation ID is missing or ambiguous")
+        bind_observed_execution_events(
+            evidence, operation.get("test_execution_events", []),
+        )
+        operation["target_fingerprint"] = _fingerprint_repository(target)
+        receipts_by_id: dict[str, list[dict]] = {}
+        for item in operation.get("test_execution_events", []):
+            if isinstance(item, dict) and isinstance(item.get("event_id"), str):
+                receipts_by_id.setdefault(item["event_id"], []).append(item)
+        for entry in evidence["commitments"]:
+            entry["operation_id"] = operation_id
+            for reference in entry.get("validation_refs", []):
+                if reference.get("operation_id") not in (None, operation_id):
+                    raise TraceabilityError(
+                        "validation reference names a different Codex operation",
+                    )
+                reference["operation_id"] = operation_id
+                artifact_path = reference.get("artifact_path")
+                if not artifact_path:
+                    continue
+                event_ids = reference.get("execution_event_ids", [])
+                if len(event_ids) != 1:
+                    reference["artifact_error"] = "one JUnit artifact must identify exactly one execution event"
+                    continue
+                try:
+                    _tests, artifact_digest = junit_test_results(
+                        target, artifact_path, reference.get("artifact_sha256"),
+                    )
+                    artifact_mtime_ns = junit_artifact_mtime_ns(target, artifact_path)
+                except TraceabilityError as exc:
+                    reference["artifact_error"] = str(exc)
+                    continue
+                event_id = event_ids[0]
+                matching_receipts = receipts_by_id.get(event_id, [])
+                receipt = matching_receipts[0] if len(matching_receipts) == 1 else None
+                if (not isinstance(receipt, dict) or type(receipt.get("exit_code")) is not int
+                        or receipt.get("exit_code") != 0
+                        or receipt.get("runner") != "pytest"
+                        or receipt.get("junit_report_path") != artifact_path):
+                    reference["artifact_error"] = (
+                        "JUnit artifact path is not the report output of its successful pytest execution event"
+                    )
+                    continue
+                receipt["junit_artifact"] = {
+                    "path": artifact_path,
+                    "sha256": artifact_digest,
+                    "mtime_ns": artifact_mtime_ns,
+                    "event_id": event_id,
+                    "operation_id": operation_id,
+                    "target_fingerprint": operation.get("target_fingerprint"),
+                }
+        receipt_material = []
+        for entry in evidence["commitments"]:
+            for reference in entry.get("validation_refs", []):
+                for event_id in reference.get("execution_event_ids", []):
+                    matching_receipts = receipts_by_id.get(event_id, [])
+                    receipt = matching_receipts[0] if len(matching_receipts) == 1 else None
+                    if isinstance(receipt, dict):
+                        receipt_material.append({
+                            "operation_id": operation_id,
+                            "operation_stdout_sha256": operation.get("stdout_sha256"),
+                            "event_id": event_id,
+                            "receipt": receipt,
+                        })
+        record = {
+            "schema_version": EVIDENCE_SCHEMA_VERSION,
+            "proposal_version": approval.get("proposal_version"),
+            "proposal_sha256": approval.get("proposal_sha256"),
+            "ledger_sha256": approval.get("ledger_sha256"),
+            "operation_id": operation_id,
+            "operation_stdout_sha256": operation.get("stdout_sha256"),
+            "operation_target_fingerprint": operation.get("target_fingerprint"),
+            "test_receipts_sha256": canonical_sha256(receipt_material),
+            "evidence": evidence,
+        }
+        record["evidence_sha256"] = canonical_sha256(record)
+        state["commitment_evidence"] = record
+    except (TraceabilityError, KeyError, TypeError, AttributeError) as exc:
+        state["commitment_evidence"] = {
+            "schema_version": EVIDENCE_SCHEMA_VERSION,
+            "proposal_version": approval.get("proposal_version"),
+            "proposal_sha256": approval.get("proposal_sha256"),
+            "ledger_sha256": approval.get("ledger_sha256"),
+            "operation_id": operation.get("operation_id") if operation else None,
+            "operation_stdout_sha256": operation.get("stdout_sha256") if operation else None,
+            "operation_target_fingerprint": operation.get("target_fingerprint") if operation else None,
+            "test_receipts_sha256": canonical_sha256([]),
+            "evidence": None,
+            "error": str(exc),
+        }
+        state["commitment_evidence"]["evidence_sha256"] = canonical_sha256(
+            state["commitment_evidence"],
+        )
+
+def capture_commitment_assessment(state, report: str, *, purpose: str) -> None:
+    if state.get("traceability_required") is not True:
+        return
+    approval = state.get("commitment_ledger_approval")
+    ledger = approval.get("ledger") if isinstance(approval, dict) else None
+    assessment = None
+    error = None
+    if not isinstance(ledger, dict):
+        error = "approved commitment ledger is unavailable"
+    else:
+        try:
+            assessment = parse_claude_assessment(report, ledger)
+            if assessment is None:
+                error = "Claude report did not include a commitment-assessment block"
+        except (TraceabilityError, KeyError, TypeError, AttributeError) as exc:
+            error = str(exc)
+    state["commitment_assessment"] = {
+        "schema_version": 1,
+        "purpose": purpose,
+        "proposal_version": state.get("proposal_version"),
+        "proposal_sha256": approval.get("proposal_sha256") if isinstance(approval, dict) else None,
+        "ledger_sha256": approval.get("ledger_sha256") if isinstance(approval, dict) else None,
+        "report_sha256": hashlib.sha256(report.encode("utf-8")).hexdigest(),
+        "assessment": assessment,
+        "error": error,
+    }
+
+def evaluate_commitment_delivery(state, target: Path, proposal_path: Path) -> dict | None:
+    if state.get("traceability_required") is not True:
+        return None
+    approval = state.get("commitment_ledger_approval")
+    if not isinstance(approval, dict) or not isinstance(approval.get("ledger"), dict):
+        result = {
+            "schema_version": 1,
+            "disposition": "blocked",
+            "rationale": "No approved commitment ledger snapshot is available.",
+            "commitments": [],
+        }
+        state["commitment_gate"] = result
+        state["delivery_disposition"] = "blocked"
+        return result
+    evidence_record = state.get("commitment_evidence")
+    evidence = None
+    hard_errors: list[str] = []
+    if approval.get("ledger_sha256") != canonical_sha256(approval["ledger"]):
+        hard_errors.append("Approved commitment ledger snapshot changed after approval")
+    if approval.get("proposal_sha256") != state.get("proposal_artifact_sha256"):
+        hard_errors.append("Approved proposal identity changed after approval")
+    try:
+        current_proposal_sha256 = hashlib.sha256(_persistence.read_bytes(proposal_path)).hexdigest()
+    except (OSError, WorkflowError):
+        current_proposal_sha256 = None
+    if current_proposal_sha256 != approval.get("proposal_sha256"):
+        hard_errors.append("Proposal artifact changed or is unavailable after approval")
+    ledger_commitments = approval["ledger"].get("commitments", [])
+    if not isinstance(ledger_commitments, list):
+        hard_errors.append("Approved commitment ledger commitments are malformed")
+        ledger_commitments = []
+    has_required_commitments = any(
+        item.get("class") in REQUIRED_CLASSES
+        for item in ledger_commitments if isinstance(item, dict)
+    )
+    operation_history = state.get("operation_history", [])
+    if not isinstance(operation_history, list):
+        operation_history = []
+        hard_errors.append("Operation history is malformed")
+    operations_by_id: dict[str, list[dict]] = {}
+    completed_work_operations = []
+    for operation in operation_history:
+        if not isinstance(operation, dict):
+            continue
+        operation_id = operation.get("operation_id")
+        if isinstance(operation_id, str):
+            operations_by_id.setdefault(operation_id, []).append(operation)
+        if (operation.get("operation_type") == "codex"
+                and operation.get("stage") in {"implementation", "correction"}
+                and operation.get("status") == "completed"):
+            completed_work_operations.append(operation)
+    duplicate_operation_ids = sorted(
+        operation_id for operation_id, matches in operations_by_id.items() if len(matches) != 1
+    )
+    if duplicate_operation_ids:
+        hard_errors.append("Duplicate operation IDs are present: " + ", ".join(duplicate_operation_ids))
+    latest_operation = completed_work_operations[-1] if completed_work_operations else None
+    if not isinstance(evidence_record, dict):
+        if has_required_commitments:
+            hard_errors.append("Codex commitment evidence record is missing")
+    else:
+        evidence_payload = dict(evidence_record)
+        saved_digest = evidence_payload.pop("evidence_sha256", None)
+        if saved_digest != canonical_sha256(evidence_payload):
+            hard_errors.append("Codex commitment evidence digest does not match the saved record")
+        elif (evidence_record.get("ledger_sha256") != approval.get("ledger_sha256")
+              or evidence_record.get("proposal_version") != approval.get("proposal_version")
+              or evidence_record.get("proposal_sha256") != approval.get("proposal_sha256")):
+            hard_errors.append("Codex evidence is bound to a different approved proposal or ledger")
+        else:
+            evidence = evidence_record.get("evidence")
+            if evidence is not None and not isinstance(evidence, dict):
+                hard_errors.append("Codex commitment evidence payload is malformed")
+                evidence = None
+            if evidence is None and has_required_commitments and not evidence_record.get("error"):
+                hard_errors.append("Codex commitment evidence payload is missing")
+            if isinstance(evidence, dict):
+                evidence_operation_id = evidence_record.get("operation_id")
+                if has_required_commitments and (
+                        not isinstance(latest_operation, dict)
+                        or evidence_operation_id != latest_operation.get("operation_id")):
+                    hard_errors.append("Codex evidence is stale; it is not bound to the latest implementation or correction operation")
+                operation_matches = (
+                    operations_by_id.get(evidence_operation_id, [])
+                    if isinstance(evidence_operation_id, str) else []
+                )
+                if len(operation_matches) != 1:
+                    if has_required_commitments:
+                        hard_errors.append("Codex evidence operation ID is missing or ambiguous")
+                    bound_operation = {}
+                else:
+                    bound_operation = operation_matches[0]
+                if has_required_commitments and isinstance(latest_operation, dict) and bound_operation is latest_operation:
+                    if (evidence_record.get("operation_stdout_sha256") != bound_operation.get("stdout_sha256")
+                            or evidence_record.get("operation_target_fingerprint") != bound_operation.get("target_fingerprint")):
+                        hard_errors.append("Codex evidence operation output or target fingerprint changed after capture")
+                receipt_material = []
+                evidence_entries = evidence.get("commitments", [])
+                if not isinstance(evidence_entries, list):
+                    hard_errors.append("Codex evidence commitments are malformed")
+                    evidence_entries = []
+                for item in evidence_entries:
+                    if not isinstance(item, dict):
+                        hard_errors.append("Codex evidence contains a malformed commitment entry")
+                        continue
+                    operation_id = item.get("operation_id") or evidence_operation_id
+                    if has_required_commitments and operation_id != evidence_operation_id:
+                        hard_errors.append("A commitment evidence entry references a different operation")
+                        continue
+                    operation_candidates = (
+                        operations_by_id.get(operation_id, []) if isinstance(operation_id, str) else []
+                    )
+                    if len(operation_candidates) != 1:
+                        continue
+                    operation = operation_candidates[0]
+                    receipt_groups: dict[str, list[dict]] = {}
+                    receipts = operation.get("test_execution_events", [])
+                    if isinstance(receipts, list):
+                        for receipt in receipts:
+                            if isinstance(receipt, dict) and isinstance(receipt.get("event_id"), str):
+                                receipt_groups.setdefault(receipt["event_id"], []).append(receipt)
+                    validation_refs = item.get("validation_refs", [])
+                    if not isinstance(validation_refs, list):
+                        hard_errors.append("Codex validation references are malformed")
+                        continue
+                    for reference in validation_refs:
+                        if not isinstance(reference, dict):
+                            hard_errors.append("Codex validation reference is malformed")
+                            continue
+                        event_ids = reference.get("execution_event_ids", [])
+                        if not isinstance(event_ids, list):
+                            hard_errors.append("Codex execution event references are malformed")
+                            continue
+                        for event_id in event_ids:
+                            if not isinstance(event_id, str):
+                                hard_errors.append("Codex execution event ID is malformed")
+                                continue
+                            matches = receipt_groups.get(event_id, [])
+                            if len(matches) == 1:
+                                receipt_material.append({
+                                    "operation_id": operation_id,
+                                    "operation_stdout_sha256": operation.get("stdout_sha256"),
+                                    "event_id": event_id,
+                                    "receipt": matches[0],
+                                })
+                if (evidence_record.get("test_receipts_sha256")
+                        != canonical_sha256(receipt_material)):
+                    hard_errors.append("Observed test execution receipts changed after capture")
+    assessment_record = state.get("commitment_assessment")
+    assessment = None
+    expected_assessment_purpose = "verification" if state.get("correction_attempts") else "initial"
+    report_text = (
+        state.get("verification_report")
+        if state.get("correction_attempts") else state.get("code_review")
+    )
+    if not isinstance(assessment_record, dict):
+        hard_errors.append("Claude commitment assessment record is missing")
+    elif (assessment_record.get("ledger_sha256") != approval.get("ledger_sha256")
+          or assessment_record.get("proposal_version") != approval.get("proposal_version")
+          or assessment_record.get("proposal_sha256") != approval.get("proposal_sha256")
+          or assessment_record.get("purpose") != expected_assessment_purpose
+          or assessment_record.get("report_sha256") != hashlib.sha256(str(report_text or "").encode("utf-8")).hexdigest()):
+        hard_errors.append("Claude commitment assessment is stale or bound to a different approved proposal or review report")
+    else:
+        assessment = assessment_record.get("assessment")
+        try:
+            report_assessment = parse_claude_assessment(
+                str(report_text or ""), approval["ledger"],
+            )
+        except (TraceabilityError, KeyError, TypeError, AttributeError):
+            report_assessment = None
+        if assessment != report_assessment:
+            hard_errors.append("Saved Claude assessment does not match the bound review report")
+            assessment = None
+    integrity_record = state.get("integrity")
+    review_evidence = integrity_record.get("review_evidence", {}) if isinstance(integrity_record, dict) else {}
+    final_fingerprint = {
+        "working_tree_sha256": review_evidence.get("target_working_tree_sha256")
+        if isinstance(review_evidence, dict) else None,
+    }
+    review_provenance = {
+        key: review_evidence.get(key)
+        for key in (
+            "campaign_id", "purpose", "review_reports_sha256", "target_commit_sha",
+            "target_working_tree_sha256", "review_scope_sha256",
+        )
+    } if isinstance(review_evidence, dict) else None
+    try:
+        evaluation = evaluate_ledger(
+            approval["ledger"], evidence, assessment,
+            target=target,
+            reviewed_paths=set(state.get("review_scope_files", state.get("review_included_files", []))),
+            operations=state.get("operation_history", []),
+            final_fingerprint=final_fingerprint,
+            workflow_changed_paths=set(state.get("review_workflow_paths", [])),
+            review_provenance=review_provenance,
+        )
+    except Exception as exc:
+        hard_errors.append(f"Commitment evaluation failed: {type(exc).__name__}")
+        evaluation = {"schema_version": 1, "disposition": "blocked", "commitments": []}
+    if hard_errors:
+        evaluation["disposition"] = "blocked"
+        evaluation["rationale"] = "; ".join(hard_errors)
+    evaluation["workflow_status"] = state.get("status")
+    evaluation["approved_ledger_sha256"] = approval.get("ledger_sha256")
+    evaluation["evidence_integrity_errors"] = hard_errors
+    state["commitment_gate"] = evaluation
+    state["delivery_disposition"] = evaluation["disposition"]
+    return evaluation
+
+def commitment_review_context(state) -> str:
+    approval = state.get("commitment_ledger_approval")
+    evidence_record = state.get("commitment_evidence")
+    if not isinstance(approval, dict) or not isinstance(evidence_record, dict):
+        return "No approved commitment ledger or Codex evidence record is available."
+    evidence = evidence_record.get("evidence")
+    referenced_events = {
+        event_id
+        for item in (evidence or {}).get("commitments", []) if isinstance(item, dict)
+        for reference in item.get("validation_refs", []) if isinstance(reference, dict)
+        for event_id in reference.get("execution_event_ids", []) if isinstance(event_id, str)
+    }
+    operation_id = evidence_record.get("operation_id")
+    operation = next((
+        item for item in state.get("operation_history", [])
+        if isinstance(item, dict) and item.get("operation_id") == operation_id
+    ), {})
+    receipts = [
+        receipt for receipt in operation.get("test_execution_events", [])
+        if isinstance(receipt, dict) and receipt.get("event_id") in referenced_events
+    ]
+    ledger = approval.get("ledger") or {}
+    relevant_ids = {
+        item.get("id") for item in ledger.get("commitments", [])
+        if isinstance(item, dict) and item.get("class") in REQUIRED_CLASSES
+    }
+    compact_ledger = [
+        {
+            key: item.get(key)
+            for key in ("id", "class", "statement", "acceptance_condition", "implementation_basis", "relevant_sources", "availability", "verification_scenarios")
+        }
+        for item in ledger.get("commitments", [])
+        if isinstance(item, dict) and item.get("id") in relevant_ids
+    ]
+    compact_evidence = [
+        {
+            "commitment_id": item.get("commitment_id"),
+            "source_refs": item.get("source_refs", []),
+            "validation_refs": item.get("validation_refs", []),
+            "disposition": item.get("disposition"),
+            "reason": item.get("reason"),
+        }
+        for item in (evidence or {}).get("commitments", [])
+        if isinstance(item, dict) and item.get("commitment_id") in relevant_ids
+    ]
+    return json.dumps({
+        "approved_ledger_sha256": approval.get("ledger_sha256"),
+        "commitments_requiring_assessment": compact_ledger,
+        "codex_evidence_references": compact_evidence,
+        "codex_evidence_error": evidence_record.get("error"),
+        "execution_operation_id": operation_id,
+        "execution_target_fingerprint_before": operation.get("target_fingerprint_before"),
+        "execution_target_fingerprint_after": operation.get("target_fingerprint_after"),
+        "execution_target_fingerprint": operation.get("target_fingerprint"),
+        "observed_test_execution_receipts": receipts,
+    }, sort_keys=True, ensure_ascii=False, indent=2)
+
+def commitment_validation_baseline(state, workflow_id: str) -> str:
+    """Expose non-sensitive initial path and content hashes for scope checks."""
+    preexisting = state.get("preexisting_paths", [])
+    paths = sorted({
+        path for path in preexisting
+        if isinstance(path, str)
+        and path != _workspace.WORKFLOW_ROOT
+        and not path.startswith(_workspace.WORKFLOW_ROOT + "/")
+        and not _workspace.fingerprint_path_is_sensitive(path)
+    }) if isinstance(preexisting, list) else []
+    path_states: dict[str, dict[str, object]] = {}
+    snapshot = state.get("baseline_snapshot")
+    execution = state.get("execution_fingerprint")
+    initial_target = (
+        execution.get("initial", {}).get("target", {}) if isinstance(execution, dict) else {}
+    )
+    if isinstance(snapshot, dict) and isinstance(snapshot.get("entries"), list):
+        snapshot_body = {key: value for key, value in snapshot.items() if key != "sha256"}
+        expected_snapshot_sha = hashlib.sha256(json.dumps(
+            snapshot_body, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")).hexdigest()
+        if (snapshot.get("sha256") == expected_snapshot_sha
+                and snapshot.get("baseline_fingerprint_sha256")
+                == (initial_target.get("working_tree_sha256") if isinstance(initial_target, dict) else None)):
+            for entry in snapshot["entries"]:
+                if not isinstance(entry, dict):
+                    continue
+                path = entry.get("path")
+                kind = entry.get("kind")
+                mode = entry.get("mode")
+                digest = entry.get("sha256")
+                if (path not in paths or kind not in {"file", "symlink"}
+                        or type(mode) is not int or not isinstance(digest, str)
+                        or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest)):
+                    continue
+                path_states[path] = {"kind": kind, "mode": mode, "sha256": digest}
+    return json.dumps({
+        "baseline_commit": state.get("baseline_commit"),
+        "preexisting_non_sensitive_paths": paths,
+        "preexisting_path_states": path_states,
+        "preexisting_snapshot_complete": set(path_states) == set(paths),
+        "workflow_artifact_prefix": f"{_workspace.WORKFLOW_ROOT}/{workflow_id}/",
+    }, ensure_ascii=False, sort_keys=True, indent=2)

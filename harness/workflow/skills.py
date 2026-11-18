@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import re
 
+MAX_PROMPT_FILE_INVENTORY_CHARS = 32_000
+
+
 
 STAGE_SKILLS = {
     "planning": ("architecture-design", "software-engineering", "testing-strategy"),
@@ -99,3 +102,80 @@ def select_skills(guidance: dict, stage: str, context: str = "") -> dict:
             selected.append(skill)
             selected_names.add(name)
     return {**guidance, "skills": selected}
+
+
+def file_inventory_section(files: list[str], label: str = "Files") -> str:
+    if not files:
+        return f"{label}: (no project files found)"
+    inventory = ", ".join(files)
+    if len(inventory) <= MAX_PROMPT_FILE_INVENTORY_CHARS:
+        return f"{label}: {inventory}"
+    return (
+        f"{label}: full inventory omitted ({len(files):,} paths; {len(inventory):,} characters). "
+        "Use `rg --files` and focused `rg` searches to locate relevant files."
+    )
+
+
+def guidance_for_claude(
+    guidance: dict, *, stage: str | None = None, context: str = "", include_skill_content: bool = True,
+) -> str:
+    if stage is not None:
+        guidance = select_skills(guidance, stage, context)
+    files = guidance.get("files") or []
+    instructions = guidance.get("instructions") or []
+    lines = [file_inventory_section(files, label="Repository files")]
+    lines.append("Instruction files: " + (", ".join(item["path"] for item in instructions) or "none found"))
+    locations = guidance.get("skill_locations_checked") or []
+    lines.append("Skill locations checked: " + (", ".join(locations) if locations else "none"))
+    skills = guidance.get("skills") or []
+    if skills:
+        lines.append("Relevant skill instructions:")
+        for skill in skills:
+            label = f"{skill['name']} ({skill.get('source', 'unknown')}; {skill.get('path', 'path unavailable')})"
+            content = skill.get("content")
+            if include_skill_content and isinstance(content, str) and content.strip():
+                lines.append(f"--- {label} ---\n{content}")
+            else:
+                if skill["name"] == "api-engineer":
+                    description = (
+                        "Establish the API contract from the assignment, align verification with behavior at risk, "
+                        "and avoid unnecessary Postman setup when no existing collection or workspace is present."
+                    )
+                else:
+                    description = skill.get("description") or "Skill content unavailable."
+                lines.append(f"--- {label} ---\n{description}")
+    else:
+        lines.append("Relevant skills: none found in project skill locations.")
+    return "\n".join(lines)
+
+
+def guidance_for_codex(guidance: dict, *, stage: str | None = None, context: str = "") -> str:
+    if stage is not None:
+        guidance = select_skills(guidance, stage, context)
+    files = guidance.get("files") or []
+    sections = ["Target repository context:", file_inventory_section(files)]
+    locations = guidance.get("skill_locations_checked") or []
+    sections.append("Skill locations checked: " + (", ".join(locations) if locations else "none"))
+    instructions = guidance.get("instructions") or []
+    if instructions:
+        sections.append("Applicable instruction files (follow them):")
+        for instruction in instructions:
+            sections.append(f"--- {instruction['path']} ---\n{instruction['content']}")
+    else:
+        sections.append("Applicable instruction files: none found.")
+    skills = guidance.get("skills") or []
+    if skills:
+        sections.append(
+            "Stage-selected skill instructions (apply the relevant guidance without expanding the assignment):"
+        )
+        for skill in skills:
+            sections.append(
+                f"--- {skill['name']} ({skill['source']}; {skill['path']}) ---\n{skill['content']}"
+            )
+    else:
+        sections.append("Applicable skills: none found; continue without inventing or forcing a skill.")
+    sections.append(
+        "Skill instructions do not override the assignment, user constraints, or workflow authorization. "
+        "Do not create or publish external workspaces, commit, push, or add setup that is not justified by the task."
+    )
+    return "\n\n".join(sections)

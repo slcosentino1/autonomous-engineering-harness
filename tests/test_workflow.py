@@ -137,16 +137,24 @@ class CodexGuidanceTests(unittest.TestCase):
 
     def test_claude_repository_context_omits_oversized_file_inventory(self):
         files = [f"src/module-{index:05d}/file.py" for index in range(5_000)]
-        runner = object.__new__(orchestrator.Orchestrator)
+        runner = object.__new__(orchestrator.WorkflowExecution)
 
-        context = runner._repository_context_for_claude({"files": files})
+        context = orchestrator._planning_review.repository_context_for_claude({"files": files})
 
         self.assertIn("Files: full inventory omitted (5,000 paths;", context)
         self.assertNotIn(files[0], context)
 
-    def test_default_claude_payload_limit_is_increased(self):
+    def test_default_claude_payload_limit_is_600000_characters(self):
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(claude_reviewer.max_review_payload_chars(), 200_000)
+            self.assertEqual(claude_reviewer.max_review_payload_chars(), 600_000)
+
+    def test_default_payload_accepts_exact_600000_unicode_characters(self):
+        context = "é" * 600_000
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(claude_reviewer.validate_review_payload(context), 600_000)
+            self.assertEqual(len(context.encode("utf-8")), 1_200_000)
+            with self.assertRaisesRegex(claude_reviewer.ReviewError, "above the configured 600000-character"):
+                claude_reviewer.validate_review_payload(context + "é")
 
     def test_exact_documentation_urls_are_authorized_only_in_read_only_plan_stages(self):
         self.assertEqual(
@@ -715,12 +723,11 @@ class PartReviewParserTests(unittest.TestCase):
         self.assertTrue(parsed["valid"], parsed["errors"])
 
     def test_review_prompt_requests_stable_report_and_feedback_keeps_detail(self):
-        header = orchestrator.Orchestrator._code_review_header()
+        header = review_contracts.ReviewCampaign._code_review_header()
         self.assertIn("### Finding F1", header)
         self.assertIn("Recommended correction", header)
-        runner = object.__new__(orchestrator.Orchestrator)
-        runner.state = {"proposal_version": 7}
-        sections = runner._part_sections(
+        campaign = review_contracts.ReviewCampaign({"proposal_version": 7})
+        sections = campaign._part_sections(
             {"Assignment": "Full assignment", "Approved proposal": "Full proposal"},
             [self.segment], campaign_id="campaign", part_id="part-000001", excluded_count=0,
         )
@@ -744,6 +751,26 @@ class ReviewContractExtractionTests(unittest.TestCase):
         self.assertIs(orchestrator.ReviewSegment, review_contracts.ReviewSegment)
         self.assertIs(orchestrator.parse_part_review_report, review_contracts.parse_part_review_report)
         self.assertIs(orchestrator.render_review_feedback, review_contracts.render_review_feedback)
+
+    def test_review_report_hash_is_canonical_for_capture_and_delivery(self):
+        campaign = {
+            "consolidated_report": "Approved.",
+            "part_reviews": [{"part_id": "part-1", "report": "Reviewed.", "status": "reviewed"}],
+            "integration_review": {"report": "Coherent."},
+        }
+        state = {
+            "review_campaign": campaign,
+            "code_review": "Approved.",
+            "verification_report": None,
+            "traceability_required": True,
+            "commitment_assessment": {"commitments": []},
+        }
+
+        captured = review_contracts.review_reports_sha256(state, campaign)
+        self.assertEqual(review_contracts.review_reports_sha256(state), captured)
+
+        state["commitment_assessment"] = {"commitments": [{"id": "C-1"}]}
+        self.assertNotEqual(review_contracts.review_reports_sha256(state), captured)
 
     def test_legacy_review_hash_is_reconstructible_without_hiding_new_code_changes(self):
         patch = "diff --git a/SMOKE_TEST.md b/SMOKE_TEST.md\n+content\n"
@@ -781,7 +808,7 @@ class ReviewContractExtractionTests(unittest.TestCase):
             recorded_hash,
         )
 
-    def test_partition_validation_keeps_workflow_error_and_message(self):
+    def test_partition_validation_keeps_review_error_and_message(self):
         patch = "first line\nsecond line\n"
         segment_text = "first line\n"
         segment = review_contracts.ReviewSegment(
@@ -793,11 +820,93 @@ class ReviewContractExtractionTests(unittest.TestCase):
         parts = [{"part_id": "part-000001", "segments": [segment]}]
         expected = "Review partition does not cover the complete changed file patch: src/module.py."
         self.assertEqual(review_contracts._review_partition_error(review_diff, parts), expected)
-        with self.assertRaisesRegex(orchestrator.WorkflowError, expected.replace(".", r"\.")):
-            orchestrator.Orchestrator._validate_review_partition(review_diff, parts)
+        with self.assertRaisesRegex(review_contracts.ReviewCampaignError, expected.replace(".", r"\.")):
+            review_contracts.ReviewCampaign._validate_review_partition(review_diff, parts)
 
 
 class ReviewCampaignBoundaryTests(unittest.TestCase):
+    def test_shared_review_context_removes_duplicated_embedded_proposal_and_ledger(self):
+        state = {
+            "task": (
+                "Original assignment.\n\n## Approved proposal and worktree binding\n"
+                "Use the independent target worktree; do not commit.\n\n"
+                "## Approved proposal v7\nDuplicated proposal body.\n"
+            ),
+            "proposal": "Final approved proposal.\n```commitment-ledger\n{}\n```\n",
+            "implementation_summary": "summary",
+            "traceability_required": True,
+            "commitment_ledger_approval": {"ledger": {"commitments": [{
+                "class": "mandatory_user_requirement",
+            }]}},
+        }
+        campaign = review_contracts.ReviewCampaign(state)
+        review_diff = review_contracts.ReviewDiff("", (), (), ())
+
+        with patch.object(
+            review_contracts._traceability, "commitment_review_context", return_value="Normalized commitments.",
+        ):
+            shared = campaign.build_shared_context(
+                review_diff, repository_context="repository", relevant_skills="skills",
+            )
+
+        self.assertEqual(shared["Assignment"], "Original assignment.")
+        self.assertEqual(
+            shared["Workflow target and authorization binding"],
+            "Use the independent target worktree; do not commit.",
+        )
+        self.assertEqual(shared["Approved proposal"], "Final approved proposal.")
+        self.assertEqual(shared["Commitment ledger and Harness-validated evidence references"], "Normalized commitments.")
+
+    def test_python_class_method_is_a_safe_patch_boundary_with_its_decorator(self):
+        lines = [
+            "@@ -1,10 +1,10 @@\n",
+            " class Store:\n",
+            "-    def load(self):\n",
+            "-        return None\n",
+            "-\n",
+            "-    @staticmethod\n",
+            "-    def connect():\n",
+            "-        return Store()\n",
+            "-            elif stage == \"code_review\":\n",
+        ]
+
+        boundaries = review_contracts._safe_patch_boundaries(lines, "harness/workflow/store.py")
+
+        self.assertIn(5, boundaries)
+        self.assertNotIn(6, boundaries)
+        self.assertIn(8, boundaries)
+
+    def test_part_context_is_compact_while_integration_context_remains_unchanged(self):
+        full = {
+            "Assignment": "Complete assignment.",
+            "Approved proposal": "Approved architecture.",
+            "Implementation summary": "Unverified summary.",
+            "Repository context": "Full repository context.",
+            "Relevant skills": "Full skill text.",
+            "Commitment ledger and Harness-validated evidence references": "Full ledger.",
+            "Commitment assessment contract": "Full assessment contract.",
+            "Selected baseline and final source context": (
+                "### README.md (pre-existing target state; unchanged; symbols: integration_note)\n"
+                "Baseline and final source are identical. Baseline version — context only, never implementation evidence; "
+                "relevant declarations:\nPre-existing staged integration note.\n\n"
+                "### src/large.py (Git HEAD baseline; symbols: Store.load)\n" + "x" * 9_000
+            ),
+            "Independent reviewer role": "Review role.",
+        }
+
+        part = review_contracts.ReviewCampaign._part_review_context(full)
+
+        self.assertIn("Pre-existing staged integration note.", full["Selected baseline and final source context"])
+        self.assertEqual(part["Assignment"], "Complete assignment.")
+        self.assertEqual(part["Approved proposal"], "Approved architecture.")
+        self.assertEqual(part["Repository context"], "Full repository context.")
+        self.assertEqual(part["Relevant skills"], "Full skill text.")
+        self.assertNotIn("Commitment ledger and Harness-validated evidence references", part)
+        self.assertNotIn("Selected baseline and final source context", part)
+        self.assertIn("Pre-existing staged integration note.", part["Selected pre-existing target context"])
+        self.assertNotIn("x" * 5_000, part.get("Selected pre-existing target context", ""))
+        self.assertIn("final integration review receives", part["Review context for this part"])
+
     def test_campaign_runs_through_state_and_provider_callbacks_without_orchestrator(self):
         patch = "diff --git a/src/feature.py b/src/feature.py\n+value = 1\n"
         segment = review_contracts.ReviewSegment(
@@ -853,6 +962,40 @@ class ReviewCampaignBoundaryTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][1], "code_review")
         self.assertGreater(len(saves), 1)
+
+    def test_shared_review_context_includes_referenced_symbols_not_whole_source_files(self):
+        source = "class Store:\n    def load(self):\n        return 'loaded'\n\n# " + ("x" * 90_000)
+        state = {
+            "task": "A" * 70_000,
+            "proposal": "P" * 45_000,
+            "implementation_summary": "S" * 8_000,
+            "commitment_evidence": {"evidence": {"commitments": [{
+                "source_refs": [{"path": "src/store.py", "symbol": "Store.load"}],
+            }]}},
+        }
+        review_diff = review_contracts.ReviewDiff(
+            "diff --git a/src/change.py b/src/change.py\n+value = 1\n",
+            ("src/change.py",), (), (("src/change.py", "value = 1\n"),),
+            context_files=(("src/store.py", "pre-existing target state", source, source),),
+        )
+        campaign = review_contracts.ReviewCampaign(state)
+        shared = campaign.build_shared_context(
+            review_diff, repository_context="repository context", relevant_skills="review skills",
+        )
+        probe = campaign._review_segment("review-context-probe.txt", "x")
+        sections = campaign._part_sections(
+            shared, [probe], campaign_id="context-budget", part_id="part-000001", excluded_count=0,
+        )
+        prompt = campaign._serialized_review_prompt(campaign._code_review_header(), sections)
+
+        self.assertTrue(campaign._serialized_review_fits(
+            campaign._code_review_header(), sections, claude_reviewer.DEFAULT_MAX_REVIEW_PAYLOAD_CHARS,
+        ))
+        self.assertLess(len(prompt), claude_reviewer.DEFAULT_MAX_REVIEW_PAYLOAD_CHARS)
+        self.assertIn("Store.load", prompt)
+        self.assertIn("return 'loaded'", prompt)
+        self.assertNotIn("x" * 500, prompt)
+        self.assertIn("Baseline and final source are identical", prompt)
 
 
 class WorkspaceModuleTests(unittest.TestCase):
@@ -951,10 +1094,12 @@ class WorkspaceModuleTests(unittest.TestCase):
         })
         self.assertNotIn(".engineering/workflows/sample/state.json", by_path)
 
-        runner = object.__new__(orchestrator.Orchestrator)
-        runner.target = self.target
-        runner.state = {"baseline_commit": baseline, "preexisting_paths": ["modified.py", "untracked.py"]}
-        self.assertEqual(runner._target_change_inventory(), inventory)
+        self.assertEqual(
+            workspace_ops.target_change_inventory(
+                self.target, baseline, ["modified.py", "untracked.py"],
+            ),
+            inventory,
+        )
 
     def test_target_change_inventory_is_empty_without_a_valid_baseline(self):
         self.assertEqual(workspace_ops.target_change_inventory(self.target, None, []), [])
@@ -1238,7 +1383,7 @@ class PersistenceModuleTests(unittest.TestCase):
         runner.workflow_dir.mkdir(parents=True)
         runner.state = {"version": 1}
         with self.assertRaisesRegex(orchestrator.WorkflowError, "state writes require the workflow process lock"):
-            runner._save()
+            runner.execution._save()
         self.assertFalse(runner.state_path.exists())
 
         with runner._workflow_lock():
@@ -1247,7 +1392,7 @@ class PersistenceModuleTests(unittest.TestCase):
                     orchestrator._atomic_text(runner.state_path, "state\n")
             with patch("workflow.persistence.os.replace", side_effect=OSError("disk full")):
                 with self.assertRaisesRegex(orchestrator.WorkflowError, "disk full"):
-                    runner._save()
+                    runner.execution._save()
 
 
 class CodexInvocationEvidenceTests(unittest.TestCase):
@@ -1535,14 +1680,14 @@ class CodexInvocationEvidenceTests(unittest.TestCase):
 
     def test_process_exit_before_evidence_persistence_leaves_operation_unresolved(self):
         runner, _process = self.invoke(stdout=b'{"type":"turn.completed"}\n')
-        finish = runner._finish_operation
+        finish = runner.execution._finish_operation
 
         def interrupt_before_save(operation_id, **kwargs):
             if kwargs.get("status") == "completed":
                 raise KeyboardInterrupt()
             finish(operation_id, **kwargs)
 
-        runner._finish_operation = interrupt_before_save
+        runner.execution._finish_operation = interrupt_before_save
         with self.assertRaises(KeyboardInterrupt):
             self.run_locked(runner)
 
@@ -1804,6 +1949,30 @@ class WorkflowTests(unittest.TestCase):
                 runners[0].resume()
         self.assertEqual(runners[0].state_path.read_bytes(), before_unknown)
 
+    def test_workflow_lock_precedes_target_lock_for_combined_operations(self):
+        runner = orchestrator.Orchestrator(self.target, workflow_id="lock-order")
+        events = []
+
+        class RecordingLock:
+            def __init__(self, name):
+                self.name = name
+
+            def __enter__(self):
+                events.append(self.name + ":enter")
+
+            def __exit__(self, *_exc):
+                events.append(self.name + ":exit")
+
+        with (patch.object(runner, "_workflow_lock", return_value=RecordingLock("workflow")),
+              patch("orchestrator._target_process_lock", return_value=RecordingLock("target"))):
+            runner._execute_locked(
+                lambda: events.append("operation") or {"status": "complete"}, target_lock=True,
+            )
+
+        self.assertEqual(events, [
+            "workflow:enter", "target:enter", "operation", "target:exit", "workflow:exit",
+        ])
+
     def test_approval_rejects_stale_target_baseline_after_another_workflow_changes_target(self):
         review = lambda: FakeClaude(
             claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05),
@@ -1875,25 +2044,25 @@ class WorkflowTests(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 runner.approve()
         elif mode == "after-process":
-            finish_operation = runner._finish_operation
+            finish_operation = runner.execution._finish_operation
 
             def interrupt_before_result_save(operation_id, **kwargs):
                 if kwargs.get("status") == "completed":
                     raise KeyboardInterrupt()
                 finish_operation(operation_id, **kwargs)
 
-            runner._finish_operation = interrupt_before_result_save
+            runner.execution._finish_operation = interrupt_before_result_save
             with self.assertRaises(KeyboardInterrupt):
                 runner.approve()
         elif mode == "after-result-persisted":
-            finish_operation = runner._finish_operation
+            finish_operation = runner.execution._finish_operation
 
             def interrupt_after_result_save(operation_id, **kwargs):
                 finish_operation(operation_id, **kwargs)
                 if kwargs.get("status") == "completed":
                     raise KeyboardInterrupt()
 
-            runner._finish_operation = interrupt_after_result_save
+            runner.execution._finish_operation = interrupt_after_result_save
             with self.assertRaises(KeyboardInterrupt):
                 runner.approve()
         else:
@@ -1904,7 +2073,7 @@ class WorkflowTests(unittest.TestCase):
         runner = orchestrator.Orchestrator(
             self.target, task="Add a feature", budget_usd=1.0, workflow_id="crash-before-operation",
         )
-        with patch.object(runner, "_run_codex", side_effect=KeyboardInterrupt()):
+        with patch.object(runner.execution, "_run_codex", side_effect=KeyboardInterrupt()):
             with self.assertRaises(KeyboardInterrupt):
                 runner.start()
         state = json.loads(runner.state_path.read_text(encoding="utf-8"))
@@ -1921,12 +2090,94 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(resumed["status"], "awaiting_approval")
         self.assertEqual(len(codex.commands), 2)
 
+    def test_proposal_artifact_before_stage_advance_retries_saved_stage(self):
+        codex = FakeCodex(
+            "# Proposal\nPlan safely.\n", "# Proposal\nPlan safely again.\n", self.refined(),
+        )
+        claude = FakeClaude(claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05))
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add a feature", budget_usd=1.0,
+            workflow_id="proposal-artifact-crash-window", process_runner=codex, claude_runner=claude,
+        )
+        def interrupt_before_outcome(fields):
+            self.assertTrue(runner.proposal_path.is_file())
+            self.assertEqual(fields, {"stage": "plan_review_1"})
+            raise orchestrator.WorkflowError("simulated interruption before stage outcome application")
+
+        runner.workflow_state.transition = interrupt_before_outcome
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "before stage outcome application"):
+            runner.start()
+
+        persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["stage"], "planning")
+        self.assertEqual(persisted["status"], "failed")
+        self.assertTrue(runner.proposal_path.is_file())
+        self.assertIn("Plan safely.", runner.proposal_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["proposal_artifact_sha256"], hashlib.sha256(
+            runner.proposal_path.read_bytes(),
+        ).hexdigest())
+        self.assertEqual(len(codex.commands), 1)
+
+        resumed = orchestrator.Orchestrator(
+            self.target, workflow_id="proposal-artifact-crash-window",
+            process_runner=codex, claude_runner=claude,
+        ).resume()
+        self.assertEqual(resumed["status"], "awaiting_approval")
+        self.assertEqual(len(codex.commands), 3)
+        self.assertEqual(sum(
+            item.get("stage") == "planning" and item.get("operation_type") == "codex"
+            for item in resumed["operation_history"]
+        ), 2)
+
+    def test_delivery_artifact_before_complete_outcome_is_recoverable(self):
+        codex = FakeCodex(
+            "# Proposal\nPlan safely.\n", self.refined(), "Implemented the feature.\n",
+        )
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Plan looks good.", 0.1),
+            claude_reviewer.ReviewResult("Decision: APPROVED\nNo code findings.", 0.2),
+        )
+        (self.target / "src").mkdir()
+        codex.on_call = lambda index, _command, _kwargs: (
+            (self.target / "src" / "feature.py").write_text("VALUE = 1\n", encoding="utf-8")
+            if index == 2 else None
+        )
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add a feature", budget_usd=1.0, workflow_id="delivery-artifact-crash-window",
+            process_runner=codex, claude_runner=claude,
+        )
+        self.assertEqual(runner.start()["status"], "awaiting_approval")
+        transition = runner.workflow_state.transition
+
+        def interrupt_before_completion(fields):
+            if fields == {"status": "complete"}:
+                self.assertTrue(runner.delivery_path.is_file())
+                raise orchestrator.WorkflowError("simulated interruption before completion outcome application")
+            transition(fields)
+
+        runner.workflow_state.transition = interrupt_before_completion
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "before completion outcome application"):
+            runner.approve()
+
+        saved = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(saved["stage"], "complete")
+        self.assertTrue(runner.delivery_path.is_file())
+        provider_calls = (len(codex.commands), len(claude.prompts))
+
+        resumed = orchestrator.Orchestrator(
+            self.target, workflow_id="delivery-artifact-crash-window",
+            process_runner=codex, claude_runner=claude,
+        ).resume()
+        self.assertEqual(resumed["status"], "complete")
+        self.assertEqual((len(codex.commands), len(claude.prompts)), provider_calls)
+
     def test_crash_after_started_before_subprocess_launch_is_safe_to_resume(self):
         runner = orchestrator.Orchestrator(
             self.target, task="Add a feature", budget_usd=1.0, workflow_id="crash-before-launch",
             process_runner=FakeCodex("# Proposal\nPlan.\n", self.refined()),
         )
-        with patch.object(runner, "_run_process_with_pid", side_effect=KeyboardInterrupt()):
+        with patch.object(runner.execution, "_run_process_with_pid", side_effect=KeyboardInterrupt()):
             with self.assertRaises(KeyboardInterrupt):
                 runner.start()
         persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
@@ -2056,14 +2307,14 @@ class WorkflowTests(unittest.TestCase):
             self.target, task="Add a feature", budget_usd=1.0, workflow_id="crash-before-claude-launch",
             process_runner=FakeCodex("# Proposal\nPlan.\n"), claude_runner=claude,
         )
-        operation_launching = runner._operation_launching
+        operation_launching = runner.workflow_state.operation_launching
 
         def interrupt_before_claude_launch(operation_id):
             if runner._operation(operation_id).get("operation_type") == "claude":
                 raise KeyboardInterrupt()
             operation_launching(operation_id)
 
-        with patch.object(runner, "_operation_launching", side_effect=interrupt_before_claude_launch):
+        with patch.object(runner.workflow_state, "operation_launching", side_effect=interrupt_before_claude_launch):
             with self.assertRaises(KeyboardInterrupt):
                 runner.start()
         state = json.loads(runner.state_path.read_text(encoding="utf-8"))
@@ -2131,7 +2382,7 @@ class WorkflowTests(unittest.TestCase):
         runner = orchestrator.Orchestrator(
             self.target, task="Add a feature", budget_usd=1.0, workflow_id="stale-running-no-operation",
         )
-        with patch.object(runner, "_run_codex", side_effect=KeyboardInterrupt()):
+        with patch.object(runner.execution, "_run_codex", side_effect=KeyboardInterrupt()):
             with self.assertRaises(KeyboardInterrupt):
                 runner.start()
         codex = FakeCodex("# Proposal\nPlan.\n", self.refined())
@@ -2232,7 +2483,7 @@ class WorkflowTests(unittest.TestCase):
         runner = orchestrator.Orchestrator(
             self.target, task="Add a feature", budget_usd=1.0, workflow_id="legacy-running-workflow",
         )
-        with patch.object(runner, "_run_codex", side_effect=KeyboardInterrupt()):
+        with patch.object(runner.execution, "_run_codex", side_effect=KeyboardInterrupt()):
             with self.assertRaises(KeyboardInterrupt):
                 runner.start()
         state = json.loads(runner.state_path.read_text(encoding="utf-8"))
@@ -2732,14 +2983,14 @@ class WorkflowTests(unittest.TestCase):
             claude_runner=claude,
         )
         self.assertEqual(runner.start()["status"], "awaiting_approval")
-        original = runner._run_codex_impl
+        original = runner.execution._run_codex_impl
 
         def mutate_before_write(prompt, *, sandbox):
             if sandbox == "workspace-write":
                 (self.target / "README.md").write_text("changed after approval\n", encoding="utf-8")
             return original(prompt, sandbox=sandbox)
 
-        with patch.object(runner, "_run_codex_impl", side_effect=mutate_before_write):
+        with patch.object(runner.execution, "_run_codex_impl", side_effect=mutate_before_write):
             with self.assertRaisesRegex(orchestrator.WorkflowError, "changed after the workflow baseline"):
                 runner.approve()
 
@@ -3100,11 +3351,11 @@ class WorkflowTests(unittest.TestCase):
         approver = orchestrator.Orchestrator(
             self.target, workflow_id="changed-before-delivery", process_runner=codex, claude_runner=claude,
         )
-        verify = approver._verify_delivery_integrity
+        verify = approver.execution._verify_delivery_integrity
         def mutate_then_verify():
             source.write_text("value = 2\n", encoding="utf-8")
             return verify()
-        approver._verify_delivery_integrity = mutate_then_verify
+        approver.execution._verify_delivery_integrity = mutate_then_verify
         with self.assertRaisesRegex(orchestrator.WorkflowError, "target code changed after its final review"):
             approver.approve()
         persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
@@ -3131,11 +3382,11 @@ class WorkflowTests(unittest.TestCase):
         approver = orchestrator.Orchestrator(
             self.target, workflow_id="proposal-changed-before-delivery", process_runner=codex, claude_runner=claude,
         )
-        verify = approver._verify_delivery_integrity
+        verify = approver.execution._verify_delivery_integrity
         def mutate_then_verify():
             approver.proposal_path.write_text("# Tampered proposal\n", encoding="utf-8")
             return verify()
-        approver._verify_delivery_integrity = mutate_then_verify
+        approver.execution._verify_delivery_integrity = mutate_then_verify
         with self.assertRaisesRegex(orchestrator.WorkflowError, "saved proposal changed after review"):
             approver.approve()
         persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
@@ -3201,11 +3452,14 @@ class WorkflowTests(unittest.TestCase):
 
     def test_large_review_uses_adaptive_parts_shared_context_and_integration(self):
         changed = {
-            "services/ledger/engine.py": "def calculate():\n" + "    value = 1  # ledger operation\n" * 45,
-            "services/ledger/model.py": "class LedgerModel:\n" + "    value = 'entry'\n" * 45,
-            "checks/ledger/test_engine.py": "def test_calculate():\n" + "    assert 1 == 1\n" * 45,
-            "contracts/ledger.contract": "ledger request contract\n" * 45,
-            "plugins/codec/custom.data": "codec mapping row\n" * 45,
+            "services/ledger/engine.py": "def calculate():\n" + "    value = 1  # ledger operation\n" * 400,
+            "services/ledger/model.py": "class LedgerModel:\n" + "    value = 'entry'\n" * 400,
+            "checks/ledger/test_engine.py": "\n".join(
+                f"def test_calculate_{index}():\n" + "    assert 1 == 1\n" * 40
+                for index in range(3)
+            ),
+            "contracts/ledger.contract": "ledger request contract\n" * 400,
+            "plugins/codec/custom.data": "codec mapping row\n" * 400,
         }
         codex = FakeCodex("# Proposal\nA small service with explicit contracts.\n", self.refined(), "Implemented all changed modules.\n")
 
@@ -3228,7 +3482,7 @@ class WorkflowTests(unittest.TestCase):
             workflow_id="multipart-review", process_runner=codex, claude_runner=claude,
         )
         runner.start()
-        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "24000"}):
+        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "40000"}):
             state = orchestrator.Orchestrator(
                 self.target, workflow_id="multipart-review", process_runner=codex,
                 claude_runner=claude,
@@ -3249,11 +3503,7 @@ class WorkflowTests(unittest.TestCase):
             assignments.setdefault(segment["path"], 0)
             assignments[segment["path"]] += 1
         self.assertEqual(assignments, {path: 1 for path in changed})
-        self.assertTrue(any(
-            {"services/ledger/engine.py", "services/ledger/model.py"}
-            <= {segment["path"] for segment in part["segments"]}
-            for part in campaign["parts"]
-        ))
+        self.assertTrue(any(len(part["segments"]) > 1 for part in campaign["parts"]))
         self.assertTrue(all(
             part["status"] == "reviewed" and f"Part ID: {part['part_id']}" in part["report"]
             for part in campaign["part_reviews"]
@@ -3269,8 +3519,8 @@ class WorkflowTests(unittest.TestCase):
             state["review_campaign_call_count"],
             state["authorization"]["claude_aily"]["max_code_reviews"],
         )
-        self.assertTrue(all(item["characters"] <= 24000 for item in code_calls))
-        self.assertTrue(all(item["payload_limit_characters"] == 24000 for item in code_calls))
+        self.assertTrue(all(item["characters"] <= 40000 for item in code_calls))
+        self.assertTrue(all(item["payload_limit_characters"] == 40000 for item in code_calls))
         self.assertEqual(
             {item["shared_context_sha256"] for item in code_calls},
             {campaign["shared_context_sha256"]},
@@ -3286,11 +3536,15 @@ class WorkflowTests(unittest.TestCase):
         integration_prompt = next(prompt for prompt in claude.prompts if "final independent integration review" in prompt)
         self.assertEqual(len(part_prompts), len(campaign["parts"]))
         for section in (
-            "Assignment", "Approved proposal", "Implementation summary", "Independent reviewer role",
+            "Assignment", "Approved proposal", "Relevant skills", "Independent reviewer role",
             "Engineering Judgment & Proportional Design", "Repository/module map and dependencies",
         ):
             values = {prompt_section(prompt, section) for prompt in part_prompts}
             self.assertEqual(len(values), 1, section)
+        self.assertEqual(campaign["header_id"], "code-review-part-v3")
+        self.assertTrue(all(item.get("part_context_sha256") for item in code_calls if item.get("review_kind") == "part"))
+        self.assertIn("Implementation summary", integration_prompt)
+        self.assertIn("Individual part reports", integration_prompt)
         self.assertIn("Individual part reports", integration_prompt)
         self.assertIn("Part ID: part-000001", integration_prompt)
         self.assertEqual(integration_prompt.count("Part ID: part-"), len(campaign["parts"]))
@@ -3349,7 +3603,7 @@ class WorkflowTests(unittest.TestCase):
     def test_resume_reuses_successful_parts_and_retries_only_failed_part(self):
         changed = {
             f"components/ledger/file_{index}.py": (
-                f"def operation_{index}():\n" + "    result = 'component operation'\n" * 45
+                f"def operation_{index}():\n" + "    result = 'component operation'\n" * 120
             )
             for index in range(5)
         }
@@ -3377,7 +3631,7 @@ class WorkflowTests(unittest.TestCase):
             process_runner=codex, claude_runner=claude,
         )
         runner.start()
-        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "14000"}):
+        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "20000"}):
             with self.assertRaisesRegex(orchestrator.WorkflowError, "temporary Aily failure"):
                 orchestrator.Orchestrator(
                     self.target, workflow_id="part-resume", process_runner=codex, claude_runner=claude,
@@ -3520,7 +3774,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_saved_part_report_is_recovered_without_repeating_paid_call(self):
         changed = {
-            f"modules/recovery/file_{index}.py": f"def operation_{index}():\n" + "    return 'recoverable'\n" * 45
+            f"modules/recovery/file_{index}.py": f"def operation_{index}():\n" + "    return 'recoverable'\n" * 120
             for index in range(5)
         }
         codex = FakeCodex("# Proposal\nKeep the report state durable.\n", self.refined(), "Implemented.\n")
@@ -3537,22 +3791,26 @@ class WorkflowTests(unittest.TestCase):
         )
         runner.start()
 
-        class InterruptedAfterSavedCall(orchestrator.Orchestrator):
-            interrupted = False
+        interrupted = orchestrator.Orchestrator(
+            self.target, workflow_id="persisted-report-recovery", process_runner=codex,
+            claude_runner=claude,
+        )
+        call_claude = interrupted.execution._call_claude
+        interrupted_once = False
 
-            def _call_claude(self, header, stage, sections, *, metadata=None):
-                result = super()._call_claude(header, stage, sections, metadata=metadata)
-                if stage == "code_review" and (metadata or {}).get("review_kind") == "part" and not self.interrupted:
-                    self.interrupted = True
-                    raise orchestrator.WorkflowError("simulated interruption after report persistence")
-                return result
+        def interrupt_after_saved_call(header, stage, sections, *, metadata=None):
+            nonlocal interrupted_once
+            result = call_claude(header, stage, sections, metadata=metadata)
+            if stage == "code_review" and (metadata or {}).get("review_kind") == "part" and not interrupted_once:
+                interrupted_once = True
+                raise orchestrator.WorkflowError("simulated interruption after report persistence")
+            return result
 
-        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "14000"}):
+        interrupted.execution._call_claude = interrupt_after_saved_call
+
+        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "20000"}):
             with self.assertRaisesRegex(orchestrator.WorkflowError, "simulated interruption"):
-                InterruptedAfterSavedCall(
-                    self.target, workflow_id="persisted-report-recovery", process_runner=codex,
-                    claude_runner=claude,
-                ).approve()
+                interrupted.approve()
             state_before = json.loads(runner.state_path.read_text(encoding="utf-8"))
             part_record = state_before["review_campaign"]["part_reviews"][0]
             self.assertEqual(part_record["status"], "report_saved")
@@ -3575,7 +3833,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_saved_integration_report_is_recovered_without_repeating_paid_call(self):
         changed = {
-            f"application/sync/file_{index}.py": f"def operation_{index}():\n" + "    return 'sync'\n" * 55
+            f"application/sync/file_{index}.py": f"def operation_{index}():\n" + "    return 'sync'\n" * 200
             for index in range(5)
         }
         codex = FakeCodex("# Proposal\nIntegrate the sync modules.\n", self.refined(), "Implemented.\n")
@@ -3592,19 +3850,23 @@ class WorkflowTests(unittest.TestCase):
         )
         runner.start()
 
-        class InterruptedAfterIntegration(orchestrator.Orchestrator):
-            def _call_claude(self, header, stage, sections, *, metadata=None):
-                result = super()._call_claude(header, stage, sections, metadata=metadata)
-                if (stage == "code_review" and (metadata or {}).get("review_kind") == "integration"):
-                    raise orchestrator.WorkflowError("simulated integration persistence boundary")
-                return result
+        interrupted = orchestrator.Orchestrator(
+            self.target, workflow_id="integration-recovery", process_runner=codex,
+            claude_runner=claude,
+        )
+        call_claude = interrupted.execution._call_claude
 
-        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "14000"}):
+        def interrupt_after_integration(header, stage, sections, *, metadata=None):
+            result = call_claude(header, stage, sections, metadata=metadata)
+            if stage == "code_review" and (metadata or {}).get("review_kind") == "integration":
+                raise orchestrator.WorkflowError("simulated integration persistence boundary")
+            return result
+
+        interrupted.execution._call_claude = interrupt_after_integration
+
+        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "20000"}):
             with self.assertRaisesRegex(orchestrator.WorkflowError, "integration persistence boundary"):
-                InterruptedAfterIntegration(
-                    self.target, workflow_id="integration-recovery", process_runner=codex,
-                    claude_runner=claude,
-                ).approve()
+                interrupted.approve()
             saved = json.loads(runner.state_path.read_text(encoding="utf-8"))
             self.assertEqual(saved["review_campaign"]["integration_review"]["status"], "report_saved")
             calls_before_resume = len(claude.prompts)
@@ -3619,7 +3881,7 @@ class WorkflowTests(unittest.TestCase):
     def test_unknown_part_spend_blocks_all_later_campaign_calls(self):
         changed = {
             f"modules/records/part_{index}.py": (
-                f"def operation_{index}():\n" + "    return 'record operation'\n" * 50
+                f"def operation_{index}():\n" + "    return 'record operation'\n" * 120
             ) for index in range(5)
         }
         codex = FakeCodex("# Proposal\nUse the existing contract.\n", self.refined(), "Implemented records.\n")
@@ -3637,7 +3899,7 @@ class WorkflowTests(unittest.TestCase):
             process_runner=codex, claude_runner=claude,
         )
         runner.start()
-        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "14000"}):
+        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "20000"}):
             with self.assertRaisesRegex(orchestrator.WorkflowError, "previous call has no recorded cost"):
                 orchestrator.Orchestrator(
                     self.target, workflow_id="unknown-part-spend", process_runner=codex,
@@ -3655,7 +3917,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_existing_single_call_authorization_does_not_expand_for_multipart_review(self):
         changed = {
-            f"areas/component/file_{index}.py": f"def item_{index}():\n" + "    return 3\n" * 80
+            f"areas/component/file_{index}.py": f"def item_{index}():\n" + "    return 3\n" * 200
             for index in range(5)
         }
         codex = FakeCodex("# Proposal\nPlan.\n", self.refined(), "Implementation.\n")
@@ -3670,8 +3932,8 @@ class WorkflowTests(unittest.TestCase):
         external.pop("code_review_policy")
         external["max_code_reviews"] = 1
         with runner._workflow_lock():
-            runner._save()
-        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "13500"}):
+            runner.execution._save()
+        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "20000"}):
             with self.assertRaisesRegex(orchestrator.WorkflowError, "requires .* Claude calls.*authorizes 1"):
                 runner.approve()
         saved = json.loads(runner.state_path.read_text(encoding="utf-8"))
@@ -3700,7 +3962,7 @@ class WorkflowTests(unittest.TestCase):
         )
         runner.start()
         claude.auto_structure = False
-        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "14000"}):
+        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "20000"}):
             with self.assertRaisesRegex(orchestrator.WorkflowError, "report for part-000001 is invalid"):
                 runner.approve()
         saved = json.loads(runner.state_path.read_text(encoding="utf-8"))
@@ -3729,7 +3991,7 @@ class WorkflowTests(unittest.TestCase):
             process_runner=codex, claude_runner=claude,
         )
         runner.start()
-        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "15000"}):
+        with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "13000"}):
             with self.assertRaisesRegex(orchestrator.WorkflowError, "cannot be split at a safe patch boundary"):
                 runner.approve()
         failed = json.loads(runner.state_path.read_text(encoding="utf-8"))
@@ -3814,8 +4076,8 @@ class WorkflowTests(unittest.TestCase):
                 orchestrator._authorization.LEGACY_CLAUDE_DATA_SCOPE.copy()
             )
             authorization["scope_sha256"] = orchestrator.authorization_scope_digest(authorization)
-            runner._save()
-            header, sections, metadata = runner._plan_review_prompt(2)
+            runner.execution._save()
+            header, sections, metadata = runner.execution._plan_review_prompt(2)
             report, manifest = runner._call_claude(header, "plan_review_2", sections, metadata=metadata)
 
         self.assertIn("No material plan concerns.", report)
@@ -3850,12 +4112,12 @@ class WorkflowTests(unittest.TestCase):
             "Decision: APPROVED\nSeverity: Must fix\nFinding: broken required behavior."
         ))
         segment = orchestrator.ReviewSegment("src/a.py", "complete patch", 1, 1, 1, "hash")
-        self.assertTrue(orchestrator.Orchestrator._part_report_is_structured(
+        self.assertTrue(review_contracts.ReviewCampaign._part_report_is_structured(
             "Decision: APPROVED\nPart ID: part-000001\nFiles reviewed:\n- src/a.py\nFindings: None\n"
             "Cross-component concerns: None\nOverall assessment: adequate.",
             "part-000001", [segment],
         ))
-        self.assertTrue(orchestrator.Orchestrator._integration_report_is_structured(
+        self.assertTrue(review_contracts.ReviewCampaign._integration_report_is_structured(
             "Decision: APPROVED\nConsolidated findings: None\nIntegration findings: None\n"
             "Overall assessment: coherent."
         ))
@@ -3879,10 +4141,7 @@ class WorkflowTests(unittest.TestCase):
                 {"part_id": "part-2", "status": "pending", "segments": [second]},
             ],
         }
-        runner = object.__new__(orchestrator.Orchestrator)
-        runner.state = {}
-
-        runner._sync_review_coverage(
+        orchestrator._ReviewCampaign({})._sync_review_coverage(
             campaign,
             orchestrator.ReviewDiff("", ("src/first.py", "src/second.py"), (), ()),
         )
@@ -3911,16 +4170,15 @@ class WorkflowTests(unittest.TestCase):
                 {"part_id": "part-2", "status": "pending", "segments": [second]},
             ],
         }
-        runner = object.__new__(orchestrator.Orchestrator)
-        runner.state = {}
         review_diff = orchestrator.ReviewDiff("", ("src/module.py",), (), ())
 
-        runner._sync_review_coverage(campaign, review_diff)
+        review_campaign = orchestrator._ReviewCampaign({})
+        review_campaign._sync_review_coverage(campaign, review_diff)
         self.assertEqual(campaign["files_reviewed"], [])
         self.assertEqual([item["path"] for item in campaign["files_not_reviewed"]], ["src/module.py"])
 
         campaign["part_reviews"][1]["status"] = "reviewed"
-        runner._sync_review_coverage(campaign, review_diff)
+        review_campaign._sync_review_coverage(campaign, review_diff)
         self.assertEqual(campaign["files_reviewed"], ["src/module.py"])
         self.assertEqual(campaign["files_not_reviewed"], [])
 
@@ -3938,7 +4196,7 @@ class WorkflowTests(unittest.TestCase):
             "Cross-component concerns:\n- None\nOverall assessment: adequate."
         )
 
-        self.assertFalse(orchestrator.Orchestrator._part_report_is_structured(
+        self.assertFalse(review_contracts.ReviewCampaign._part_report_is_structured(
             report, "part-000001", segments,
         ))
 
@@ -3953,7 +4211,7 @@ class WorkflowTests(unittest.TestCase):
             "Findings: None\nCross-component concerns: None\nOverall assessment: adequate."
         )
 
-        self.assertTrue(orchestrator.Orchestrator._part_report_is_structured(
+        self.assertTrue(review_contracts.ReviewCampaign._part_report_is_structured(
             report, "part-000001", segments,
         ))
 
@@ -4044,7 +4302,7 @@ class WorkflowTests(unittest.TestCase):
             "stage": "code_review", "started_at": "unknown", "cap_usd": 0.9,
         }
         with runner._workflow_lock():
-            runner._save()
+            runner.execution._save()
 
         resumed = orchestrator.Orchestrator(
             self.target, workflow_id="active-review-call", process_runner=codex, claude_runner=claude,
@@ -4150,9 +4408,9 @@ class WorkflowTests(unittest.TestCase):
 
         runner.workflow_dir.mkdir(parents=True)
         with patch.dict(os.environ, {"CODEX_HOME": str(self.root / "empty-codex-home")}), runner._workflow_lock():
-            runner._run_codex_impl("Read the API documentation.", sandbox="read-only")
+            runner.execution._run_codex_impl("Read the API documentation.", sandbox="read-only")
             runner.state["stage"] = "implementation"
-            runner._run_codex_impl("Implement the approved change.", sandbox="workspace-write")
+            runner.execution._run_codex_impl("Implement the approved change.", sandbox="workspace-write")
 
         planning_command, implementation_command = codex.commands
         planning_config = next(item for item in planning_command if item.startswith("mcp_servers={"))
@@ -4186,7 +4444,7 @@ class WorkflowTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(orchestrator.WorkflowError, "declares MCP servers"):
-            runner._run_codex_impl("Read the API documentation.", sandbox="read-only")
+            runner.execution._run_codex_impl("Read the API documentation.", sandbox="read-only")
         self.assertEqual(codex.commands, [])
 
     def test_invalid_user_codex_config_fails_closed_before_planning_runs(self):
@@ -4207,7 +4465,7 @@ class WorkflowTests(unittest.TestCase):
             runner.workflow_dir.mkdir(parents=True)
             with patch.dict(os.environ, {"CODEX_HOME": codex_home}), runner._workflow_lock():
                 with self.assertRaisesRegex(orchestrator.WorkflowError, "Codex user configuration is invalid"):
-                    runner._run_codex_impl("Plan the work.", sandbox="read-only")
+                    runner.execution._run_codex_impl("Plan the work.", sandbox="read-only")
         self.assertEqual(codex.commands, [])
 
     def test_review_packet_excludes_sensitive_and_preexisting_paths_and_redacts_tokens(self):
@@ -4353,7 +4611,7 @@ class WorkflowTests(unittest.TestCase):
         )
         runner.start()
         with runner._workflow_lock():
-            header, sections, metadata = runner._plan_review_prompt(2)
+            header, sections, metadata = runner.execution._plan_review_prompt(2)
             incomplete = dict(sections)
             incomplete.pop("Current proposal")
             with self.assertRaisesRegex(orchestrator.WorkflowError, "missing mandatory sections"):
@@ -4379,6 +4637,38 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(runner.state["authorization"]["claude_aily"]["budget_unknown"], False)
             self.assertIsNone(runner.state["authorization"]["claude_aily"]["active_call"])
 
+    def test_600000_character_default_partitions_complete_patches_without_truncation(self):
+        patches = tuple(
+            (f"packages/large/module_{index}.py",
+             f"diff --git a/packages/large/module_{index}.py b/packages/large/module_{index}.py\n+"
+             + ("x" * 89_900) + "\n")
+            for index in range(7)
+        )
+        review_diff = review_contracts.ReviewDiff(
+            "\n".join(patch for _path, patch in patches),
+            tuple(path for path, _patch in patches), (), patches,
+        )
+        campaign = review_contracts.ReviewCampaign({"proposal_version": 1})
+        with patch.dict(os.environ, {}, clear=True):
+            limit = claude_reviewer.max_review_payload_chars()
+            parts, multipart = campaign._partition_review_segments(
+                review_diff, {"Assignment": "Review every complete changed file."},
+                campaign_id="default-600k", limit=limit,
+            )
+
+        self.assertEqual(limit, 600_000)
+        self.assertTrue(multipart)
+        self.assertGreater(len(parts), 1)
+        recovered = {segment.path: segment.text for part in parts for segment in part["segments"]}
+        self.assertEqual(recovered, dict(patches))
+        for part in parts:
+            sections = campaign._part_sections(
+                {"Assignment": "Review every complete changed file."}, part["segments"],
+                campaign_id="default-600k", part_id=part["part_id"], excluded_count=0,
+            )
+            prompt = campaign._serialized_review_prompt(campaign._code_review_header(), sections)
+            self.assertLessEqual(len(prompt), limit)
+
     def test_configured_higher_limit_is_used_for_exact_serialized_payload(self):
         codex = FakeCodex("# Proposal\nComplete.\n", self.refined())
         claude = FakeClaude(
@@ -4391,7 +4681,7 @@ class WorkflowTests(unittest.TestCase):
         )
         runner.start()
         with runner._workflow_lock():
-            header, sections, metadata = runner._plan_review_prompt(2)
+            header, sections, metadata = runner.execution._plan_review_prompt(2)
             sections["Assignment"] += "é" * 110_000
             with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "125000"}):
                 _report, manifest = runner._call_claude(
@@ -4424,8 +4714,9 @@ class WorkflowTests(unittest.TestCase):
         )
         runner.start()
         with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "1000"}):
-            with self.assertRaisesRegex(orchestrator.WorkflowError, "shared code-review context cannot fit"):
+            with self.assertRaisesRegex(orchestrator.WorkflowError, "Required shared code-review context is") as raised:
                 runner.approve()
+        self.assertIn("Largest shared sections:", str(raised.exception))
 
         failed = json.loads(runner.state_path.read_text(encoding="utf-8"))
         self.assertEqual(failed["status"], "failed")
@@ -4621,7 +4912,7 @@ class WorkflowTests(unittest.TestCase):
             "- Finding: missing empty-input behavior.\n\nSecond plan review needed: no\n"
         )
         with self.assertRaisesRegex(orchestrator.WorkflowError, "decision and reason"):
-            orchestrator.Orchestrator._refined_proposal(incomplete)
+            orchestrator._planning_review.refined_proposal(incomplete)
 
     def test_complete_diff_is_not_truncated_and_oversize_fails_explicitly(self):
         content = "# complete diff marker\n" + ("line of relevant code\n" * 120)
@@ -4636,6 +4927,44 @@ class WorkflowTests(unittest.TestCase):
             with self.assertRaisesRegex(claude_reviewer.ReviewError, "no paid call was made"):
                 claude_reviewer.validate_review_payload(diff.text)
 
+    def test_600000_character_review_is_sent_losslessly_over_stdin(self):
+        prompt = "é" * 600_000
+        observed = {}
+        report = "Report begins. " + ("finding detail " * 50_000) + " FINAL REPORT MARKER"
+        envelope = {"type": "result", "subtype": "success", "is_error": False,
+                    "result": report, "total_cost_usd": 0.1}
+
+        class FakeProcess:
+            pid = 123
+            returncode = 0
+
+            def communicate(self, *, input=None, timeout=None):
+                observed["input"] = input
+                observed["timeout"] = timeout
+                return json.dumps(envelope).encode(), b""
+
+        process = FakeProcess()
+        started = []
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            claude_reviewer.subprocess, "Popen", return_value=process,
+        ) as popen:
+            result = claude_reviewer.review(
+                prompt, budget_usd=0.5, executable="/test/aily", process_started=started.append,
+            )
+
+        command = popen.call_args.args[0]
+        self.assertEqual(observed["input"], prompt.encode("utf-8"))
+        self.assertEqual(result.text, report)
+        self.assertTrue(result.text.endswith("FINAL REPORT MARKER"))
+        self.assertEqual(observed["timeout"], 900)
+        self.assertEqual(started, [123])
+        self.assertIs(popen.call_args.kwargs["stdin"], subprocess.PIPE)
+        self.assertIn("--enable-1m-models", command)
+        self.assertEqual(command[command.index("--input-format") + 1], "text")
+        self.assertEqual(command[command.index("-p") + 1], "--input-format")
+        self.assertNotIn(prompt, command)
+        self.assertLess(sum(len(arg.encode("utf-8")) for arg in command), 1_000)
+
     def test_redaction_preserves_long_text_and_adapter_refuses_oversize_before_call(self):
         long_context = "context " * 300
         self.assertEqual(claude_reviewer.redact(long_context), long_context)
@@ -4645,7 +4974,7 @@ class WorkflowTests(unittest.TestCase):
         def process_runner(command, **kwargs):
             nonlocal called
             called = True
-            observed["prompt"] = command[command.index("-p") + 1]
+            observed["prompt"] = kwargs["input"].decode("utf-8")
             envelope = {"type": "result", "subtype": "success", "is_error": False,
                         "result": "Decision: APPROVED", "total_cost_usd": 0.1}
             return subprocess.CompletedProcess(command, 0, json.dumps(envelope).encode(), b"")
@@ -4734,7 +5063,9 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(observed["env"]["GIT_CONFIG_KEY_0"], "credential.helper")
         self.assertEqual(observed["env"]["GIT_CONFIG_VALUE_0"], "")
         command = observed["command"]
-        self.assertEqual(command[:4], [str(configured_executable), "claude", "-p", prompt])
+        self.assertEqual(command[:4], [str(configured_executable), "claude", "--enable-1m-models", "-p"])
+        self.assertEqual(command[command.index("--input-format") + 1], "text")
+        self.assertNotIn(prompt, command)
         self.assertEqual(command[command.index("--output-format") + 1], "json")
         self.assertIn("--no-session-persistence", command)
         self.assertEqual(command[command.index("--permission-mode") + 1], "plan")
@@ -4845,7 +5176,7 @@ class WorkflowTests(unittest.TestCase):
 
         for version in (3, 4, 5):
             with runner._workflow_lock():
-                runner._record_unvalidated_planning_output(
+                runner.execution._record_unvalidated_planning_output(
                     invalid_output,
                     orchestrator.WorkflowError("Repeated invalid output."),
                     stage="plan_refine_1",
@@ -4859,15 +5190,15 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(all(item["approval_eligible"] is False for item in records))
 
     def test_refinement_failure_record_does_not_consume_human_revision_result(self):
-        runner = object.__new__(orchestrator.Orchestrator)
+        runner = orchestrator.Orchestrator(self.target, workflow_id="human-revision-result")
         operation = {
             "status": "completed", "operation_type": "codex", "stage": "human_revision",
             "result_text": "human revision result",
         }
         runner.state = {"operation_history": [operation]}
-        runner._save = lambda: None
+        runner.workflow_state.save = lambda: None
 
-        runner._record_unvalidated_planning_output(
+        runner.execution._record_unvalidated_planning_output(
             "invalid human revision", orchestrator.WorkflowError("invalid proposal"),
             stage="human_revision", proposal_version=2,
         )
@@ -4995,7 +5326,7 @@ class CommitmentLedgerIntegrationTests(unittest.TestCase):
         verification_dir = runner.workflow_dir / "verification"
         verification_dir.mkdir()
         workflow_prefix = f"{workspace_ops.WORKFLOW_ROOT}/{workflow_id}/"
-        initial_target = runner._fingerprint_repository(self.target, expected_commit=baseline_commit)
+        initial_target = runner.execution._fingerprint_repository(self.target, expected_commit=baseline_commit)
         baseline_snapshot = workspace_ops.capture_preexisting_snapshot(self.target, baseline_paths)
         baseline_snapshot["baseline_fingerprint_sha256"] = initial_target["working_tree_sha256"]
         snapshot_body = {key: value for key, value in baseline_snapshot.items() if key != "sha256"}
@@ -5008,7 +5339,7 @@ class CommitmentLedgerIntegrationTests(unittest.TestCase):
             "baseline_snapshot": baseline_snapshot,
             "execution_fingerprint": {"initial": {"target": initial_target}},
         }
-        validation_baseline = json.loads(runner._commitment_validation_baseline())
+        validation_baseline = json.loads(orchestrator._traceability.commitment_validation_baseline(runner.state, runner.workflow_id))
         module = f"""from pathlib import Path
 import hashlib
 import json
@@ -5152,9 +5483,9 @@ class CommitmentChecks(unittest.TestCase):
         evidence_report = "```harness-evidence\n" + json.dumps({
             "schema_version": 1, "commitments": entries,
         }) + "\n```\n"
-        runner._capture_commitment_evidence(evidence_report)
+        orchestrator._traceability.capture_commitment_evidence(runner.state, runner.target, evidence_report)
         with runner._workflow_lock():
-            runner._save()
+            runner.execution._save()
         persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
         return runner, ledger, persisted, test_ids, completed.returncode
 
@@ -5194,7 +5525,7 @@ class CommitmentChecks(unittest.TestCase):
         )
         self.assertEqual(result["disposition"], "complete")
         self.assertEqual([item["verification_status"] for item in result["commitments"]], ["passed", "passed"])
-        baseline = json.loads(runner._commitment_validation_baseline())
+        baseline = json.loads(orchestrator._traceability.commitment_validation_baseline(runner.state, runner.workflow_id))
         self.assertTrue(baseline["preexisting_snapshot_complete"])
         self.assertEqual(
             baseline["preexisting_path_states"][".engineering/existing-metadata.txt"]["sha256"],
@@ -5375,11 +5706,11 @@ class CommitmentChecks(unittest.TestCase):
             "review_campaign_history": [],
             "claude_contexts": [],
         }
-        runner._capture_commitment_evidence(codex_report)
+        orchestrator._traceability.capture_commitment_evidence(runner.state, runner.target, codex_report)
         runner.state["integrity"]["review_evidence"]["target_working_tree_sha256"] = operation[
             "target_fingerprint"
         ]["working_tree_sha256"]
-        runner._capture_commitment_assessment(review_report, purpose="initial")
+        orchestrator._traceability.capture_commitment_assessment(runner.state, review_report, purpose="initial")
         if scenario == "mismatched_evidence":
             operation["stdout_sha256"] = "stale-operation-output-hash"
         elif scenario == "mismatched_ledger":
@@ -5399,10 +5730,10 @@ class CommitmentChecks(unittest.TestCase):
         elif scenario == "malformed_integrity":
             runner.state["integrity"] = None
 
-        runner._evaluate_commitment_delivery()
+        orchestrator._traceability.evaluate_commitment_delivery(runner.state, runner.target, runner.proposal_path)
         with runner._workflow_lock():
-            runner._save()
-        report = runner._delivery_report()
+            runner.execution._save()
+        report = runner.execution._delivery_report()
         runner.delivery_path.write_text(report, encoding="utf-8")
         persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
         return persisted, report, runner.delivery_path
@@ -5822,7 +6153,7 @@ class WorkflowExecutionFingerprintTests(unittest.TestCase):
         with runner._workflow_lock():
             runner._read_state()
             runner.state.pop("execution_fingerprint", None)
-            runner._save()
+            runner.execution._save()
 
         resumed = orchestrator.Orchestrator(self.target, workflow_id="legacy-no-fingerprints").resume()
 

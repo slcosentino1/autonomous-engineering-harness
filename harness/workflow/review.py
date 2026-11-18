@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import copy
 import json
@@ -15,10 +16,14 @@ from pathlib import Path
 from typing import Callable
 
 import claude_reviewer
+from workflow import workspace as _workspace
+from workflow import traceability as _traceability
+from workflow.state import WorkflowError
 
 
 PART_REVIEW_VALIDATOR_VERSION = "part-review-v2"
 CLAUDE_MAX_PAYLOAD_ENV = claude_reviewer.MAX_REVIEW_PAYLOAD_ENV
+MAX_PART_PREEXISTING_CONTEXT_CHARS = 8_000
 
 
 class ReviewCampaignError(RuntimeError):
@@ -56,6 +61,217 @@ def _review_sha256_text(value: str) -> str | None:
         return None
 
 
+def review_reports_sha256(state: dict, campaign: dict | None = None) -> str:
+    """Hash the canonical report material used by review capture and delivery verification."""
+    campaign = campaign if isinstance(campaign, dict) else state.get("review_campaign")
+    campaign = campaign if isinstance(campaign, dict) else {}
+    report_bundle = {
+        "campaign": {
+            "consolidated_report": campaign.get("consolidated_report"),
+            "part_reviews": [
+                {"part_id": item.get("part_id"), "report": item.get("report"), "status": item.get("status")}
+                for item in campaign.get("part_reviews", []) if isinstance(item, dict)
+            ],
+            "integration_review": campaign.get("integration_review"),
+        },
+        "code_review": state.get("code_review"),
+        "verification_report": state.get("verification_report"),
+    }
+    if state.get("traceability_required") is True:
+        report_bundle["commitment_assessment"] = state.get("commitment_assessment")
+    report_bytes = json.dumps(
+        report_bundle, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(report_bytes).hexdigest()
+
+
+def review_source_hash_matching_evidence(state: dict, review_diff: ReviewDiff, evidence: dict) -> str | None:
+    """Match current review input to saved evidence, preserving legacy workflow exclusions safely."""
+    expected_hash = evidence.get("source_patch_sha256")
+    current_hash = ReviewCampaign._campaign_source_hash(review_diff)
+    if current_hash == expected_hash:
+        return current_hash
+
+    campaign = state.get("review_campaign")
+    historical_workflow_exclusions = []
+    if (isinstance(campaign, dict)
+            and campaign.get("campaign_id") == evidence.get("campaign_id")
+            and campaign.get("source_patch_sha256") == expected_hash
+            and isinstance(campaign.get("excluded_files"), list)):
+        workflow_prefix = _workspace.WORKFLOW_ROOT + "/"
+        historical_workflow_exclusions = [
+            (item["path"], item["reason"])
+            for item in campaign["excluded_files"]
+            if isinstance(item, dict)
+            and isinstance(item.get("path"), str)
+            and (item["path"] == _workspace.WORKFLOW_ROOT
+                 or item["path"].startswith(workflow_prefix))
+            and isinstance(item.get("reason"), str)
+        ]
+    historical_hash = (
+        ReviewCampaign._campaign_source_hash(
+            review_diff, preserved_exclusions=tuple(historical_workflow_exclusions),
+        ) if historical_workflow_exclusions else None
+    )
+    return historical_hash if historical_hash == expected_hash else None
+
+
+def record_review_snapshot(
+    state: dict,
+    campaign: dict,
+    review_diff: ReviewDiff,
+    current_review_diff: ReviewDiff,
+    fingerprint: dict,
+    proposal_bytes: bytes,
+    proposal_text: str,
+    saved_proposal_text: str,
+    *,
+    purpose: str,
+) -> tuple[dict, bool]:
+    """Bind review evidence to proposal, target, reports, and the selected review scope."""
+    if ReviewCampaign._campaign_source_hash(current_review_diff) != ReviewCampaign._campaign_source_hash(review_diff):
+        raise ReviewCampaignError("Target code changed while the review was running; review provenance is inconclusive.")
+    if fingerprint.get("status") != "captured":
+        raise ReviewCampaignError("Could not capture the target fingerprint for review provenance.")
+    source_hash = ReviewCampaign._campaign_source_hash(review_diff)
+    if campaign.get("source_patch_sha256") != source_hash:
+        raise ReviewCampaignError("Review provenance does not match the completed review campaign source.")
+    proposal_hash = hashlib.sha256(proposal_bytes).hexdigest()
+    version_hashes = state.get("proposal_version_hashes", {})
+    expected_proposal_hash = state.get("proposal_artifact_sha256")
+    version_hash = (
+        version_hashes.get(str(state.get("proposal_version")))
+        if isinstance(version_hashes, dict) else None
+    )
+    binding_changed = False
+    if expected_proposal_hash is None and version_hash is None:
+        if proposal_text != saved_proposal_text:
+            raise ReviewCampaignError("Review provenance cannot be recorded because the approved proposal changed.")
+        version_hashes = state.setdefault("proposal_version_hashes", {})
+        version_hashes[str(state.get("proposal_version", 1))] = proposal_hash
+        state["proposal_artifact_sha256"] = proposal_hash
+        expected_proposal_hash = proposal_hash
+        version_hash = proposal_hash
+        binding_changed = True
+    if (proposal_hash != expected_proposal_hash or proposal_hash != version_hash
+            or proposal_text != saved_proposal_text):
+        raise ReviewCampaignError("Review provenance cannot be recorded because the proposal changed during review.")
+
+    from workflow import traceability as _traceability
+
+    record = {
+        "purpose": purpose,
+        "campaign_id": campaign.get("campaign_id"),
+        "proposal_version": state.get("proposal_version"),
+        "proposal_sha256": proposal_hash,
+        "source_patch_sha256": source_hash,
+        "target_commit_sha": fingerprint.get("commit_sha"),
+        "target_working_tree_sha256": fingerprint.get("working_tree_sha256"),
+        "baseline_fingerprint_sha256": (
+            state.get("execution_fingerprint", {}).get("initial", {}).get("target", {}).get(
+                "working_tree_sha256",
+            ) if isinstance(state.get("execution_fingerprint"), dict) else None
+        ),
+        "baseline_snapshot_sha256": (
+            state.get("baseline_snapshot", {}).get("sha256")
+            if isinstance(state.get("baseline_snapshot"), dict) else None
+        ),
+        "review_scope_sha256": source_hash,
+        "review_scope_paths": list(state.get("review_scope_files", [])),
+        "workflow_change_paths": list(state.get("review_workflow_paths", [])),
+        "review_reports_sha256": review_reports_sha256(state, campaign),
+        "implementation_summary_sha256": hashlib.sha256(
+            str(state.get("implementation_summary") or "").encode("utf-8"),
+        ).hexdigest(),
+        "correction_summary_sha256": hashlib.sha256(
+            str(state.get("correction_summary") or "").encode("utf-8"),
+        ).hexdigest(),
+        "commitment_ledger_sha256": (
+            state.get("commitment_ledger_approval", {}).get("ledger_sha256")
+            if isinstance(state.get("commitment_ledger_approval"), dict) else None
+        ),
+        "commitment_evidence_sha256": (
+            state.get("commitment_evidence", {}).get("evidence_sha256")
+            if isinstance(state.get("commitment_evidence"), dict) else None
+        ),
+        "commitment_assessment_sha256": (
+            _traceability.canonical_sha256(state.get("commitment_assessment"))
+            if state.get("traceability_required") is True else None
+        ),
+        "captured_at": fingerprint.get("captured_at"),
+    }
+    if purpose == "verification":
+        attempts = state.get("correction_attempts", [])
+        attempt = attempts[-1] if isinstance(attempts, list) and attempts and isinstance(attempts[-1], dict) else {}
+        record["correction_attempt"] = attempt.get("attempt")
+        record["original_campaign_id"] = attempt.get("original_campaign_id")
+    integrity = state.setdefault("integrity", {})
+    integrity.setdefault("review_evidence_history", []).append(record)
+    integrity["review_evidence"] = record
+    return record, binding_changed
+
+
+def build_review_diff(
+    state: dict, target: Path, *, redactor: Callable[[str], str] = claude_reviewer.redact,
+) -> ReviewDiff:
+    """Create the review input from the saved baseline, ledger scope, and implementation snapshot."""
+    from workflow import review_input as _review_input
+
+    try:
+        snapshot = state.get("baseline_snapshot")
+        if isinstance(snapshot, dict):
+            execution = state.get("execution_fingerprint")
+            initial_target = execution.get("initial", {}).get("target", {}) if isinstance(execution, dict) else {}
+            if snapshot.get("baseline_fingerprint_sha256") != initial_target.get("working_tree_sha256"):
+                raise _review_input.ReviewInputError(
+                    "Saved baseline snapshot does not match the immutable initial target fingerprint.",
+                )
+        evidence_record = state.get("commitment_evidence")
+        evidence = evidence_record.get("evidence") if isinstance(evidence_record, dict) else None
+        review_scope_paths = {
+            reference.get("path")
+            for item in (evidence or {}).get("commitments", []) if isinstance(item, dict)
+            for reference in item.get("source_refs", []) if isinstance(reference, dict)
+            if isinstance(reference.get("path"), str)
+        }
+        approval = state.get("commitment_ledger_approval")
+        ledger = approval.get("ledger") if isinstance(approval, dict) else None
+        review_scope_paths.update(
+            reference.get("path")
+            for item in (ledger or {}).get("commitments", []) if isinstance(item, dict)
+            for reference in item.get("relevant_sources", []) if isinstance(reference, dict)
+            if isinstance(reference.get("path"), str)
+        )
+        if not isinstance(snapshot, dict):
+            review_scope_paths = set()
+        implementation_snapshot = None
+        correction_attempts = state.get("correction_attempts")
+        if isinstance(snapshot, dict) and isinstance(correction_attempts, list) and correction_attempts:
+            implementation_snapshot = state.get("implementation_snapshot")
+            integrity = state.get("integrity")
+            history = integrity.get("review_evidence_history", []) if isinstance(integrity, dict) else []
+            initial_review = next((
+                record for record in reversed(history)
+                if isinstance(record, dict) and record.get("purpose") == "initial"
+            ), None) if isinstance(history, list) else None
+            if (not isinstance(implementation_snapshot, dict) or not isinstance(initial_review, dict)
+                    or implementation_snapshot.get("source_patch_sha256") != initial_review.get("source_patch_sha256")):
+                raise _review_input.ReviewInputError(
+                    "Initial implementation snapshot is not bound to the completed initial review.",
+                )
+        return _review_input.build_review_diff(
+            target,
+            state["baseline_commit"],
+            state.get("preexisting_paths", []),
+            baseline_snapshot=state.get("baseline_snapshot"),
+            review_scope_paths=review_scope_paths,
+            implementation_snapshot=implementation_snapshot,
+            redactor=redactor,
+        )
+    except (_review_input.ReviewInputError, _workspace.WorkspaceError) as exc:
+        raise WorkflowError(str(exc)) from exc
+
+
 @dataclass(frozen=True)
 class ReviewDiff:
     """Workflow diff plus commitment-selected baseline/final context and exclusions."""
@@ -80,6 +296,117 @@ class ReviewSegment:
     patch_line_end: int
     patch_line_count: int
     patch_sha256: str
+
+
+def review_source_excerpt(path: str, source: str, symbols: list[str]) -> str:
+    """Render referenced source symbols without repeating whole context files."""
+    lines = source.splitlines()
+    if not lines:
+        return "(source is empty)"
+
+    if path.endswith(".py"):
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            tree = None
+        if tree is not None:
+            nodes: dict[str, ast.AST] = {}
+
+            def index(body: list[ast.stmt], parents: tuple[str, ...] = ()) -> None:
+                for node in body:
+                    if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                        qualified = ".".join((*parents, node.name))
+                        nodes[qualified] = node
+                        if isinstance(node, ast.ClassDef):
+                            index(node.body, (*parents, node.name))
+
+            index(tree.body)
+            selected: list[tuple[int, int, str]] = []
+            for symbol in sorted(set(symbols)):
+                node = nodes.get(symbol)
+                if node is None:
+                    matches = [value for name, value in nodes.items() if name.rsplit(".", 1)[-1] == symbol]
+                    node = matches[0] if len(matches) == 1 else None
+                if isinstance(node, ast.ClassDef):
+                    members = [
+                        f"{member.name} (line {member.lineno})"
+                        for member in node.body
+                        if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                    ]
+                    member_text = ", ".join(members[:40])
+                    if len(members) > 40:
+                        member_text += f", … {len(members) - 40} more"
+                    selected.append((node.lineno, node.lineno, f"{symbol}: class declaration; members: {member_text or 'none'}"))
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    first = min([node.lineno, *(item.lineno for item in node.decorator_list)])
+                    selected.append((first, node.end_lineno or node.lineno, symbol))
+
+            if selected:
+                result = []
+                occupied: set[int] = set()
+                for first, last, label in sorted(selected):
+                    if last == first and label.endswith(("members: none",)):
+                        result.append(f"{label} (line {first})")
+                        continue
+                    if last == first and "; members:" in label:
+                        result.append(f"{label} (line {first})")
+                        continue
+                    result.append(f"{label} (lines {first}-{last})")
+                    for number in range(first, last + 1):
+                        if number in occupied:
+                            continue
+                        occupied.add(number)
+                        result.append(f"{number}: {lines[number - 1]}")
+                return "\n".join(result)
+
+    headings = []
+    for symbol in sorted(set(symbols)):
+        variants = {symbol, re.sub(r"[_.-]+", " ", symbol)}
+        heading_patterns = [
+            re.compile(r"^\s*(#{1,6})\s+" + re.escape(value) + r"\s*#*\s*$", re.IGNORECASE)
+            for value in variants
+        ]
+        for index, line in enumerate(lines):
+            match = next((pattern.match(line) for pattern in heading_patterns if pattern.match(line)), None)
+            if not match:
+                continue
+            level = len(match.group(1))
+            end = len(lines)
+            for next_index in range(index + 1, len(lines)):
+                next_heading = re.match(r"^\s*(#{1,6})\s+", lines[next_index])
+                if next_heading and len(next_heading.group(1)) <= level:
+                    end = next_index
+                    break
+            headings.append((index + 1, end, symbol))
+            break
+    if headings:
+        return "\n".join(
+            f"{label} (lines {first}-{last})\n" + "\n".join(
+                f"{number}: {lines[number - 1]}" for number in range(first, last + 1)
+            )
+            for first, last, label in headings
+        )
+
+    excerpts = []
+    for symbol in sorted(set(symbols)):
+        variants = {symbol.casefold(), re.sub(r"[_.-]+", " ", symbol).casefold()}
+        occurrences = [
+            index for index, line in enumerate(lines)
+            if any(value and value in line.casefold() for value in variants)
+        ][:3]
+        for index in occurrences:
+            first, last = max(0, index - 5), min(len(lines), index + 6)
+            excerpts.append((first, last, symbol))
+    if excerpts:
+        merged = []
+        for first, last, symbol in sorted(excerpts):
+            merged.append(
+                f"{symbol} (lines {first + 1}-{last})\n" + "\n".join(
+                    f"{number + 1}: {lines[number]}" for number in range(first, last)
+                )
+            )
+        return "\n".join(merged)
+    return "No referenced symbol or section was found in this source version."
 
 
 PART_REVIEW_FIELDS = (
@@ -412,6 +739,70 @@ def _review_patch_sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _clearly_no_review_findings(report: str) -> bool:
+    approved = re.search(r"(?im)^\s*Decision:\s*APPROVED\b", report)
+    changes_requested = re.search(r"(?im)^\s*Decision:\s*CHANGES_REQUESTED\b", report)
+    empty = re.search(
+        r"(?i)\b(no\s+(?:actionable\s+|material\s+|code\s+)?(?:findings|issues|defects)|"
+        r"nothing to change|findings?\s*:\s*(?:none|no))\b", report,
+    )
+    if changes_requested:
+        return False
+    if approved:
+        blocking_severity = re.search(
+            r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?Severity(?:\*\*)?\s*:\s*(?:\*\*)?Must fix\b|"
+            r"^\s*(?:#+\s*)?Must fix finding\b", report,
+        )
+        return not blocking_severity
+    return bool(empty and not re.search(r"(?i)\bMust fix\b", report))
+
+
+def _post_correction_dispositions(
+    initial_campaign: dict, verification_campaign: dict,
+) -> tuple[dict[str, dict[str, str]] | None, str | None]:
+    """Require explicit evidence-backed disposition of each original blocking finding."""
+    expected: set[str] = set()
+    for report in _validated_campaign_reports(initial_campaign):
+        validation = report.get("validation") or {}
+        for finding in validation.get("findings", []):
+            if str(finding.get("Severity", "")).casefold() == "must fix":
+                expected.add(f"{report.get('part_id')}/{finding.get('id')}")
+    if not expected:
+        return None, "The original review has no validated blocking finding to verify."
+
+    if verification_campaign.get("strategy") == "multi_part_with_integration":
+        integration = verification_campaign.get("integration_review")
+        report_text = integration.get("report", "") if isinstance(integration, dict) else ""
+    else:
+        report_text = str(verification_campaign.get("consolidated_report") or "")
+    pattern = re.compile(
+        r"(?im)^\s*[-*+]\s*`?(part-\d+/F\d+)`?\s*:\s*"
+        r"(Resolved|Partially resolved|Unresolved)\s*[—–-]\s*(\S.*)$"
+    )
+    matches: dict[str, list[tuple[str, str]]] = {}
+    for match in pattern.finditer(report_text):
+        matches.setdefault(match.group(1), []).append((match.group(2).casefold(), match.group(3).strip()))
+    missing = sorted(expected - matches.keys())
+    duplicated = sorted(key for key, values in matches.items() if key in expected and len(values) != 1)
+    unresolved = sorted(
+        key for key in expected & matches.keys()
+        if len(matches[key]) == 1 and (matches[key][0][0] != "resolved" or not matches[key][0][1])
+    )
+    if missing or duplicated or unresolved:
+        details = []
+        if missing:
+            details.append("missing dispositions for " + ", ".join(missing))
+        if duplicated:
+            details.append("duplicate dispositions for " + ", ".join(duplicated))
+        if unresolved:
+            details.append("unresolved or unsupported dispositions for " + ", ".join(unresolved))
+        return None, "Independent verification is incomplete: " + "; ".join(details) + "."
+    return {
+        key: {"status": matches[key][0][0], "evidence": matches[key][0][1]}
+        for key in sorted(expected)
+    }, None
+
+
 def _safe_patch_boundaries(lines: list[str], path: str) -> list[int]:
     """Return conservative split positions at hunk, declaration, or prose boundaries."""
     boundaries: set[int] = set()
@@ -419,20 +810,49 @@ def _safe_patch_boundaries(lines: list[str], path: str) -> list[int]:
         r"^(?:async\s+)?(?:def|class|function|interface|type|enum|struct|trait|impl|func|fn)\b"
         r"|^(?:export\s+)?(?:class|function|interface|type|enum)\b"
     )
-    prose_file = Path(path).suffix.lower() in {".md", ".markdown", ".rst", ".txt", ".adoc"}
+    suffix = Path(path).suffix.lower()
+    prose_file = suffix in {".md", ".markdown", ".rst", ".txt", ".adoc"}
+    python_file = suffix == ".py"
+
+    def source_content(line: str) -> str:
+        return line[1:].rstrip("\r\n") if line[:1] in {"+", "-", " "} else line.rstrip("\r\n")
+
     for index in range(1, len(lines)):
         current = lines[index]
         previous = lines[index - 1]
         if current.startswith("@@") and any(line.startswith("@@") for line in lines[:index]):
             boundaries.add(index)
             continue
-        if current[:1] in {"+", "-", " "}:
-            content = current[1:].rstrip("\r\n")
-        else:
-            content = current.rstrip("\r\n")
+        content = source_content(current)
         indentation = len(content) - len(content.lstrip(" \t"))
         if indentation == 0 and declaration.match(content):
             boundaries.add(index)
+            continue
+        if python_file and re.match(r"^(?:if|elif)\s+stage\b", content.lstrip()):
+            # A removed coordinator method can be one large hunk; stage branches
+            # are independent review units even though they share that old method.
+            boundaries.add(index)
+            continue
+        if python_file and indentation == 4 and re.match(r"^(?:async\s+)?def\b", content.lstrip()):
+            # Keep decorators with their class method when a large unified-diff hunk
+            # must be split; top-level-only boundaries leave whole deleted classes intact.
+            start = index
+            cursor = index - 1
+            decorator_start = None
+            while cursor > 0:
+                prior = source_content(lines[cursor])
+                if not prior.strip() or prior.startswith("@@"):
+                    break
+                prior_indentation = len(prior) - len(prior.lstrip(" \t"))
+                if (prior_indentation == 4
+                        and re.match(r"^(?:async\s+)?def\b", prior.lstrip())):
+                    break
+                if prior_indentation == 4 and prior.lstrip().startswith("@"):
+                    decorator_start = cursor
+                cursor -= 1
+            if decorator_start is not None:
+                start = decorator_start
+            boundaries.add(start)
             continue
         previous_content = previous[1:].strip() if previous[:1] in {"+", "-", " "} else previous.strip()
         if not previous_content:
@@ -553,39 +973,6 @@ correction stage; Should fix and Optional improvements must be reasoned about an
 explicitly identifies an acceptance-blocking defect."""
 
 
-CLAUDE_CODE_REVIEW_GUIDANCE = """Independent review roles and duties
-Act as a Senior Software Architect, Senior Backend Engineer, Product Engineer, and independent senior reviewer.
-Do not assume the approved proposal is correct merely because it was approved. Verify the actual implementation
-against the assignment and challenge assumptions where evidence warrants it.
-
-Evaluate requirements and product behavior; architecture and boundaries; design and maintainability; engineering
-judgment and proportionality; relevant reliability and operational behavior; security; and test quality. Evaluate
-the architecture that exists in context. Do not prefer Clean, Hexagonal, Microservices, CQRS, or another style by
-default. Ask what concrete problem each significant decision solves, whether that problem exists here, what trade-off
-it creates, and whether a simpler design would satisfy the requirement. Do not demand lengthy justification for
-trivial details. Treat timeout, retry, concurrency, recovery, and scale concerns as findings only when relevant to
-the actual requirements and execution model.
-
-Use explicit requirements as the acceptance baseline. Separate confirmed defects from risks needing verification
-and optional improvements. Do not report a style preference as a defect. Every finding must explain what is wrong,
-why it matters in this assignment, the affected requirement or engineering property, and a concrete correction.
-Classify severity as Must fix, Should fix, or Optional improvement; optional improvements do not block acceptance.
-Use category Requirements, Architecture, Design, Correctness, Reliability, Security, Testing, or Integration.
-
-For individual parts, assess local responsibilities, cohesion, coupling, dependency direction, contracts, tests, and
-failure handling. Put concerns that depend on another part under Cross-component concerns and state what evidence
-the integration review should verify. For final integration, synthesize all part reports; inspect boundaries,
-contracts, data flow, assumptions, error/state behavior, duplicate responsibilities, and cross-component defects.
-Do not merely concatenate reports. Consolidate duplicates while preserving references and introduce new integration
-findings only when supported by the shared context and part reports.
-
-Return the requested structured report. Each finding must include severity, category, file and location when known,
-description, assignment-specific impact and reasoning, and recommended correction. Finish with a concise overall
-assessment of requirement satisfaction, architecture/design quality, main risks, proportionality, and whether any
-finding blocks acceptance. Only Must fix findings or an explicit CHANGES_REQUESTED decision should trigger the
-correction stage; Should fix and Optional improvements must be reasoned about and remain advisory unless the report
-explicitly identifies an acceptance-blocking defect."""
-
 class ReviewCampaign:
     """Code-review campaign operations over workflow state and narrow callbacks."""
 
@@ -619,6 +1006,58 @@ class ReviewCampaign:
             raise ReviewCampaignError("Review campaign authorization was not supplied by the workflow coordinator.")
         return self._authorize_call_count_callback(required_calls)
 
+    @staticmethod
+    def _part_review_context(shared: dict[str, str]) -> dict[str, str]:
+        """Keep per-part calls focused; the integration call receives full shared evidence."""
+        context = dict(shared)
+        for key in (
+            "Commitment ledger and Harness-validated evidence references", "Commitment assessment contract",
+        ):
+            context.pop(key, None)
+        source_context = context.pop("Selected baseline and final source context", "")
+        preexisting_blocks = []
+        omitted_preexisting_paths = []
+        if source_context:
+            headings = list(re.finditer(r"(?m)^### (.+)$", source_context))
+            for index, heading in enumerate(headings):
+                metadata = heading.group(1)
+                if "(pre-existing target state;" not in metadata:
+                    continue
+                end = headings[index + 1].start() if index + 1 < len(headings) else len(source_context)
+                block = source_context[heading.start():end].strip()
+                path = metadata.split(" (", 1)[0]
+                selected_size = sum(len(item) for item in preexisting_blocks)
+                if (len(block) <= MAX_PART_PREEXISTING_CONTEXT_CHARS
+                        and selected_size + len(block) <= MAX_PART_PREEXISTING_CONTEXT_CHARS):
+                    preexisting_blocks.append(block)
+                else:
+                    omitted_preexisting_paths.append(path)
+        if preexisting_blocks:
+            context["Selected pre-existing target context"] = "\n\n".join(preexisting_blocks)
+        if omitted_preexisting_paths:
+            provenance = context.get("Evidence provenance and review scope", "")
+            context["Evidence provenance and review scope"] = "\n".join(filter(None, (
+                provenance,
+                "Larger pre-existing source excerpts omitted from this local part to preserve the payload limit; "
+                "the integration review receives them in full: " + ", ".join(sorted(omitted_preexisting_paths)),
+            )))
+        context["Implementation summary"] = (
+            "The full implementation summary is reserved for integration; inspect the assigned patch and observed receipts."
+        )
+        context["Review context for this part"] = (
+            "Review this part's complete patch against the full assignment and approved proposal. The final "
+            "integration review receives the implementation summary, repository context, machine-readable "
+            "commitment ledger, runner evidence references, and all selected baseline/final source excerpts. "
+            "Raise cross-component concerns when those shared sources are needed to verify them."
+        )
+        return context
+
+    @staticmethod
+    def _context_sha256(header: str, shared: dict[str, str]) -> str:
+        return _review_patch_sha256(_format_context_prompt(
+            _review_redact(header), {name: _review_redact(value).strip() for name, value in shared.items()},
+        ))
+
     def _require_save(self) -> None:
         if self._save is None:
             raise ReviewCampaignError("Review campaign persistence was not supplied by the workflow coordinator.")
@@ -626,6 +1065,235 @@ class ReviewCampaign:
     def _require_review_call(self) -> None:
         if self._call_claude is None:
             raise ReviewCampaignError("Claude review execution was not supplied by the workflow coordinator.")
+
+    def build_shared_context(
+        self,
+        review_diff: ReviewDiff,
+        *,
+        repository_context: str,
+        relevant_skills: str,
+        purpose: str = "initial",
+    ) -> dict[str, str]:
+        """Build review context and fit optional source excerpts inside the configured payload."""
+        state = self.state
+        assignment = state["task"]
+        worktree_binding = None
+        binding_start = re.search(r"(?m)^## Approved proposal and worktree binding\s*$", assignment)
+        if binding_start is not None:
+            proposal_start = re.search(
+                r"(?m)^## Approved proposal v7\s*$", assignment[binding_start.end():],
+            )
+            if proposal_start is not None:
+                proposal_index = binding_start.end() + proposal_start.start()
+                worktree_binding = assignment[binding_start.end():proposal_index].strip()
+                assignment = assignment[:binding_start.start()].rstrip()
+        directory_counts: dict[str, int] = {}
+        contract_paths: list[str] = []
+        for path in review_diff.included_paths:
+            parent = str(Path(path).parent)
+            directory = parent if parent != "." else "(repository root)"
+            directory_counts[directory] = directory_counts.get(directory, 0) + 1
+            if re.search(r"(?i)(api|schema|contract|interface|openapi|proto|event)", Path(path).name):
+                contract_paths.append(path)
+        module_lines = ["Modules are inferred from changed directory structure; directory names are clues, not architecture rules."]
+        module_lines.extend(f"- `{path}`: {count} changed text file(s)" for path, count in sorted(directory_counts.items()))
+        module_lines.append(
+            "Changed contract/interface/schema candidates: "
+            + (", ".join(f"`{path}`" for path in sorted(contract_paths)) if contract_paths else "none detected by filename")
+        )
+        module_lines.append(
+            "Use the assignment, approved proposal, implementation summary, repository instructions, and individual "
+            "reports to assess dependencies. Do not infer dependency direction from folder names alone."
+        )
+        shared = {
+            "Assignment": assignment,
+            "Approved proposal": state["proposal"],
+            "Implementation summary": state["implementation_summary"],
+            "Repository context": repository_context,
+            "Relevant skills": relevant_skills,
+            "Repository/module map and dependencies": "\n".join(module_lines),
+            "Independent reviewer role": CLAUDE_CODE_REVIEW_GUIDANCE,
+            "Engineering Judgment & Proportional Design": (
+                "Use the stage-selected skills and independent review rubric. Assess proportionality against the "
+                "assignment; do not elevate style preferences or hypothetical concerns into findings."
+            ),
+        }
+        if worktree_binding:
+            shared["Workflow target and authorization binding"] = worktree_binding
+        source_refs = [
+            reference
+            for item in ((state.get("commitment_evidence") or {}).get("evidence") or {}).get(
+                    "commitments", []) if isinstance(item, dict)
+            for reference in item.get("source_refs", []) if isinstance(reference, dict)
+        ]
+        approval = state.get("commitment_ledger_approval")
+        approved_ledger = approval.get("ledger") if isinstance(approval, dict) else {}
+        source_refs.extend(
+            reference
+            for item in approved_ledger.get("commitments", []) if isinstance(item, dict)
+            for reference in item.get("relevant_sources", []) if isinstance(reference, dict)
+        )
+        symbols_by_path: dict[str, list[str]] = {}
+        for reference in source_refs:
+            path, symbol = reference.get("path"), reference.get("symbol")
+            if isinstance(path, str) and isinstance(symbol, str):
+                symbols_by_path.setdefault(path, []).append(symbol)
+        ledger = approval.get("ledger") if isinstance(approval, dict) else {}
+        requires_assessment = any(
+            item.get("class") in _traceability.REQUIRED_CLASSES
+            for item in ledger.get("commitments", []) if isinstance(item, dict)
+        )
+        if (state.get("preexisting_paths") or review_diff.context_files or review_diff.context_exclusions
+                or requires_assessment or review_diff.operation_diffs):
+            shared["Evidence provenance and review scope"] = (
+                "Workflow implementation paths are the supplied deltas. Baseline context is inspection only, not implementation evidence. "
+                "Cite reviewed sources and receipts or report insufficient evidence."
+            )
+        if review_diff.context_exclusions:
+            shared["Evidence provenance and review scope"] += "\nContext sources unavailable or excluded:\n" + "\n".join(
+                f"- `{path}`: {reason}" for path, reason in review_diff.context_exclusions
+            )
+        if state.get("traceability_required") is True:
+            shared["Approved proposal"] = re.sub(
+                r"(?ms)^```commitment-ledger[ \t]*\n.*?^```[ \t]*$", "", state["proposal"],
+            ).strip()
+        if state.get("traceability_required") is True and requires_assessment:
+            shared["Commitment ledger and Harness-validated evidence references"] = (
+                _traceability.commitment_review_context(state)
+            )
+            shared["Commitment assessment contract"] = (
+                "Assess each required commitment independently against the attributable workflow diff, selected baseline/final source context, and observed runner receipts. "
+                "For implementation_basis=new_change, cite at least one source path changed after the immutable baseline. "
+                "For implementation_basis=existing_behavior_acceptable, baseline source can support fulfillment only "
+                "because the approved acceptance condition explicitly permits it and current validation passes. "
+                "Baseline context alone never proves a new implementation. Agent assertions and metadata do not prove "
+                "fulfillment; do not infer implementation from tests or verification from source. Report insufficient "
+                "evidence where the selected source or observed validation is incomplete. An unfulfilled required item is a Must fix and requires "
+                "Decision: CHANGES_REQUESTED. Include one fenced `commitment-assessment` JSON block for every "
+                "required ID: {\"schema_version\":1,\"commitments\":[{\"id\":\"C-001\","
+                "\"implementation_status\":\"implemented|partial|not_started\","
+                "\"verification_status\":\"not_run|passed|failed|unverified|blocked\","
+                "\"assessment\":\"fulfilled|partially_fulfilled|not_fulfilled|insufficient_evidence\","
+                "\"explanation\":\"...\",\"evidence_refs\":{\"source\":[\"path#symbol\"],"
+                "\"validation\":[\"scenario/test ID\"]}}]}."
+            )
+        if purpose == "verification":
+            history = state.get("review_campaign_history", [])
+            initial = next((
+                campaign for campaign in reversed(history)
+                if isinstance(campaign, dict) and campaign.get("purpose") == "initial"
+            ), {})
+            original_reports = [
+                str(initial.get("consolidated_report") or state.get("code_review") or ""),
+                *(str(item.get("report") or "") for item in initial.get("part_reviews", [])
+                  if isinstance(item, dict)),
+            ]
+            integration = initial.get("integration_review")
+            if isinstance(integration, dict):
+                original_reports.append(str(integration.get("report") or ""))
+            original_findings = [
+                f"{item.get('part_id')}/{finding.get('id')}"
+                for item in _validated_campaign_reports(initial)
+                for finding in (item.get("validation") or {}).get("findings", [])
+                if str(finding.get("Severity", "")).casefold() == "must fix"
+            ]
+            shared["Post-correction verification"] = (
+                "Independently verify this actual resulting patch after the single authorized Codex correction. "
+                "For every original Must fix finding below, determine resolved, partially resolved, or unresolved and cite "
+                "current code or test evidence. Inspect for regressions in the affected scope. Do not treat the "
+                "correction summary as proof. An unresolved original Must fix finding, a new Must fix finding, an "
+                "incomplete report, or inconclusive evidence blocks delivery.\n\nOriginal independent review reports:\n\n"
+                + "\n\n--- Original review report ---\n\n".join(
+                    report for report in original_reports if report.strip()
+                )
+                + "\n\nUnder Overall assessment, include exactly one disposition line for each original Must fix identifier "
+                "listed here, using this format: `- part-000001/F1: Resolved — <specific current-code or test evidence>`. "
+                "Use `Partially resolved` or `Unresolved` when appropriate. Do not omit, duplicate, or rename an "
+                "identifier. Original Must fix identifiers requiring disposition: "
+                + (", ".join(sorted(set(original_findings))) if original_findings else "none; explain why no blocking finding exists")
+            )
+            shared["Correction and validation summary (unverified agent claim)"] = (
+                "The following is Codex's report of what it changed and which checks it says it ran. Treat it as a "
+                "claim to compare with the actual resulting patch and visible test changes; it is not independent "
+                "proof that commands succeeded.\n\n" + str(state.get("correction_summary") or "No summary recorded.")
+            )
+        if review_diff.operation_diffs:
+            shared["Initial implementation and correction deltas"] = "\n\n".join(
+                f"## {label}\n{patch}" for label, patch in review_diff.operation_diffs
+            )
+
+        if review_diff.context_files:
+            candidates = []
+            for path, provenance, baseline_text, final_text in review_diff.context_files:
+                symbols = sorted(set(symbols_by_path.get(path, [])))
+                label = ", ".join(symbols) if symbols else "path selected by approved commitment evidence"
+                baseline_excerpt = review_source_excerpt(path, baseline_text, symbols)
+                if baseline_text == final_text:
+                    block = (
+                        f"### {path} ({provenance}; unchanged; symbols: {label})\n"
+                        "Baseline and final source are identical. Baseline version — context only, never implementation "
+                        "evidence; relevant declarations:\n"
+                        f"{baseline_excerpt}"
+                    )
+                else:
+                    block = (
+                        f"### {path} ({provenance}; symbols: {label})\n"
+                        "Baseline version — context only, never implementation evidence:\n"
+                        f"{baseline_excerpt}\n"
+                        "Final target version — inspect alongside the workflow diff:\n"
+                        f"{review_source_excerpt(path, final_text, symbols)}"
+                    )
+                candidates.append((len(block), path, block))
+
+            try:
+                limit = claude_reviewer.max_review_payload_chars()
+            except claude_reviewer.ReviewError as exc:
+                raise ReviewCampaignError(str(exc)) from exc
+            probe = self._review_segment("review-context-probe.txt", "x")
+
+            def fits(context: dict[str, str]) -> bool:
+                sections = self._part_sections(
+                    context, [probe], campaign_id="context-budget", part_id="part-000001",
+                    excluded_count=len(review_diff.excluded_files),
+                )
+                return self._serialized_review_fits(self._code_review_header(), sections, limit)
+
+            selected: list[str] = []
+            omitted: list[str] = []
+            for _size, path, block in sorted(candidates):
+                candidate = dict(shared)
+                candidate["Selected baseline and final source context"] = "\n\n".join((*selected, block))
+                if fits(candidate):
+                    selected.append(block)
+                else:
+                    omitted.append(path)
+            if selected:
+                shared["Selected baseline and final source context"] = "\n\n".join(selected)
+            if omitted:
+                provenance = shared.get("Evidence provenance and review scope", "")
+                candidate = dict(shared)
+                source_paths_by_block = {block: path for _size, path, block in candidates}
+                while True:
+                    omitted_note = (
+                        "Selected source excerpts omitted to respect the configured review payload limit; "
+                        "their paths and symbols remain in the approved evidence references: "
+                        + ", ".join(sorted(set(omitted)))
+                    )
+                    candidate["Evidence provenance and review scope"] = "\n".join(
+                        filter(None, (provenance, omitted_note))
+                    )
+                    if selected:
+                        candidate["Selected baseline and final source context"] = "\n\n".join(selected)
+                    else:
+                        candidate.pop("Selected baseline and final source context", None)
+                    if fits(candidate) or not selected:
+                        break
+                    omitted.append(source_paths_by_block[selected.pop()])
+                if fits(candidate):
+                    shared = candidate
+                elif not fits(shared):
+                    shared = candidate
+        return shared
 
     @staticmethod
     def _code_review_header() -> str:
@@ -702,13 +1370,17 @@ class ReviewCampaign:
         return sections
 
     @staticmethod
-    def _serialized_review_fits(header: str, sections: dict[str, str], limit: int) -> bool:
+    def _serialized_review_prompt(header: str, sections: dict[str, str]) -> str:
         safe_header = _review_redact(header)
         safe_sections = {
             name: _review_redact(value) if name == "Complete patch" else _review_redact(value).strip()
             for name, value in sections.items()
         }
-        prompt = _format_context_prompt(safe_header, safe_sections)
+        return _format_context_prompt(safe_header, safe_sections)
+
+    @classmethod
+    def _serialized_review_fits(cls, header: str, sections: dict[str, str], limit: int) -> bool:
+        prompt = cls._serialized_review_prompt(header, sections)
         try:
             claude_reviewer.validate_review_invocation(prompt, "aily", limit=limit)
             return True
@@ -778,9 +1450,19 @@ class ReviewCampaign:
             excluded_count=len(review_diff.excluded_files),
         )
         if not self._serialized_review_fits(header, probe_sections, limit):
+            prompt_size = len(self._serialized_review_prompt(header, probe_sections))
+            largest_sections = sorted(
+                (
+                    (len(_review_redact(value).strip()), name)
+                    for name, value in shared.items()
+                ),
+                reverse=True,
+            )[:5]
+            contributors = "; ".join(f"{name}: {size:,}" for size, name in largest_sections)
             raise ReviewCampaignError(
-                f"Required shared code-review context cannot fit within the configured {limit}-character "
-                "payload even with a minimal patch. No files were truncated or omitted."
+                f"Required shared code-review context is {prompt_size:,} characters with a minimal patch, "
+                f"above the configured {limit:,}-character payload. Largest shared sections: {contributors}. "
+                "No changed files were truncated or omitted."
             )
         complete_segments = [self._review_segment(path, patch) for path, patch in review_diff.file_patches]
         full_sections = self._part_sections(
@@ -929,14 +1611,14 @@ class ReviewCampaign:
             or (not existing.get("header_id") and "code-review-part-v1" in saved_headers)
         )
         review_header = self._legacy_code_review_header() if legacy_campaign else self._code_review_header()
-        shared_hash = _review_patch_sha256(_format_context_prompt(
-            _review_redact(review_header),
-            {name: _review_redact(value).strip() for name, value in shared.items()},
-        ))
+        shared_hash = self._context_sha256(review_header, shared)
+        compact_parts = not existing or existing.get("header_id") == "code-review-part-v3"
+        part_shared = self._part_review_context(shared) if compact_parts else shared
+        part_context_hash = self._context_sha256(self._code_review_header(), part_shared) if compact_parts else None
         source_hash = self._campaign_source_hash(review_diff)
         try:
             parts, multipart = self._partition_review_segments(
-                review_diff, shared, campaign_id=campaign_id, limit=limit, header=review_header,
+                review_diff, part_shared, campaign_id=campaign_id, limit=limit, header=review_header,
             )
         except ReviewCampaignError as exc:
             if not existing:
@@ -964,6 +1646,7 @@ class ReviewCampaign:
         if existing:
             if (existing.get("source_patch_sha256") != source_hash
                     or existing.get("shared_context_sha256") != shared_hash
+                    or (compact_parts and existing.get("part_context_sha256") != part_context_hash)
                     or existing.get("parts") != part_manifest):
                 raise ReviewCampaignError(
                     "The target diff, shared review context, or partition changed after the review campaign began. "
@@ -988,7 +1671,9 @@ class ReviewCampaign:
         authorization_limit = self.authorized_call_limit
         campaign = {
             "campaign_id": campaign_id,
-            "header_id": "code-review-part-v2",
+            "header_id": "code-review-part-v3" if compact_parts else (
+                "code-review-part-v1" if legacy_campaign else "code-review-part-v2"
+            ),
             "report_contract_version": PART_REVIEW_VALIDATOR_VERSION,
             "status": "planned",
             "strategy": "multi_part_with_integration" if multipart else "single_call",
@@ -1021,6 +1706,8 @@ class ReviewCampaign:
             ],
             "consolidated_report": None,
         }
+        if part_context_hash is not None:
+            campaign["part_context_sha256"] = part_context_hash
         self.state["review_campaign"] = campaign
         self.state["review_campaign_id"] = campaign_id
         self.state["review_shared_context_sha256"] = shared_hash
@@ -1118,6 +1805,10 @@ class ReviewCampaign:
         self._require_save()
         self._save()
         part_records = {record["part_id"]: record for record in campaign["part_reviews"]}
+        part_shared = (
+            self._part_review_context(shared)
+            if campaign.get("header_id") == "code-review-part-v3" else shared
+        )
         for part_index, part in enumerate(parts, start=1):
             record = part_records[part["part_id"]]
             if record["status"] == "reviewed":
@@ -1180,7 +1871,7 @@ class ReviewCampaign:
                     )
                 continue
             sections = self._part_sections(
-                shared, part["segments"], campaign_id=campaign["campaign_id"],
+                part_shared, part["segments"], campaign_id=campaign["campaign_id"],
                 part_id=part["part_id"], excluded_count=len(review_diff.excluded_files),
             )
             patch_hash = _review_patch_sha256(sections["Complete patch"])
@@ -1196,12 +1887,14 @@ class ReviewCampaign:
                         self._code_review_header(), "code_review", sections,
                         metadata={
                             "proposal_version": self.state.get("proposal_version", 1),
-                            "header_id": "code-review-part-v2",
+                            "header_id": campaign.get("header_id", "code-review-part-v2"),
                             "review_kind": "part",
                             "campaign_id": campaign["campaign_id"],
                             "part_id": part["part_id"],
                             "retry_count": len(record.get("calls", [])) if isinstance(record.get("calls", []), list) else 0,
                             "shared_context_sha256": campaign["shared_context_sha256"],
+                            **({"part_context_sha256": campaign["part_context_sha256"]}
+                               if campaign.get("part_context_sha256") else {}),
                             "part_patch_sha256": patch_hash,
                             "payload_limit_chars": campaign["payload_limit_characters"],
                             "included_files": sorted({segment.path for segment in part["segments"]}),
@@ -1460,7 +2153,7 @@ def recover_review_campaign(
     }
     if header_ids == {"code-review-part-v1"}:
         header = ReviewCampaign._legacy_code_review_header()
-    elif header_ids == {"code-review-part-v2"}:
+    elif header_ids in ({"code-review-part-v2"}, {"code-review-part-v3"}):
         header = ReviewCampaign._code_review_header()
     else:
         errors.append("saved code-review contexts do not identify one supported prompt contract")
@@ -1472,6 +2165,14 @@ def recover_review_campaign(
     if shared_hash != campaign.get("shared_context_sha256"):
         errors.append("current assignment, proposal, implementation summary, repository context, or review guidance "
                       "does not match the saved shared-context hash")
+    compact_parts = campaign.get("header_id") == "code-review-part-v3"
+    part_shared = ReviewCampaign._part_review_context(shared) if compact_parts else shared
+    part_context_hash = (
+        ReviewCampaign._context_sha256(ReviewCampaign._code_review_header(), part_shared)
+        if compact_parts else None
+    )
+    if compact_parts and part_context_hash != campaign.get("part_context_sha256"):
+        errors.append("current individual-part review context does not match the saved campaign")
 
     patch_by_path = dict(review_diff.file_patches)
     parts: list[dict] = []
@@ -1526,7 +2227,7 @@ def recover_review_campaign(
                     errors.append(f"{part_id} campaign call metadata does not preserve each saved provider attempt")
             continue
         sections = ReviewCampaign(state)._part_sections(
-            shared, part["segments"], campaign_id=campaign["campaign_id"], part_id=part_id,
+            part_shared, part["segments"], campaign_id=campaign["campaign_id"], part_id=part_id,
             excluded_count=len(review_diff.excluded_files),
         )
         safe_header = _review_redact(header)
@@ -1555,6 +2256,8 @@ def recover_review_campaign(
                 metadata_errors.append("part patch hash does not match the current target diff")
             if context.get("shared_context_sha256") != campaign.get("shared_context_sha256"):
                 metadata_errors.append("saved shared-context metadata does not match the campaign")
+            if compact_parts and context.get("part_context_sha256") != part_context_hash:
+                metadata_errors.append("saved individual-part context metadata does not match the campaign")
             if context.get("included_files") != expected_files:
                 metadata_errors.append("included-file metadata does not match this part")
             if context.get("excluded_files") != campaign.get("excluded_files"):

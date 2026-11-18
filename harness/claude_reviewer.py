@@ -19,7 +19,7 @@ from workflow import workspace
 
 DEFAULT_AILY_EXECUTABLE = "/Users/slcosentino/.local/bin/aily"
 AILY_EXECUTABLE = os.environ.get("AILY_EXECUTABLE", DEFAULT_AILY_EXECUTABLE)
-DEFAULT_MAX_REVIEW_PAYLOAD_CHARS = 200_000
+DEFAULT_MAX_REVIEW_PAYLOAD_CHARS = 600_000
 MAX_REVIEW_PAYLOAD_ENV = "HARNESS_CLAUDE_MAX_PAYLOAD_CHARS"
 SECRET_PATTERNS = (
     re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{12,}"),
@@ -137,9 +137,12 @@ def review(
     if executable is None:
         executable = os.environ.get("AILY_EXECUTABLE", AILY_EXECUTABLE)
     validate_review_invocation(prompt, executable)
+    prompt_bytes = prompt.encode("utf-8")
 
+    # Aily opts into its 1M-context support; stdin avoids ARG_MAX for large UTF-8 prompts.
     command = [
-        executable, "claude", "-p", prompt,
+        executable, "claude", "--enable-1m-models", "-p",
+        "--input-format", "text",
         "--output-format", "json",
         "--no-session-persistence",
         "--permission-mode", "plan",
@@ -158,6 +161,7 @@ def review(
                 process = subprocess.Popen(
                     command,
                     cwd=review_root,
+                    stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     env=env,
@@ -170,7 +174,7 @@ def review(
                     process.communicate()
                     raise
                 try:
-                    stdout, stderr = process.communicate(timeout=timeout_seconds)
+                    stdout, stderr = process.communicate(input=prompt_bytes, timeout=timeout_seconds)
                 except subprocess.TimeoutExpired as exc:
                     terminate_process_group(process)
                     stdout, stderr = process.communicate()
@@ -188,6 +192,7 @@ def review(
                     cwd=review_root,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
+                    input=prompt_bytes,
                     timeout=timeout_seconds,
                     check=False,
                     env=env,

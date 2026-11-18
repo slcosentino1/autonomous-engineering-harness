@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "harness"))
 
 import orchestrator  # noqa: E402
 from workflow import review_input  # noqa: E402
+from workflow import review as review_contracts  # noqa: E402
 from workflow import workspace  # noqa: E402
 
 
@@ -108,7 +109,7 @@ class ReviewInputTests(unittest.TestCase):
             self.target, self.baseline, [], baseline_snapshot=snapshot,
             review_scope_paths={"src/app.py"},
         )
-        before_hash = orchestrator.Orchestrator._campaign_source_hash(before_delivery)
+        before_hash = review_contracts.ReviewCampaign._campaign_source_hash(before_delivery)
 
         (workflow / "delivery.md").write_text("delivery report\n", encoding="utf-8")
         (workflow / "state.json").write_text("updated state\n", encoding="utf-8")
@@ -121,7 +122,7 @@ class ReviewInputTests(unittest.TestCase):
             self.target, self.baseline, [], baseline_snapshot=snapshot,
             review_scope_paths={"src/app.py"},
         )
-        after_hash = orchestrator.Orchestrator._campaign_source_hash(after_delivery)
+        after_hash = review_contracts.ReviewCampaign._campaign_source_hash(after_delivery)
 
         self.assertEqual(before_delivery.included_paths, (".engineering/notes.md", "src/app.py"))
         self.assertEqual(after_delivery.included_paths, before_delivery.included_paths)

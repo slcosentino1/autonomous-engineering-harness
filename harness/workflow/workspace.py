@@ -20,6 +20,9 @@ class WorkspaceError(RuntimeError):
 
 
 WORKFLOW_ROOT = ".engineering/workflows"
+MAX_EXECUTION_CHANGE_EXAMPLES = 10
+
+
 HARNESS_SKILLS_ROOT = Path(__file__).resolve().parents[2] / ".agents" / "skills"
 
 

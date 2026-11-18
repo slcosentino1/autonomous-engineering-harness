@@ -120,7 +120,7 @@ class BudgetResumeTests(unittest.TestCase):
 
         runner.state["status"] = "failed"
         with runner._workflow_lock():
-            runner._save()
+            runner.execution._save()
         self.resume_without_providers(runner, set_budget_limit="1.50")
         changes = runner.state["authorization"]["claude_aily"]["budget_changes"]
         self.assertEqual(len(changes), 2)
@@ -210,7 +210,7 @@ class BudgetResumeTests(unittest.TestCase):
         self.resume_without_providers(runner, extend_budget="0.50")
         runner.state["status"] = "failed"
         with runner._workflow_lock():
-            runner._save()
+            runner.execution._save()
         second = self.runner()
         self.resume_without_providers(second, extend_budget="0.25")
 
@@ -238,7 +238,7 @@ class BudgetResumeTests(unittest.TestCase):
         def fail_retry():
             runner.state["status"] = "failed"
             runner.state["error"] = "Fake verification retry failed."
-            runner._save()
+            runner.execution._save()
             raise orchestrator.WorkflowError("Fake verification retry failed.")
 
         with patch.object(runner, "run_pending", side_effect=fail_retry):
@@ -322,6 +322,7 @@ class BudgetResumeTests(unittest.TestCase):
         runner._process_lock_held = True
         fake_claude = Mock(return_value=claude_reviewer.ReviewResult("Plan looks good.", 0.1))
         runner.claude_runner = fake_claude
+        runner.execution.claude_runner = fake_claude
         sections = {
             "Review metadata": "metadata", "Assignment": "assignment", "Current proposal": "proposal",
             "Repository context": "context",
@@ -330,7 +331,8 @@ class BudgetResumeTests(unittest.TestCase):
         }
         with (patch("orchestrator.claude_reviewer.max_review_payload_chars", return_value=100_000),
               patch("orchestrator.claude_reviewer.validate_review_invocation"),
-              patch.object(runner, "_save"), patch.object(runner, "_operation_launching")):
+              patch.object(runner.workflow_state, "save"),
+              patch.object(runner.workflow_state, "operation_launching")):
             runner._call_claude(
                 "Review this proposal", "plan_review_1", sections,
                 metadata={"iteration": 1, "proposal_version": 1},

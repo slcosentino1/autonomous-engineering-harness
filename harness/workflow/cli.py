@@ -307,8 +307,11 @@ def main(
                 help="Set the absolute total Claude/Aily limit, including accumulated spend",
             )
             command.add_argument(
-                "--recovery-action", choices=("retry", "accept-implementation"),
-                help="Explicitly resolve a detected crash recovery after inspecting status and target changes",
+                "--recovery-action", choices=("retry", "accept-implementation", "accept-target-for-review"),
+                help=(
+                    "Resolve a detected recovery, or explicitly accept the inspected current target "
+                    "for independent review"
+                ),
             )
             command.add_argument(
                 "--verified-claude-cost-usd", type=float,
@@ -324,7 +327,7 @@ def main(
             )
             command.add_argument(
                 "--confirm-target-reviewed", action="store_true",
-                help="Confirm that target changes were inspected before retrying or accepting interrupted implementation",
+                help="Confirm that target changes were inspected before retrying or accepting them for review",
             )
 
     recover = commands.add_parser(

@@ -1,11 +1,156 @@
-"""Pure rendering for completed workflow delivery reports."""
+"""Delivery integrity verification and report rendering."""
 
 from __future__ import annotations
 
+import hashlib
+from datetime import datetime, timezone
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+import claude_reviewer
+from workflow import persistence as _persistence
+from workflow import traceability as _traceability
+from workflow import workspace as _workspace
+from workflow.state import WorkflowError
+from workflow.review import (
+    build_review_diff,
+    review_reports_sha256,
+    review_source_hash_matching_evidence,
+)
+
+
+def _clean_markdown(value: str) -> str:
+    return "\n".join(line.rstrip() for line in value.strip().splitlines()).strip() + "\n"
+
+
+def verify_delivery_integrity(
+    state: Mapping[str, Any],
+    *,
+    target: Path,
+    proposal_path: Path,
+) -> dict:
+    """Verify saved review, proposal, target, and commitment evidence before delivery."""
+    integrity = state.get("integrity")
+    evidence = integrity.get("review_evidence") if isinstance(integrity, dict) else None
+    if not isinstance(evidence, dict):
+        raise WorkflowError("Delivery is blocked because no completed review provenance was recorded.")
+    correction_attempts = state.get("correction_attempts", [])
+    expected_purpose = "verification" if correction_attempts else "initial"
+    if evidence.get("purpose") != expected_purpose:
+        raise WorkflowError("Delivery is blocked because the final review does not verify the corrected source.")
+    if correction_attempts:
+        verification = integrity.get("verification_result") if isinstance(integrity, dict) else None
+        if (not isinstance(verification, dict) or verification.get("status") != "verified"
+                or verification.get("campaign_id") != evidence.get("campaign_id")
+                or not isinstance(verification.get("original_finding_dispositions"), dict)
+                or not verification.get("original_finding_dispositions")):
+            raise WorkflowError("Delivery is blocked because post-correction verification is incomplete.")
+    try:
+        proposal_bytes = _persistence.read_bytes(proposal_path)
+    except OSError as exc:
+        raise WorkflowError("Delivery is blocked because the saved proposal is missing or unreadable.") from exc
+    try:
+        proposal = _persistence.read_text(proposal_path)
+    except (OSError, UnicodeDecodeError) as exc:
+        raise WorkflowError(f"Saved proposal is unavailable: {proposal_path}") from exc
+    if not proposal.strip():
+        raise WorkflowError("Saved proposal is empty.")
+    proposal_text = _clean_markdown(proposal)
+    proposal_hash = hashlib.sha256(proposal_bytes).hexdigest()
+    expected_proposal_hash = state.get("proposal_artifact_sha256")
+    version_hashes = state.get("proposal_version_hashes", {})
+    version_hash = version_hashes.get(str(state.get("proposal_version"))) if isinstance(version_hashes, dict) else None
+    if (not isinstance(expected_proposal_hash, str) or proposal_hash != expected_proposal_hash
+            or proposal_hash != version_hash
+            or proposal_text != _clean_markdown(str(state.get("proposal", "")))):
+        raise WorkflowError("Delivery is blocked because the saved proposal changed after review.")
+    approved_ledger_snapshot = state.get("commitment_ledger_approval")
+    if state.get("traceability_required") is True:
+        try:
+            current_ledger = _traceability.parse_commitment_ledger(proposal_text)
+        except _traceability.TraceabilityError as exc:
+            raise WorkflowError(f"Delivery is blocked because the approved commitment ledger is invalid: {exc}") from exc
+        if (not isinstance(approved_ledger_snapshot, dict)
+                or approved_ledger_snapshot.get("proposal_version") != state.get("proposal_version")
+                or approved_ledger_snapshot.get("proposal_sha256") != proposal_hash
+                or approved_ledger_snapshot.get("ledger_sha256") != _traceability.canonical_sha256(current_ledger)
+                or approved_ledger_snapshot.get("ledger") != current_ledger):
+            raise WorkflowError("Delivery is blocked because the approved commitment ledger binding changed.")
+    if review_reports_sha256(state) != evidence.get("review_reports_sha256"):
+        raise WorkflowError("Delivery is blocked because the final review evidence changed after verification.")
+    if state.get("traceability_required") is True:
+        approved_ledger = state.get("commitment_ledger_approval", {})
+        commitment_evidence = state.get("commitment_evidence")
+        if isinstance(commitment_evidence, dict):
+            evidence_payload = dict(commitment_evidence)
+            expected_evidence_hash = evidence_payload.pop("evidence_sha256", None)
+            evidence_record_matches = (
+                expected_evidence_hash == _traceability.canonical_sha256(evidence_payload)
+                and evidence.get("commitment_evidence_sha256") == expected_evidence_hash
+            )
+        else:
+            evidence_record_matches = (
+                commitment_evidence is None and evidence.get("commitment_evidence_sha256") is None
+            )
+        if (evidence.get("commitment_ledger_sha256") != approved_ledger.get("ledger_sha256")
+                or not evidence_record_matches
+                or evidence.get("commitment_assessment_sha256") != _traceability.canonical_sha256(
+                    state.get("commitment_assessment"),
+                )):
+            raise WorkflowError("Delivery is blocked because commitment traceability evidence changed after review.")
+    if (hashlib.sha256(str(state.get("implementation_summary") or "").encode("utf-8")).hexdigest()
+            != evidence.get("implementation_summary_sha256")
+            or hashlib.sha256(str(state.get("correction_summary") or "").encode("utf-8")).hexdigest()
+            != evidence.get("correction_summary_sha256")):
+        raise WorkflowError("Delivery is blocked because implementation or correction evidence changed after verification.")
+    current_diff = build_review_diff(state, target)
+    current_patch_hash = review_source_hash_matching_evidence(state, current_diff, evidence)
+    if current_patch_hash is None:
+        raise WorkflowError("Delivery is blocked because target code changed after its final review.")
+    execution_fingerprint = state.get("execution_fingerprint")
+    initial_target = (
+        execution_fingerprint.get("initial", {}).get("target", {})
+        if isinstance(execution_fingerprint, dict) else {}
+    )
+    baseline_snapshot = state.get("baseline_snapshot")
+    if isinstance(baseline_snapshot, dict) and (
+            baseline_snapshot.get("baseline_fingerprint_sha256") != initial_target.get("working_tree_sha256")
+            or evidence.get("baseline_fingerprint_sha256") != initial_target.get("working_tree_sha256")
+            or evidence.get("baseline_snapshot_sha256") != baseline_snapshot.get("sha256")
+            or evidence.get("review_scope_sha256") != current_patch_hash
+            or evidence.get("review_scope_paths") != state.get("review_scope_files", [])
+            or evidence.get("workflow_change_paths") != state.get("review_workflow_paths", [])):
+        raise WorkflowError("Delivery is blocked because baseline or review-scope provenance changed.")
+    try:
+        fingerprint = _workspace.repository_fingerprint(target, redactor=claude_reviewer.redact)
+        current_fingerprint = {
+            "status": "captured",
+            "captured_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            **fingerprint,
+        }
+    except Exception:
+        current_fingerprint = {
+            "status": "unavailable",
+            "error_category": "FingerprintError",
+            "error": "Fingerprint calculation failed; repository state is unavailable.",
+        }
+    if (current_fingerprint.get("status") != "captured"
+            or current_fingerprint.get("commit_sha") != evidence.get("target_commit_sha")
+            or current_fingerprint.get("working_tree_sha256") != evidence.get("target_working_tree_sha256")):
+        raise WorkflowError("Delivery is blocked because the target fingerprint changed after its final review.")
+    result = {
+        "status": "verified",
+        "checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "proposal_sha256": proposal_hash,
+        "proposal_version": state.get("proposal_version"),
+        "source_patch_sha256": current_patch_hash,
+        "target_commit_sha": current_fingerprint["commit_sha"],
+        "target_working_tree_sha256": current_fingerprint["working_tree_sha256"],
+        "review_campaign_id": evidence.get("campaign_id"),
+    }
+    integrity["delivery_verification"] = result
+    return result
 
 def render_delivery_report(
     state: Mapping[str, Any],

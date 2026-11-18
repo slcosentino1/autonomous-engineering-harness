@@ -268,7 +268,7 @@ class GithubBridgeTests(unittest.TestCase):
             def run_pending(self):
                 self.state["status"] = "failed"
                 self.state["error"] = "simulated interruption after workflow state persistence"
-                self._save()
+                self.execution._save()
                 return self.state
 
         def forbidden_provider(*_args, **_kwargs):

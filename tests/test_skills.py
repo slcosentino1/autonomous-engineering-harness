@@ -91,8 +91,10 @@ class SkillResolutionTests(unittest.TestCase):
         self.assertEqual(selected["skills"], [])
 
     def test_legacy_authorization_does_not_expand_claude_skill_content_scope(self):
-        runner = object.__new__(orchestrator.Orchestrator)
-        runner.state = {"authorization": {"claude_aily": {"permitted_data": LEGACY_CLAUDE_DATA_SCOPE}}}
+        runner = object.__new__(orchestrator.WorkflowExecution)
+        runner.workflow_state = {
+            "authorization": {"claude_aily": {"permitted_data": LEGACY_CLAUDE_DATA_SCOPE}},
+        }
         guidance = {
             "skills": [{
                 "name": "software-engineering", "source": "harness", "path": "skill/SKILL.md",
