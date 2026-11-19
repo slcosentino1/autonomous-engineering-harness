@@ -31,7 +31,7 @@ There are no core packages to install. `.venv/` is ignored by Git. If you use an
 2. Claude reviews the proposal. Codex evaluates the feedback and refines it. One second Claude review is allowed only when the refined plan requests it; there are at most two plan reviews.
 3. The workflow stops in `awaiting_approval`. Read the proposal before running `approve`.
 4. After approval, Codex implements the plan and runs relevant checks in the target workspace.
-5. Claude independently reviews the change in one call when the complete context fits. Larger diffs are grouped into coherent parts and receive a final integration review. If that review requests changes, Codex may make one bounded correction and rerun affected checks. The Harness then starts a separate verification campaign over the resulting diff. That reviewer receives the original findings and must assess each one against the current code and tests while checking the affected scope for regressions. Incomplete verification or unresolved/new blocking findings stop the workflow; delivery is not written. There is no repeated correction loop. The Harness does not independently execute project-specific tests: Claude can inspect visible code and test changes plus Codex's reported validation, but the Harness does not attest that those commands actually ran or passed.
+5. The selected profile controls review, verification, correction, and delivery stages. Test stages require a successful test-runner receipt captured from Codex CLI events. Review-only inspects the target's existing changes and writes only workflow metadata.
 6. A completed workflow writes a human-readable delivery report.
 
 Each stage is recorded in one small JSON state file. `resume` retries only the failed stage. It does not replan completed work or cross the approval gate.
@@ -42,21 +42,30 @@ Starting the workflow writes one persistent authorization into that state. It bi
 
 Provide an absolute target path and assignment. Claude calls default to a total budget of USD 2.00; override it with `--budget-usd`. The workflow prints and stores the effective budget. A Codex model is optional; without `--model`, the CLI's configured default is used.
 
-Workflow selection currently defaults to the policy-compliant `full-development` profile:
+Workflow selection defaults to `full-development` for compatibility. Use `run` to execute a profile directly; `start` remains available for the proposal-first workflow. Mandatory assessment gates can pause a selected workflow for approval.
 
 ```sh
-python3 harness/orchestrator.py start --target /absolute/repository --task "Implement the approved change" \
+python3 harness/orchestrator.py run --target /absolute/repository --task "Implement the approved change" \
   --workflow full-development
 ```
 
-The code-defined profile catalog also names `bugfix`, `quick-fix`, and `implementation-only`. The current repository policy requires planning, plan review, explicit approval, implementation, code review, verification, and delivery, so profiles that omit those gates are rejected before workflow state or provider work begins. `--stages A,B,C` selects a policy-compliant subset and automatically includes its declared dependencies. For example, this selection keeps the required first plan review and all delivery gates while omitting the optional second-review and user-revision path:
+The built-in profiles are `full-development`, `bugfix`, `quick-fix`, `implementation-only`, and `review-only`. `--workflow auto` selects the assessment recommendation. Explicit profile selection takes precedence where policy permits it. High-risk work requires planning and approval; a short profile that cannot provide those gates is rejected before provider work. All source-modifying profiles require verification, and profiles that define a tests stage cannot omit it.
 
 ```sh
-python3 harness/orchestrator.py start --target /absolute/repository --task "Implement the approved change" \
-  --stages planning,plan_review_1,plan_refine_1,implementation,code_review,verification,complete
+python3 harness/orchestrator.py run --target /absolute/repository --task "Fix a small isolated defect" --workflow bugfix
+python3 harness/orchestrator.py run --target /absolute/repository --task "Fix typo in documentation" --workflow quick-fix
+python3 harness/orchestrator.py run --target /absolute/repository --task "Review this change" --workflow review-only
+python3 harness/orchestrator.py run --target /absolute/repository --task "Implement a change" --workflow implementation-only
 ```
 
-`--skip STAGE` is rejected because the default definition does not mark any stage as explicitly skippable. Neither option changes saved authorization or grants operation permissions. The workflow engine drives production stage order and persists attempts and outcomes through the shared workflow save path. Production adapters reuse the existing authorized provider and workspace operations, operation journal, approval boundary, and recovery checks. `resume` still retries only the saved failed stage; interrupted or uncertain operations require the existing explicit recovery actions.
+`--stages A,B,C` selects an ordered subset from the profile; declared dependencies are included automatically and required policy gates are checked before execution:
+
+```sh
+python3 harness/orchestrator.py run --target /absolute/repository --task "Fix typo in documentation" \
+  --workflow quick-fix --stages assessment,implementation,tests,verification
+```
+
+`--skip STAGE[,STAGE...]` is allowed only for stages marked optional in that profile. For example, `bugfix` permits skipping investigation; required verification and approval gates remain. The workflow engine executes the selected definition and persists attempts, outputs, dependencies, and decisions through the existing atomic state path. `resume` retries a saved failed stage and preserves completed upstream stages; interrupted or uncertain operations still require explicit recovery actions. For a failed or completed workflow, `resume --continue-from STAGE` reruns the named stage and its transitive dependents after checking that saved operations are resolved and their capabilities remain authorized.
 
 The `Orchestrator` coordinates lifecycle and supplies stage-scoped capabilities. Planning, implementation, review, and delivery actions live in separate modules under `harness/workflow/stages/`; the engine invokes them through the registry and owns stage order and generic transitions. Version 1 execution-state synthesis and legacy stage-ID mapping live in `workflow/legacy_compatibility.py`.
 

@@ -74,6 +74,7 @@ class ReviewStageServices:
 class DeliveryStageServices:
     state: dict[str, Any]
     target: Path
+    fingerprint_repository: Callable[..., dict[str, Any]]
     delivery_path: Path
     verify_delivery_integrity: Callable[..., Any]
     capture_final_target_fingerprint: Callable[..., Any]

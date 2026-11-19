@@ -316,6 +316,38 @@ class WorkflowEngineTests(unittest.TestCase):
         self.assertEqual(second["stages"]["work"]["status"], "completed")
         self.assertEqual(len(second["stages"]["work"]["attempts"]), 2)
 
+    def test_continue_from_reruns_selected_stage_and_transitive_dependents(self):
+        order: list[str] = []
+        registry = StageRegistry()
+        registry.register("stage", RecordingStage("stage", order))
+        definition = WorkflowDefinition("continue", "test", 1, (
+            StageDefinition("first", "stage"),
+            StageDefinition("second", "stage", (StageDependency("first"),)),
+            StageDefinition("independent", "stage"),
+        ))
+        engine = WorkflowEngine(registry, lambda _state: None)
+        state = engine.execute(definition, WorkflowContext("wf", "task"))
+        with self.assertRaisesRegex(WorkflowDefinitionError, "not authorized"):
+            engine.continue_from(
+                definition, state, "first", rerun_allowed=lambda _stage, _record: False,
+                requested_at="test-time",
+            )
+        self.assertEqual(state["status"], "complete")
+        affected = engine.continue_from(
+            definition, state, "first", rerun_allowed=lambda _stage, _record: True,
+            requested_at="test-time",
+        )
+        self.assertEqual(affected, {"first", "second"})
+        state = engine.execute(
+            definition, WorkflowContext("wf", "task"), state,
+            rerun_allowed=lambda _stage, _record: True,
+        )
+        self.assertEqual(order, ["stage", "stage", "stage", "stage", "stage"])
+        self.assertEqual(state["stages"]["first"]["attempts"][-1]["attempt"], 2)
+        self.assertEqual(state["stages"]["second"]["attempts"][-1]["attempt"], 2)
+        self.assertEqual(state["stages"]["independent"]["attempts"][-1]["attempt"], 1)
+        self.assertEqual(state["continuation_history"][0]["invalidated_stages"], ["first", "second"])
+
     def test_interrupted_running_stage_blocks_until_recovery_resolves_it(self):
         order: list[str] = []
         registry = StageRegistry()
@@ -408,12 +440,20 @@ class WorkflowEngineTests(unittest.TestCase):
         self.assertEqual(state["status"], "complete")
         self.assertEqual(len(state["stages"]["work"]["attempts"]), 2)
 
-    def test_profiles_resolve_full_flow_and_reject_policy_bypasses(self):
+    def test_all_builtin_profiles_resolve_with_distinct_stage_sequences(self):
         constraints = RepositoryWorkflowConstraints()
         self.assertEqual(resolve_workflow("full-development", constraints), BUILT_IN_WORKFLOWS["full-development"])
-        for profile in ("bugfix", "quick-fix", "implementation-only"):
-            with self.subTest(profile=profile), self.assertRaisesRegex(WorkflowDefinitionError, "conflicts with repository policy"):
-                resolve_workflow(profile, constraints)
+        expected = {
+            "bugfix": ("assessment", "investigation", "implementation", "tests", "review",
+                       "task_correction", "verification", "delivery"),
+            "quick-fix": ("assessment", "implementation", "tests", "verification", "delivery"),
+            "implementation-only": ("assessment", "implementation", "tests", "verification"),
+            "review-only": ("assessment", "review", "report"),
+        }
+        for profile, stages in expected.items():
+            with self.subTest(profile=profile):
+                definition = resolve_workflow(profile, constraints)
+                self.assertEqual(tuple(stage.stage_id for stage in definition.stages), stages)
 
     def test_assessment_is_explainable_and_reassessment_cannot_downgrade(self):
         low = assess_task("Fix a typo in one local comment.")
@@ -443,7 +483,9 @@ class WorkflowEngineTests(unittest.TestCase):
             assessment_from_dict({"complexity": "low"})
 
     def test_policy_resolver_keeps_repository_approval_and_proposal_gates(self):
-        constraints = RepositoryWorkflowConstraints()
+        constraints = RepositoryWorkflowConstraints(
+            required_stages=("planning",), proposal_policy="required", approval_policy="always",
+        )
         assessment = assess_task("Fix a typo.")
         with self.assertRaisesRegex(ValueError, "requires a proposal"):
             resolve_policies(

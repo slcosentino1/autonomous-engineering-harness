@@ -36,6 +36,7 @@ def resolve_policies(
     assessment: Assessment,
     constraints: RepositoryWorkflowConstraints,
     explicit_approval_required: bool = False,
+    read_only: bool = False,
 ) -> PolicyDecision:
     if proposal_policy not in {"required", "optional", "disabled", "automatic"}:
         raise ValueError("Unsupported proposal policy.")
@@ -45,13 +46,30 @@ def resolve_policies(
         raise ValueError("Repository policy requires a proposal.")
     if constraints.approval_policy == "always" and approval_policy != "always":
         raise ValueError("Repository policy requires explicit human approval.")
-    proposal_required = proposal_policy == "required" or (
+    policy_requires_proposal = proposal_policy == "required" or (
         proposal_policy == "automatic" and assessment.proposal_recommended
     )
-    approval_required = explicit_approval_required or approval_policy == "always" or (
-        approval_policy == "auto" and assessment.approval_recommended
+    assessment_requires_proposal = not read_only and (
+        assessment.risk == "high" or assessment.complexity == "high"
+        or assessment.security_impact or assessment.production_impact or assessment.architectural_impact
+    )
+    proposal_required = policy_requires_proposal or assessment_requires_proposal or (
+        constraints.proposal_policy == "required"
+    )
+    risk_requires_approval = (
+        not read_only and (assessment.risk == "high" or assessment.security_impact
+                           or assessment.production_impact or assessment.ambiguous)
+    )
+    approval_required = not read_only and (
+        explicit_approval_required or approval_policy == "always"
+        or (approval_policy == "auto" and assessment.approval_recommended)
+        or risk_requires_approval or constraints.approval_policy == "always"
     )
     reason = "Repository policy gates remain authoritative."
+    if policy_requires_proposal or assessment_requires_proposal:
+        reason += " Task assessment requires proposal and planning gates."
+    if risk_requires_approval:
+        reason += " Task risk requires explicit human approval."
     if explicit_approval_required:
         reason += " The task explicitly requires human approval."
     return PolicyDecision(proposal_required, approval_required, reason)

@@ -75,6 +75,142 @@ def _execute_implementation(stage_input: StageInput, services) -> StageResult:
         str(services.state.get("implementation_summary") or "").encode("utf-8"),
     ).hexdigest()})
 
+
+def _execute_task_implementation(stage_input: StageInput, services) -> StageResult:
+    """Implement a directly assigned low-risk task without fabricating proposal commitments."""
+    if services.approval_required() and not services.state.get("implementation_approved_at"):
+        raise WorkflowError("Explicit human approval is required before implementation.")
+    guidance = services.guidance()
+    skill_guidance = services.guidance_for_codex(
+        guidance, stage="implementation", context=stage_input.context.task,
+    )
+    prompt = (
+        "Implement the assigned task in this repository. Follow repository instructions and the supplied "
+        "engineering guidance. Keep the change within the assignment, preserve unrelated work, and add or "
+        "update focused tests where appropriate. Run relevant checks. Do not invent requirements. Do not "
+        "commit, push, merge, deploy, publish, change shared infrastructure, expose secrets, or read outside "
+        "the target repository. Return a concise summary of files changed, commands actually run, results, "
+        "and remaining risks.\n\n"
+        f"{skill_guidance}\n\nAssignment:\n{stage_input.context.task}"
+    )
+    summary = services.run_codex(prompt, sandbox="workspace-write")
+    services.state["implementation_summary"] = summary
+    services.save()
+    return StageResult(output={"summary_sha256": hashlib.sha256(summary.encode("utf-8")).hexdigest()})
+
+
+def _execute_tests(stage_input: StageInput, services) -> StageResult:
+    """Run repository tests through Codex and require a recorded successful test command receipt."""
+    guidance = services.guidance()
+    skill_guidance = services.guidance_for_codex(
+        guidance, stage="verification", context=stage_input.context.task,
+    )
+    prompt = (
+        "Run the repository's relevant automated tests for the current workflow change. Inspect project "
+        "instructions and manifests to choose the established test command. Execute the test runner; do not "
+        "edit source files or tests in this stage. Report the exact command, outcome, and failing test IDs. "
+        "If no automated tests exist or the command cannot be run, state that clearly. Do not claim success "
+        "without an observed successful test command.\n\n"
+        f"{skill_guidance}\n\nAssignment:\n{stage_input.context.task}"
+        f"\n\nStage attempt: {stage_input.attempt}"
+    )
+    summary = services.run_codex(prompt, sandbox="workspace-write")
+    operations = services.state.get("operation_history", [])
+    operation = next((
+        item for item in reversed(operations)
+        if isinstance(item, dict) and item.get("operation_type") == "codex"
+        and item.get("stage") == "tests" and item.get("status") == "completed"
+    ), None) if isinstance(operations, list) else None
+    receipts = operation.get("test_execution_events", []) if isinstance(operation, dict) else []
+    successful = [
+        item for item in receipts if isinstance(item, dict)
+        and item.get("runner") != "unknown" and item.get("exit_code") == 0
+    ] if isinstance(receipts, list) else []
+    if not successful:
+        raise WorkflowError("No successful automated test execution receipt was observed.")
+    services.state["test_summary"] = summary
+    services.state["test_evidence"] = [{
+        "event_id": item.get("event_id"), "runner": item.get("runner"),
+        "exit_code": item.get("exit_code"), "tests": item.get("tests", []),
+    } for item in successful]
+    services.save()
+    return StageResult(output={
+        "passed": True,
+        "events": [item.get("event_id") for item in successful],
+        "test_count": sum(len(item.get("tests", [])) for item in successful),
+    })
+
+
+def _successful_test_receipts(services, stage_id: str) -> list[dict]:
+    operations = services.state.get("operation_history", [])
+    operation = next((
+        item for item in reversed(operations)
+        if isinstance(item, dict) and item.get("operation_type") == "codex"
+        and item.get("stage") == stage_id and item.get("status") == "completed"
+    ), None) if isinstance(operations, list) else None
+    receipts = operation.get("test_execution_events", []) if isinstance(operation, dict) else []
+    return [
+        item for item in receipts if isinstance(item, dict)
+        and item.get("runner") != "unknown" and item.get("exit_code") == 0
+    ] if isinstance(receipts, list) else []
+
+
+def _execute_test_verification(stage_input: StageInput, services) -> StageResult:
+    """Confirm tests and any conditional repair completed after the bugfix review."""
+    execution = services.state.get("workflow_execution", {})
+    stages = execution.get("stages", {}) if isinstance(execution, dict) else {}
+    review = stages.get("review", {}) if isinstance(stages, dict) else {}
+    correction = stages.get("task_correction", {}) if isinstance(stages, dict) else {}
+    review_output = review.get("output", {}) if isinstance(review, dict) else {}
+    correction_status = correction.get("status") if isinstance(correction, dict) else None
+    if review.get("status") != "completed":
+        raise WorkflowError("Verification is blocked because the independent review did not complete.")
+    if review_output.get("has_findings") is True and correction_status != "completed":
+        raise WorkflowError("Verification is blocked because review findings were not corrected.")
+    evidence_stage = "task_correction" if correction_status == "completed" else "tests"
+    receipts = _successful_test_receipts(services, evidence_stage)
+    if not receipts:
+        raise WorkflowError("Verification is blocked because no successful post-change test receipt exists.")
+    services.state["integrity"] = services.state.get("integrity") or {}
+    services.state["integrity"]["verification_result"] = {
+        "status": "verified",
+        "checked_at": services.now(),
+        "test_stage": evidence_stage,
+        "test_event_ids": [item.get("event_id") for item in receipts],
+        "finding": "The independent review completed and observed automated tests passed.",
+    }
+    services.save()
+    return StageResult(output={
+        "verified": True,
+        "test_event_ids": [item.get("event_id") for item in receipts],
+    })
+
+
+def _execute_task_correction(stage_input: StageInput, services) -> StageResult:
+    """Apply only findings from a configured profile's independent review."""
+    report = services.state.get("code_review")
+    if not isinstance(report, str) or not report.strip():
+        raise WorkflowError("Correction is blocked because the review report is missing.")
+    guidance = services.guidance()
+    skill_guidance = services.guidance_for_codex(
+        guidance, stage="correction", context=f"{stage_input.context.task}\n{report}",
+    )
+    prompt = (
+        "Evaluate the independent review findings against the assigned task. Fix only valid, in-scope "
+        "blocking findings. Do not broaden the change or modify unrelated files. Add or update a focused "
+        "regression test when needed and report which findings were addressed or rejected with reasons. "
+        "Run the relevant tests after the corrections. Do not commit, push, merge, deploy, publish, or "
+        "expose secrets.\n\n"
+        f"{skill_guidance}\n\nAssignment:\n{stage_input.context.task}\n\nReview findings:\n{report}"
+    )
+    summary = services.run_codex(prompt, sandbox="workspace-write")
+    if not _successful_test_receipts(services, "task_correction"):
+        raise WorkflowError("Correction is blocked because no successful post-correction test receipt was observed.")
+    services.state["correction_summary"] = summary
+    services.save()
+    return StageResult(output={"performed": True, "summary_sha256": hashlib.sha256(summary.encode("utf-8")).hexdigest()})
+
+
 def _execute_correction(stage_input: StageInput, services) -> StageResult:
     stage = str(stage_input.configuration.get("legacy_stage", stage_input.definition.stage_id))
     guidance = services.guidance()

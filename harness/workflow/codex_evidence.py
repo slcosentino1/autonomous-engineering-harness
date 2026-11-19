@@ -89,6 +89,18 @@ def _runner_name(command: str | None) -> str:
         return "pytest"
     if re.search(r"\b(?:python(?:3(?:\.\d+)?)?\s+-m\s+unittest|unittest)\b", command):
         return "unittest"
+    if re.search(r"\bcargo\s+test\b", command):
+        return "cargo-test"
+    if re.search(r"\bgo\s+test\b", command):
+        return "go-test"
+    if re.search(r"\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test\b", command):
+        return "javascript-test"
+    if re.search(r"\bdotnet\s+test\b", command):
+        return "dotnet-test"
+    if re.search(r"\bmvn\s+(?:--batch-mode\s+)?test\b|\bmvnw\s+test\b", command):
+        return "maven-test"
+    if re.search(r"\bgradle?w?\s+.*\btest\b|\bmake\s+test\b", command):
+        return "build-test"
     return "unknown"
 
 

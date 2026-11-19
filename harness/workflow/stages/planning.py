@@ -15,6 +15,33 @@ def _current_stage(stage_input: StageInput) -> str:
     return str(stage_input.configuration.get("legacy_stage", stage_input.definition.stage_id))
 
 
+def _execute_assessment(stage_input: StageInput, services) -> StageResult:
+    assessment = services.state.get("assessment")
+    if not isinstance(assessment, dict):
+        raise WorkflowError("The workflow assessment is missing or invalid.")
+    return StageResult(output={
+        "recommended_workflow": assessment.get("recommended_workflow"),
+        "risk": assessment.get("risk"),
+        "complexity": assessment.get("complexity"),
+    })
+
+
+def _execute_investigation(stage_input: StageInput, services) -> StageResult:
+    task = stage_input.context.task
+    guidance = services.guidance()
+    skill_guidance = services.guidance_for_codex(guidance, stage="investigation", context=task)
+    prompt = (
+        "Investigate the assigned defect in this repository. Read repository instructions and relevant code. "
+        "Do not modify files, run tests, or make unrelated changes. Return a concise evidence-based diagnosis, "
+        "likely cause, affected files, and a focused implementation approach. Mark uncertainty explicitly.\n\n"
+        f"{skill_guidance}\n\nAssignment:\n{task}"
+    )
+    summary = services.run_codex(prompt, sandbox="read-only")
+    services.state["investigation_summary"] = summary
+    services.save()
+    return StageResult(output={"summary_sha256": hashlib.sha256(summary.encode("utf-8")).hexdigest()})
+
+
 def _execute_noop(stage_input: StageInput, services) -> StageResult:
     stage_id = stage_input.definition.stage_id
     state = services.state

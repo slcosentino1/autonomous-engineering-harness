@@ -138,6 +138,7 @@ MAX_PLANNING_FAILURE_RECORDS = 3
 MAX_OPERATION_HISTORY = 100
 MAX_EXECUTION_CHANGE_EXAMPLES = 10
 TRACE_STAGES = frozenset({
+    "assessment", "investigation", "tests", "review", "report", "delivery", "task_correction",
     "planning", "plan_review_1", "plan_review_2", "plan_refine_1", "plan_refine_2",
     "revision_request", "plan_review_2_request", "human_revision", "implementation", "code_review",
     "revision_plan_review_request", "plan_review_2_after_revision", "plan_refine_2_after_revision",
@@ -500,7 +501,7 @@ def _review_diff(state: dict, target: Path) -> ReviewDiff:
         return _review_input.build_review_diff(
             target,
             state["baseline_commit"],
-            state.get("preexisting_paths", []),
+            [] if state.get("workflow_name") == "review-only" else state.get("preexisting_paths", []),
             baseline_snapshot=state.get("baseline_snapshot"),
             review_scope_paths=review_scope_paths,
             implementation_snapshot=implementation_snapshot,
@@ -929,6 +930,7 @@ class Orchestrator:
                     approval_policy=definition.approval_policy,
                     assessment=assessment,
                     constraints=_definitions.RepositoryWorkflowConstraints(),
+                    read_only=definition.name == "review-only",
                 )
                 if policy != expected_policy:
                     raise WorkflowDefinitionError("Resolved workflow policy decision is inconsistent.")
@@ -1358,14 +1360,22 @@ class Orchestrator:
     def _require_write_operation_target(self, purpose: str) -> None:
         if not isinstance(self.state.get("baseline_snapshot"), dict):
             return
-        expected_stage = "correction" if purpose == "verification" else "implementation"
+        if self.state.get("workflow_name") == "review-only":
+            initial = self.state.get("execution_fingerprint", {}).get("initial", {}).get("target", {})
+            current = self._fingerprint_repository(self.target)
+            if (initial.get("status") != "captured" or current.get("status") != "captured"
+                    or initial.get("commit_sha") != current.get("commit_sha")
+                    or initial.get("working_tree_sha256") != current.get("working_tree_sha256")):
+                raise WorkflowError("Review-only target changed during execution; no report was written.")
+            return
         operations = self.state.get("operation_history", [])
         operation = next((
             item for item in reversed(operations)
             if isinstance(item, dict) and item.get("operation_type") == "codex"
-            and item.get("stage") == expected_stage
+            and item.get("sandbox") == "workspace-write"
+            and item.get("stage") in {"implementation", "tests", "correction", "task_correction"}
             and (item.get("status") == "completed" or (
-                purpose == "initial"
+                purpose in {"initial", "verification"}
                 and item.get("resolution") == "human_accepted_current_target_for_independent_review"
             ))
         ), None) if isinstance(operations, list) else None
@@ -1870,11 +1880,13 @@ class Orchestrator:
             if isinstance(definition, dict):
                 try:
                     if "assessment" in self.state:
+                        migrated_definition = _definition_from_snapshot(definition)
                         legacy_policy = _policies.resolve_policies(
                             proposal_policy=definition.get("proposal_policy", "required"),
                             approval_policy=definition.get("approval_policy", "always"),
                             assessment=_assessment.assessment_from_dict(self.state.get("assessment")),
                             constraints=_definitions.RepositoryWorkflowConstraints(),
+                            read_only=migrated_definition.name == "review-only",
                         )
                     elif (definition.get("proposal_policy") == "required"
                             and definition.get("approval_policy") == "always"):
@@ -1920,12 +1932,32 @@ class Orchestrator:
                 "decisions": copy.deepcopy(self.state["policy_decisions"]),
             })
         decisions = self.state.get("policy_decisions")
+        try:
+            if ("assessment" not in self.state
+                    and saved_definition.name == _definitions.LEGACY_DEFAULT_WORKFLOW.name
+                    and saved_definition.proposal_policy == "required"
+                    and saved_definition.approval_policy == "always"):
+                expected_policy = _policies.PolicyDecision(
+                    True, True, "Migrated from the repository-required legacy workflow policy.",
+                )
+            else:
+                expected_policy = _policies.resolve_policies(
+                    proposal_policy=saved_definition.proposal_policy,
+                    approval_policy=saved_definition.approval_policy,
+                    assessment=_assessment.assessment_from_dict(self.state.get("assessment")),
+                    constraints=_definitions.RepositoryWorkflowConstraints(),
+                    read_only=saved_definition.name == "review-only",
+                )
+        except (ValueError, TypeError) as exc:
+            raise WorkflowError("Saved workflow policy inputs are invalid.") from exc
         if (not isinstance(decisions, dict)
                 or not isinstance(decisions.get("proposal"), dict)
-                or decisions["proposal"].get("required") is not True
+                or type(decisions["proposal"].get("required")) is not bool
+                or (expected_policy.proposal_required and not decisions["proposal"].get("required"))
                 or decisions["proposal"].get("policy") != saved_definition.proposal_policy
                 or not isinstance(decisions.get("approval"), dict)
-                or decisions["approval"].get("required") is not True
+                or type(decisions["approval"].get("required")) is not bool
+                or (expected_policy.approval_required and not decisions["approval"].get("required"))
                 or decisions["approval"].get("policy") != saved_definition.approval_policy):
             raise WorkflowError("Saved workflow policy decisions do not satisfy repository constraints.")
         return authorization
@@ -2293,6 +2325,10 @@ class Orchestrator:
     def start(self) -> dict:
         return self._execute_locked(self._start_locked)
 
+    def run(self) -> dict:
+        """Start a selected workflow, which may proceed immediately or pause for policy approval."""
+        return self.start()
+
     def _start_locked(self) -> dict:
         if not self.task or not self.task.strip():
             raise WorkflowError("A non-empty task is required to start a workflow.")
@@ -2372,7 +2408,7 @@ class Orchestrator:
             "created_at": now(),
             "updated_at": now(),
             "status": "running",
-            "stage": "planning",
+            "stage": definition.stages[0].stage_id,
             "codex_model": self.model,
             "baseline_commit": baseline,
             "baseline_snapshot": baseline_snapshot,
@@ -2386,7 +2422,7 @@ class Orchestrator:
             "preexisting_paths": preexisting_paths,
             "project_guidance": _project_guidance(self.target, self.task.strip()),
             "proposal_version": 0,
-            "traceability_required": True,
+            "traceability_required": policy.proposal_required,
             "commitment_ledger_approval": None,
             "commitment_evidence": None,
             "commitment_assessment": None,
@@ -2433,6 +2469,10 @@ class Orchestrator:
             "status": "running",
             "stages": {},
         }
+        if not policy.proposal_required:
+            self.state["proposal"] = f"# Task brief\n\n{self.task.strip()}\n"
+            self.state["proposal_version"] = 1
+            self._write_proposal(self.state["proposal"])
         self.state["engine_version"] = 2
         self._save()
         self._begin_execution_trace("start")
@@ -3051,6 +3091,7 @@ class Orchestrator:
     def resume(
         self,
         *,
+        continue_from: str | None = None,
         recovery_action: str | None = None,
         verified_claude_cost_usd: float | None = None,
         confirm_provider_inactive: bool = False,
@@ -3060,6 +3101,7 @@ class Orchestrator:
         set_budget_limit: str | None = None,
     ) -> dict:
         state = self._execute_locked(lambda: self._resume_locked(
+            continue_from=continue_from,
             recovery_action=recovery_action,
             verified_claude_cost_usd=verified_claude_cost_usd,
             confirm_provider_inactive=confirm_provider_inactive,
@@ -3163,6 +3205,7 @@ class Orchestrator:
     def _resume_locked(
         self,
         *,
+        continue_from: str | None = None,
         recovery_action: str | None = None,
         verified_claude_cost_usd: float | None = None,
         confirm_provider_inactive: bool = False,
@@ -3177,15 +3220,27 @@ class Orchestrator:
         self._load(preflight_tracing=True)
         initial_workflow_status = self.state.get("status")
         if self.state.get("status") == "awaiting_approval":
+            if continue_from is not None:
+                raise WorkflowError("A workflow awaiting approval cannot continue from another stage.")
             if budget_change_requested:
                 raise WorkflowError("Budget changes are available only when resuming a saved failed stage.")
             return self.state
         if self.state.get("status") == "complete":
-            self._verify_delivery_integrity()
-            self._verify_delivery_artifact_hash()
-            if budget_change_requested:
-                raise WorkflowError("Budget changes are available only when resuming a saved failed stage.")
-            return self.state
+            self._verify_completed_workflow()
+            if continue_from is None:
+                if budget_change_requested:
+                    raise WorkflowError("Budget changes are available only when resuming a saved failed stage.")
+                return self.state
+        if continue_from is not None and initial_workflow_status not in {"failed", "complete"}:
+            raise WorkflowError("Continue-from is available only for a failed or completed workflow.")
+        if continue_from is not None and (
+            not isinstance(continue_from, str) or not continue_from.strip()
+        ):
+            raise WorkflowError("--continue-from must name a workflow stage.")
+        if continue_from is not None and (recovery_action is not None or verified_claude_cost_usd is not None):
+            raise WorkflowError("Resolve interrupted operations with resume before using --continue-from.")
+        if continue_from is not None and budget_change_requested:
+            raise WorkflowError("Budget changes cannot be combined with --continue-from.")
         recovery_resolved = False
         if self.state.get("status") == "recovery_required":
             self._resolve_recovery(
@@ -3197,8 +3252,12 @@ class Orchestrator:
             )
             recovery_resolved = True
         elif self.state.get("status") == "running":
+            if continue_from is not None:
+                raise WorkflowError("Continue-from cannot be combined with an interrupted workflow.")
             if recovery_action is not None:
                 raise WorkflowError("No recovery action is pending for this workflow.")
+        elif self.state.get("status") == "complete" and continue_from is not None:
+            pass
         elif self.state.get("status") != "failed":
             raise WorkflowError(f"Workflow cannot resume from status {self.state.get('status')!r}.")
         elif recovery_action is not None or verified_claude_cost_usd is not None:
@@ -3246,6 +3305,12 @@ class Orchestrator:
                 self._save()
                 raise WorkflowError(self.state["error"])
         self._begin_execution_trace("resume")
+        if continue_from is not None:
+            self._continue_workflow_from(continue_from)
+            self.state["status"] = "running"
+            self.state["error"] = None
+            self._save()
+            return self.run_pending()
         self.state["status"] = "running"
         self.state["error"] = None
         self._save()
@@ -3284,6 +3349,25 @@ class Orchestrator:
             and (initial_workflow_status in {"running", "failed", "recovery_required"} or recovery_resolved)
         )
         return self.run_pending()
+
+    def _continue_workflow_from(self, stage_id: str) -> None:
+        try:
+            definition = _definition_from_snapshot(self.state.get("workflow_definition"))
+            execution = self._ensure_workflow_execution(definition)
+            services = self._production_stage_services()
+            registry = _production_stages.build_stage_registry(
+                (stage.implementation for stage in definition.stages), services, self._run_stage_action,
+            )
+            engine = WorkflowEngine(registry, self._persist_workflow_execution)
+            engine.continue_from(
+                definition,
+                execution,
+                stage_id,
+                rerun_allowed=self._engine_rerun_stage_allowed,
+                requested_at=now(),
+            )
+        except WorkflowDefinitionError as exc:
+            raise WorkflowError(f"Cannot continue from stage {stage_id!r}: {exc}") from exc
 
     def _execute_locked(self, operation: Callable[[], dict], *, target_lock: bool | str = False) -> dict:
         try:
@@ -3414,8 +3498,7 @@ class Orchestrator:
         if self.state.get("status") == "complete":
             integrity = self.state.setdefault("integrity", {})
             try:
-                self._verify_delivery_integrity()
-                self._verify_delivery_artifact_hash()
+                self._verify_completed_workflow()
             except WorkflowError as exc:
                 integrity["delivery_artifact_status"] = "integrity_failure"
                 integrity["delivery_artifact_error"] = redact(str(exc))
@@ -3432,6 +3515,36 @@ class Orchestrator:
             raise WorkflowError("The delivered report is missing or unreadable.") from exc
         if not isinstance(expected, str) or actual != expected:
             raise WorkflowError("The delivered report changed after the workflow completed.")
+
+    def _verify_completed_workflow(self) -> None:
+        """Verify completion according to the persisted workflow's configured terminal stage."""
+        definition = _definition_from_snapshot(self.state.get("workflow_definition"))
+        execution = self.state.get("workflow_execution")
+        if isinstance(execution, dict) and execution.get("status") != "complete":
+            raise WorkflowError("Workflow state says complete while the workflow engine is incomplete.")
+        stage_ids = {stage.stage_id for stage in definition.stages}
+        if "complete" in stage_ids or (
+            not isinstance(execution, dict) and self.state.get("workflow_name") == "legacy-default"
+        ):
+            self._verify_delivery_integrity()
+            self._verify_delivery_artifact_hash()
+            return
+        if "delivery" in stage_ids or "report" in stage_ids:
+            self._verify_delivery_artifact_hash()
+        if "delivery" in stage_ids and self.state.get("traceability_required") is not True:
+            verification = self.state.get("integrity", {}).get("verification_result", {})
+            if not isinstance(verification, dict) or verification.get("status") != "verified":
+                raise WorkflowError("Delivery verification is missing or invalid.")
+        final = self.state.get("execution_fingerprint", {}).get("final", {}).get("target", {})
+        current = self._fingerprint_repository(self.target)
+        if (final.get("status") != "captured" or current.get("status") != "captured"
+                or final.get("commit_sha") != current.get("commit_sha")
+                or final.get("working_tree_sha256") != current.get("working_tree_sha256")):
+            raise WorkflowError("The target changed after workflow completion.")
+        if "report" in stage_ids:
+            evidence = self.state.get("integrity", {}).get("review_evidence", {})
+            if not isinstance(evidence, dict) or evidence.get("target_working_tree_sha256") != final.get("working_tree_sha256"):
+                raise WorkflowError("Review report provenance no longer matches the completed target.")
 
     def _run_codex(self, prompt: str, *, sandbox: str) -> str:
         metadata = {"provider": "codex", "operation": "codex_execution", "sandbox": sandbox}
@@ -4138,7 +4251,8 @@ class Orchestrator:
         shared = {
             "Assignment": self.state["task"],
             "Approved proposal": self.state["proposal"],
-            "Implementation summary": self.state["implementation_summary"],
+            "Implementation summary": self.state.get("implementation_summary")
+            or "No implementation stage ran in this read-only review workflow.",
             "Repository context": self._repository_context_for_claude(
                 guidance, list(review_diff.included_paths),
             ),
@@ -4146,8 +4260,8 @@ class Orchestrator:
                 guidance,
                 stage="code_review",
                 context="\n".join((
-                    self.state.get("task", ""), self.state.get("proposal", ""),
-                    self.state.get("implementation_summary", ""), *review_diff.included_paths,
+                    self.state.get("task") or "", self.state.get("proposal") or "",
+                    self.state.get("implementation_summary") or "", *review_diff.included_paths,
                 )),
                 include_skill_content=self._claude_skill_content_authorized(),
             ),
@@ -4509,6 +4623,13 @@ class Orchestrator:
             raise WorkflowError(f"Workflow is blocked at {current_stage}: {redact(str(reason))}")
         if result.get("status") != "complete":
             raise WorkflowError(f"Workflow engine returned an unsupported status: {result.get('status')!r}.")
+        self.state["status"] = "complete"
+        self.state["completed_at"] = self.state.get("completed_at") or now()
+        self._capture_final_target_fingerprint()
+        gate = self.state.get("commitment_gate")
+        if isinstance(gate, dict):
+            gate["workflow_status"] = "complete"
+        self._save()
         return self.state
 
     def _ensure_workflow_execution(self, definition: WorkflowDefinition) -> dict:
@@ -4653,6 +4774,7 @@ class Orchestrator:
             delivery=_stage_services.DeliveryStageServices(
                 state=self.state,
                 target=self.target,
+                fingerprint_repository=self._fingerprint_repository,
                 delivery_path=self.delivery_path,
                 verify_delivery_integrity=self._verify_delivery_integrity,
                 capture_final_target_fingerprint=self._capture_final_target_fingerprint,

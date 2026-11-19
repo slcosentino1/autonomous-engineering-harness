@@ -88,7 +88,8 @@ def _execute_code_review_or_verification(stage_input: StageInput, services) -> S
             "Claude reported no acceptance-blocking findings; no correction run was needed."
         )
     verification_dispositions = None
-    if purpose == "verification" and no_blocking_findings:
+    correction_attempts = services.state.get("correction_attempts", [])
+    if purpose == "verification" and no_blocking_findings and correction_attempts:
         history = services.state.get("review_campaign_history", [])
         original_campaign = next((
             item for item in reversed(history)
@@ -117,8 +118,9 @@ def _execute_code_review_or_verification(stage_input: StageInput, services) -> S
             integrity["verification_result"] = {
                 "status": "verified",
                 "campaign_id": campaign.get("campaign_id"),
-                "original_campaign_id": (services.state.get("correction_attempts") or [{}])[-1].get(
-                    "original_campaign_id",
+                "original_campaign_id": (
+                    (correction_attempts or [{}])[-1].get("original_campaign_id")
+                    if correction_attempts else None
                 ),
                 "checked_at": services.now(),
                 "report_sha256": hashlib.sha256(report.encode("utf-8")).hexdigest(),

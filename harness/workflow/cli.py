@@ -185,66 +185,58 @@ def main(
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
-    start = commands.add_parser("start", help="Create a proposal, review it, and wait for approval")
-    start.add_argument("--target", required=True, help="Absolute Git repository root")
-    task = start.add_mutually_exclusive_group(required=True)
-    task.add_argument("--task", help="Assignment text")
-    task.add_argument("--task-file", help="UTF-8 file containing the assignment")
-    start.add_argument("--workflow-id", help="Optional stable ID")
-    start.add_argument(
-        "--workflow", default="full-development",
-        help="Registered workflow profile (the current repository policy permits full-development)",
-    )
-    overrides = start.add_mutually_exclusive_group()
-    overrides.add_argument("--skip", action="append", default=[], metavar="STAGE",
-                           help="Skip a stage only when the profile and repository policy permit it")
-    overrides.add_argument("--stages", metavar="A,B,C",
-                           help="Select an ordered comma-separated stage list")
-    start.add_argument("--budget-usd", type=float, default=DEFAULT_CLAUDE_BUDGET_USD,
-                       help=f"Total cap for Claude/Aily calls (default: ${DEFAULT_CLAUDE_BUDGET_USD:.2f})")
-    start.add_argument(
-        "--max-code-review-calls",
-        type=lambda value: code_review_calls_arg(value, maximum=max_authorized_code_review_calls),
-        default=DEFAULT_MAX_CODE_REVIEW_CALLS,
-        help=(f"Maximum calls in the Claude code-review campaign, including integration review "
-              f"(default: {DEFAULT_MAX_CODE_REVIEW_CALLS}; maximum: {max_authorized_code_review_calls})"),
-    )
-    start.add_argument(
-        "--max-codex-calls",
-        type=lambda value: bounded_integer_arg(
-            value, name="Codex calls", maximum=MAX_AUTHORIZED_CODEX_CALLS,
-        ),
-        default=DEFAULT_MAX_CODEX_CALLS,
-        help=f"Maximum Codex invocations for this workflow (default: {DEFAULT_MAX_CODEX_CALLS})",
-    )
-    start.add_argument(
-        "--codex-timeout-seconds",
-        type=lambda value: bounded_integer_arg(
-            value, name="Codex timeout", maximum=MAX_PROVIDER_TIMEOUT_SECONDS,
-        ),
-        default=DEFAULT_CODEX_TIMEOUT_SECONDS,
-        help=f"Per-call Codex timeout in seconds (default: {DEFAULT_CODEX_TIMEOUT_SECONDS})",
-    )
-    start.add_argument(
-        "--claude-timeout-seconds",
-        type=lambda value: bounded_integer_arg(
-            value, name="Claude timeout", maximum=MAX_PROVIDER_TIMEOUT_SECONDS,
-        ),
-        default=DEFAULT_CLAUDE_TIMEOUT_SECONDS,
-        help=f"Per-call Claude/Aily timeout in seconds (default: {DEFAULT_CLAUDE_TIMEOUT_SECONDS})",
-    )
-    start.add_argument(
-        "--workflow-timeout-seconds",
-        type=lambda value: bounded_integer_arg(
-            value, name="workflow timeout", maximum=MAX_WORKFLOW_TIMEOUT_SECONDS,
-        ),
-        default=DEFAULT_WORKFLOW_TIMEOUT_SECONDS,
-        help=f"Maximum active workflow time in seconds (default: {DEFAULT_WORKFLOW_TIMEOUT_SECONDS})",
-    )
-    start.add_argument("--codex", default=CODEX_EXECUTABLE)
-    start.add_argument("--aily", default=claude_reviewer.AILY_EXECUTABLE)
-    start.add_argument("--model", help="Optional Codex model; omit to use the CLI's configured default")
-    start.add_argument("--trace", action="store_true", help="Enable metadata-only Langfuse tracing for this workflow")
+    def add_workflow_arguments(command_parser: argparse.ArgumentParser) -> None:
+        command_parser.add_argument("--target", required=True, help="Absolute Git repository root")
+        task_group = command_parser.add_mutually_exclusive_group(required=True)
+        task_group.add_argument("--task", help="Assignment text")
+        task_group.add_argument("--task-file", help="UTF-8 file containing the assignment")
+        command_parser.add_argument("--workflow-id", help="Optional stable ID")
+        command_parser.add_argument(
+            "--workflow", default="full-development",
+            help="Registered workflow profile, or auto to use the assessment recommendation",
+        )
+        overrides = command_parser.add_mutually_exclusive_group()
+        overrides.add_argument("--skip", action="append", default=[], metavar="STAGE[,STAGE...]",
+                               help="Skip a stage only when optional and allowed by repository policy")
+        overrides.add_argument("--stages", metavar="A,B,C",
+                               help="Select an ordered stage subset; dependencies are included automatically")
+        command_parser.add_argument("--budget-usd", type=float, default=DEFAULT_CLAUDE_BUDGET_USD,
+                                   help=f"Total cap for Claude/Aily calls (default: ${DEFAULT_CLAUDE_BUDGET_USD:.2f})")
+        command_parser.add_argument(
+            "--max-code-review-calls",
+            type=lambda value: code_review_calls_arg(value, maximum=max_authorized_code_review_calls),
+            default=DEFAULT_MAX_CODE_REVIEW_CALLS,
+        )
+        command_parser.add_argument(
+            "--max-codex-calls",
+            type=lambda value: bounded_integer_arg(value, name="Codex calls", maximum=MAX_AUTHORIZED_CODEX_CALLS),
+            default=DEFAULT_MAX_CODEX_CALLS,
+        )
+        command_parser.add_argument(
+            "--codex-timeout-seconds",
+            type=lambda value: bounded_integer_arg(value, name="Codex timeout", maximum=MAX_PROVIDER_TIMEOUT_SECONDS),
+            default=DEFAULT_CODEX_TIMEOUT_SECONDS,
+        )
+        command_parser.add_argument(
+            "--claude-timeout-seconds",
+            type=lambda value: bounded_integer_arg(value, name="Claude timeout", maximum=MAX_PROVIDER_TIMEOUT_SECONDS),
+            default=DEFAULT_CLAUDE_TIMEOUT_SECONDS,
+        )
+        command_parser.add_argument(
+            "--workflow-timeout-seconds",
+            type=lambda value: bounded_integer_arg(value, name="workflow timeout", maximum=MAX_WORKFLOW_TIMEOUT_SECONDS),
+            default=DEFAULT_WORKFLOW_TIMEOUT_SECONDS,
+        )
+        command_parser.add_argument("--codex", default=CODEX_EXECUTABLE)
+        command_parser.add_argument("--aily", default=claude_reviewer.AILY_EXECUTABLE)
+        command_parser.add_argument("--model", help="Optional Codex model")
+        command_parser.add_argument("--trace", action="store_true",
+                                    help="Enable metadata-only Langfuse tracing for this workflow")
+
+    start = commands.add_parser("start", help="Start a workflow under its selected approval policy")
+    add_workflow_arguments(start)
+    run = commands.add_parser("run", help="Execute a workflow profile; mandatory policy may pause for approval")
+    add_workflow_arguments(run)
 
     github = commands.add_parser("github", help="Exchange imported workflow tasks and status with GitHub")
     github_commands = github.add_subparsers(dest="github_command", required=True)
@@ -315,6 +307,10 @@ def main(
                 help="UTF-8 file containing additional conditions attached to human approval",
             )
         if name == "resume":
+            command.add_argument(
+                "--continue-from", metavar="STAGE",
+                help="Explicitly rerun a completed stage and its dependents after checking saved evidence",
+            )
             budget = command.add_mutually_exclusive_group()
             budget.add_argument(
                 "--extend-budget", metavar="AMOUNT",
@@ -371,17 +367,31 @@ def main(
 
     args = parser.parse_args(argv)
     try:
-        if args.command == "start":
+        if args.command in {"start", "run"}:
             task = task_text(args, workflow_error=workflow_error)
+            skipped_stages = tuple(
+                stage.strip() for value in args.skip for stage in value.split(",")
+            )
             selected_stages = (
                 tuple(item.strip() for item in args.stages.split(",")) if args.stages is not None else None
             )
             try:
                 workflow_selection = resolve_workflow_selection(
-                    args.workflow, task, skip_stages=tuple(args.skip), selected_stages=selected_stages,
+                    args.workflow, task, skip_stages=skipped_stages, selected_stages=selected_stages,
                 )
             except ValueError as exc:
                 raise workflow_error(str(exc)) from exc
+            definition, _snapshot, assessment, policy = workflow_selection
+            print(f"Resolved workflow: {definition.name}")
+            print("Stages: " + " -> ".join(stage.stage_id for stage in definition.stages))
+            print(
+                f"Assessment: {assessment.complexity} complexity, {assessment.risk} risk; "
+                f"recommended {assessment.recommended_workflow}."
+            )
+            print(
+                f"Policy: proposal {'required' if policy.proposal_required else 'not required'}, "
+                f"approval {'required' if policy.approval_required else 'not required'}; {policy.reason}"
+            )
             if args.trace:
                 from observability.langfuse import LangfusePreflightError, preflight_langfuse_tracing
 
@@ -398,8 +408,8 @@ def main(
                 workflow_timeout_seconds=args.workflow_timeout_seconds,
                 workflow_id=args.workflow_id, codex=args.codex, aily=args.aily, model=args.model,
                 tracing_enabled=args.trace or tracing_enabled_from_environment(),
-                workflow_name=args.workflow,
-                skip_stages=tuple(args.skip),
+                workflow_name=definition.name,
+                skip_stages=skipped_stages,
                 selected_stages=selected_stages,
                 workflow_selection=workflow_selection,
             )
@@ -410,7 +420,7 @@ def main(
                 f"Authorized execution limits: workflow {args.workflow_timeout_seconds}s; "
                 f"Codex {args.codex_timeout_seconds}s/call; Claude/Aily {args.claude_timeout_seconds}s/call"
             )
-            state = runner.start()
+            state = runner.run() if args.command == "run" else runner.start()
         elif args.command == "github":
             if args.github_command == "import":
                 if args.trace:
@@ -484,11 +494,15 @@ def main(
                 state = runner.approve(conditions=conditions)
             elif args.command == "resume":
                 recovery_arguments = {
-                    "recovery_action": args.recovery_action,
-                    "verified_claude_cost_usd": args.verified_claude_cost_usd,
-                    "confirm_provider_inactive": args.confirm_provider_inactive,
-                    "confirm_process_inactive": args.confirm_process_inactive,
-                    "confirm_target_reviewed": args.confirm_target_reviewed,
+                    key: value for key, value in {
+                        "continue_from": args.continue_from,
+                        "recovery_action": args.recovery_action,
+                        "verified_claude_cost_usd": args.verified_claude_cost_usd,
+                        "confirm_provider_inactive": args.confirm_provider_inactive,
+                        "confirm_process_inactive": args.confirm_process_inactive,
+                        "confirm_target_reviewed": args.confirm_target_reviewed,
+                    }.items()
+                    if value is not None and value is not False
                 }
                 if args.extend_budget is not None:
                     recovery_arguments["extend_budget"] = args.extend_budget

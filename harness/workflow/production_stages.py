@@ -8,10 +8,19 @@ from dataclasses import dataclass
 from workflow.engine import StageInput, StageRegistry, StageResult
 from workflow.errors import WorkflowError
 from workflow.stage_services import ProductionStageServices
-from workflow.stages.delivery import _execute_delivery
-from workflow.stages.implementation import _execute_correction, _execute_implementation
+from workflow.stages.delivery import _execute_delivery, _execute_profile_delivery, _execute_review_report
+from workflow.stages.implementation import (
+    _execute_correction,
+    _execute_implementation,
+    _execute_task_correction,
+    _execute_task_implementation,
+    _execute_tests,
+    _execute_test_verification,
+)
 from workflow.stages.planning import (
+    _execute_assessment,
     _execute_human_revision,
+    _execute_investigation,
     _execute_noop,
     _execute_plan_refinement,
     _execute_plan_review,
@@ -31,6 +40,15 @@ class _ProductionImplementation:
 
 
 _IMPLEMENTATIONS = {
+    "assessment": _ProductionImplementation("planning", _execute_assessment),
+    "investigation": _ProductionImplementation("planning", _execute_investigation),
+    "task_implementation": _ProductionImplementation("implementation", _execute_task_implementation),
+    "tests": _ProductionImplementation("implementation", _execute_tests),
+    "test_verification": _ProductionImplementation("implementation", _execute_test_verification),
+    "task_correction": _ProductionImplementation("implementation", _execute_task_correction),
+    "review": _ProductionImplementation("review", _execute_code_review_or_verification),
+    "report": _ProductionImplementation("delivery", _execute_review_report),
+    "profile_delivery": _ProductionImplementation("delivery", _execute_profile_delivery),
     "revision_request": _ProductionImplementation("planning", _execute_noop),
     "plan_review_2_request": _ProductionImplementation("planning", _execute_noop),
     "revision_plan_review_request": _ProductionImplementation("planning", _execute_noop),

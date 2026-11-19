@@ -726,6 +726,83 @@ class WorkflowEngine:
         self._save(state)
         return invalidated
 
+    def continue_from(
+        self,
+        definition: WorkflowDefinition,
+        state: dict[str, Any],
+        stage_id: str,
+        *,
+        rerun_allowed: Callable[[str, Mapping[str, Any]], bool],
+        requested_at: str,
+    ) -> set[str]:
+        """Invalidate a completed stage and its dependents for an explicit continuation."""
+        self.registry.validate_definition(definition)
+        if state.get("definition") != definition_snapshot(definition):
+            raise WorkflowDefinitionError("Saved workflow definition does not match the selected definition.")
+        records = state.get("stages")
+        if not isinstance(records, dict):
+            raise WorkflowDefinitionError("Saved stage execution state is invalid.")
+        stage = next((item for item in definition.stages if item.stage_id == stage_id), None)
+        if stage is None:
+            raise WorkflowDefinitionError(f"Unknown stage: {stage_id}")
+        stage_record = records.get(stage_id)
+        allowed_start_statuses = {
+            StageStatus.COMPLETED.value, StageStatus.SKIPPED.value,
+            StageStatus.NOT_APPLICABLE.value, StageStatus.FAILED.value,
+        }
+        if not isinstance(stage_record, dict) or stage_record.get("status") not in allowed_start_statuses:
+            raise WorkflowDefinitionError(
+                "Continue-from requires a completed, skipped, not-applicable, or failed stage."
+            )
+        affected = {stage_id}
+        changed = True
+        while changed:
+            changed = False
+            for candidate in definition.stages:
+                if candidate.stage_id not in affected and any(
+                    dependency.stage_id in affected for dependency in candidate.dependencies
+                ):
+                    affected.add(candidate.stage_id)
+                    changed = True
+        for affected_id in affected:
+            record = records.get(affected_id)
+            if not isinstance(record, dict):
+                continue
+            status = record.get("status")
+            if status in {StageStatus.RUNNING.value, StageStatus.BLOCKED.value}:
+                raise WorkflowDefinitionError(
+                    f"Cannot continue from {stage_id!r} while dependent stage {affected_id!r} "
+                    "requires recovery."
+                )
+            if status in {
+                StageStatus.COMPLETED.value, StageStatus.SKIPPED.value,
+                StageStatus.NOT_APPLICABLE.value, StageStatus.FAILED.value,
+            } and not rerun_allowed(affected_id, record):
+                raise WorkflowDefinitionError(
+                    f"Continue-from is not authorized to rerun stage {affected_id!r}."
+                )
+        previous = state.get("continuation_history", [])
+        if not isinstance(previous, list):
+            raise WorkflowDefinitionError("Saved continuation history is invalid.")
+        state["continuation_history"] = [
+            *previous,
+            {
+                "stage_id": stage_id,
+                "invalidated_stages": [item.stage_id for item in definition.stages
+                                       if item.stage_id in affected],
+                "requested_at": requested_at,
+            },
+        ]
+        try:
+            self.invalidate_dependents(definition, state, stage_id)
+        except Exception:
+            if previous:
+                state["continuation_history"] = previous
+            else:
+                state.pop("continuation_history", None)
+            raise
+        return affected
+
     @staticmethod
     def _dependency_failure(
         stage: StageDefinition,
