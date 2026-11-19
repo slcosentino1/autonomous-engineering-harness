@@ -7,11 +7,11 @@ import json
 from workflow import planning_review as _planning_review
 from workflow.errors import WorkflowError
 from workflow.review import _safe_review_path
-from workflow.engine import StageInput
-from workflow.stage_services import ProductionStageServices
+from workflow.engine import StageInput, StageResult
 
 
-def _execute_code_review_or_verification(stage_input: StageInput, services, stage: str) -> None:
+def _execute_code_review_or_verification(stage_input: StageInput, services) -> StageResult:
+    stage = str(stage_input.configuration.get("legacy_stage", stage_input.definition.stage_id))
     purpose = "verification" if stage == "verification" else "initial"
     services.require_write_operation_target(purpose)
     review_diff = services.review_diff(services.state, services.target)
@@ -125,7 +125,6 @@ def _execute_code_review_or_verification(stage_input: StageInput, services, stag
                 "finding": "No unresolved blocking findings were reported.",
                 "original_finding_dispositions": verification_dispositions,
             }
-            services.state["stage"] = "complete"
         else:
             integrity["verification_result"] = {
                 "status": "failed",
@@ -138,8 +137,7 @@ def _execute_code_review_or_verification(stage_input: StageInput, services, stag
             raise WorkflowError(
                 "Independent post-correction verification found unresolved or new blocking findings; delivery is blocked."
             )
-    elif no_blocking_findings:
-        services.state["stage"] = "complete"
-    else:
-        services.state["stage"] = "correction"
     services.save()
+    if purpose == "verification":
+        return StageResult(output={"verified": True})
+    return StageResult(output={"has_findings": not no_blocking_findings})

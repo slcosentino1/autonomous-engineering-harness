@@ -32,6 +32,7 @@ from workflow import review as review_contracts  # noqa: E402
 from workflow import workspace as workspace_ops  # noqa: E402
 from workflow import persistence as persistence_ops  # noqa: E402
 from workflow import codex_evidence  # noqa: E402
+from workflow.stages import planning as planning_stages  # noqa: E402
 
 
 def git(root: Path, *args: str) -> str:
@@ -1757,6 +1758,23 @@ class WorkflowTests(unittest.TestCase):
                 path.write_text(content, encoding="utf-8")
         codex.on_call = implementation
 
+    def approved_workflow_for_persistence_test(self, workflow_id: str):
+        codex = FakeCodex(
+            "# Proposal\n\n## Approach\nImplement the requested change.\n", self.refined(),
+            "Implementation summary.\n",
+        )
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05),
+            claude_reviewer.ReviewResult("Decision: APPROVED\nNo code findings.", 0.05),
+        )
+        runner = orchestrator.Orchestrator(
+            self.target, task="Implement a persistence test change", budget_usd=1.0,
+            workflow_id=workflow_id, process_runner=codex, claude_runner=claude,
+        )
+        self.implement_files(codex, {"src/persistence_case.py": "value = 'saved'\n"})
+        self.assertEqual(runner.start()["status"], "awaiting_approval")
+        return runner, codex, claude
+
     def test_proposal_approval_binds_the_user_visible_ledger_snapshot(self):
         codex = FakeCodex("# Proposal\nPlan.\n", self.refined())
         claude = FakeClaude(claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05))
@@ -1924,6 +1942,135 @@ class WorkflowTests(unittest.TestCase):
         ).resume()
         self.assertEqual(resumed["status"], "awaiting_approval")
         self.assertEqual(len(codex.commands), 2)
+
+    def test_stage_start_persistence_interruption_retries_without_provider_history(self):
+        runner, codex, _claude = self.approved_workflow_for_persistence_test("persist-stage-start")
+        original_save = runner._save
+        original_finish_runtime = runner._finish_workflow_runtime
+        interrupted = False
+
+        def interrupt_stage_start():
+            nonlocal interrupted
+            execution = runner.state.get("workflow_execution", {})
+            record = execution.get("stages", {}).get("implementation", {})
+            attempts = record.get("attempts", [])
+            if (not interrupted and record.get("status") == "running" and attempts
+                    and attempts[-1].get("status") == "running"):
+                interrupted = True
+                raise SystemExit()
+            original_save()
+
+        runner._save = interrupt_stage_start
+        runner._finish_workflow_runtime = lambda: None
+        with self.assertRaises(SystemExit):
+            runner.approve()
+        runner._save = original_save
+        runner._finish_workflow_runtime = original_finish_runtime
+
+        persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["workflow_execution"]["stages"]["implementation"]["status"], "pending")
+        self.assertFalse(any(op.get("stage") == "implementation" for op in persisted["operation_history"]))
+        self.assertEqual(len(codex.commands), 2)
+
+        resumed = runner.resume()
+        self.assertEqual(resumed["status"], "complete")
+        self.assertEqual(len(codex.commands), 3)
+
+    def test_operation_start_persistence_interruption_is_safe_to_retry(self):
+        runner, codex, _claude = self.approved_workflow_for_persistence_test("persist-operation-start")
+        original_save = runner._save
+        original_finish_runtime = runner._finish_workflow_runtime
+        interrupted = False
+
+        def interrupt_operation_start():
+            nonlocal interrupted
+            operation = next(iter(reversed(runner.state.get("operation_history", []))), {})
+            if (not interrupted and operation.get("stage") == "implementation"
+                    and operation.get("status") == "started"
+                    and operation.get("launch_state") == "not_started"):
+                interrupted = True
+                raise SystemExit()
+            original_save()
+
+        runner._save = interrupt_operation_start
+        runner._finish_workflow_runtime = lambda: None
+        with self.assertRaises(SystemExit):
+            runner.approve()
+        runner._save = original_save
+        runner._finish_workflow_runtime = original_finish_runtime
+
+        persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertFalse(any(op.get("stage") == "implementation" for op in persisted["operation_history"]))
+        self.assertEqual(len(codex.commands), 2)
+
+        resumed = runner.resume()
+        self.assertEqual(resumed["status"], "complete")
+        self.assertEqual(len(codex.commands), 3)
+
+    def test_operation_outcome_persistence_interruption_requires_recovery(self):
+        runner, codex, _claude = self.approved_workflow_for_persistence_test("persist-operation-outcome")
+        original_save = runner._save
+        original_finish_runtime = runner._finish_workflow_runtime
+        interrupted = False
+
+        def interrupt_operation_outcome():
+            nonlocal interrupted
+            operation = next(iter(reversed(runner.state.get("operation_history", []))), {})
+            if (not interrupted and operation.get("stage") == "implementation"
+                    and operation.get("status") == "completed"
+                    and operation.get("result_text") is not None):
+                interrupted = True
+                raise SystemExit()
+            original_save()
+
+        runner._save = interrupt_operation_outcome
+        runner._finish_workflow_runtime = lambda: None
+        with self.assertRaises(SystemExit):
+            runner.approve()
+        runner._save = original_save
+        runner._finish_workflow_runtime = original_finish_runtime
+
+        persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        operation = persisted["operation_history"][-1]
+        self.assertEqual(operation["status"], "started")
+        self.assertIsNone(operation["result_text"])
+        self.assertNotEqual(persisted["workflow_execution"]["status"], "complete")
+        with self.assertRaisesRegex(orchestrator.WorkflowError, "requires recovery"):
+            runner.resume()
+        self.assertEqual(len(codex.commands), 3)
+
+    def test_stage_result_persistence_interruption_reuses_durable_operation_result(self):
+        runner, codex, _claude = self.approved_workflow_for_persistence_test("persist-stage-result")
+        original_save = runner._save
+        original_finish_runtime = runner._finish_workflow_runtime
+        interrupted = False
+
+        def interrupt_stage_result():
+            nonlocal interrupted
+            execution = runner.state.get("workflow_execution", {})
+            record = execution.get("stages", {}).get("implementation", {})
+            attempts = record.get("attempts", [])
+            if (not interrupted and record.get("status") == "completed" and attempts
+                    and attempts[-1].get("status") == "completed"):
+                interrupted = True
+                raise SystemExit()
+            original_save()
+
+        runner._save = interrupt_stage_result
+        runner._finish_workflow_runtime = lambda: None
+        with self.assertRaises(SystemExit):
+            runner.approve()
+        runner._save = original_save
+        runner._finish_workflow_runtime = original_finish_runtime
+
+        persisted = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["workflow_execution"]["stages"]["implementation"]["status"], "running")
+        self.assertEqual(persisted["operation_history"][-1]["status"], "completed")
+        self.assertEqual(persisted["operation_history"][-1]["result_text"], "Implementation summary.")
+
+        resumed = runner.resume()
+        self.assertEqual(resumed["status"], "complete")
+        self.assertEqual(len(codex.commands), 3)
 
     def test_crash_after_started_before_subprocess_launch_is_safe_to_resume(self):
         runner = orchestrator.Orchestrator(
@@ -3866,7 +4013,9 @@ class WorkflowTests(unittest.TestCase):
             )
             authorization["scope_sha256"] = orchestrator.authorization_scope_digest(authorization)
             runner._save()
-            header, sections, metadata = runner._plan_review_prompt(2)
+            header, sections, metadata = planning_stages._plan_review_prompt(
+                runner._production_stage_services().planning, 2,
+            )
             report, manifest = runner._call_claude(header, "plan_review_2", sections, metadata=metadata)
 
         self.assertIn("No material plan concerns.", report)
@@ -4404,7 +4553,9 @@ class WorkflowTests(unittest.TestCase):
         )
         runner.start()
         with runner._workflow_lock():
-            header, sections, metadata = runner._plan_review_prompt(2)
+            header, sections, metadata = planning_stages._plan_review_prompt(
+                runner._production_stage_services().planning, 2,
+            )
             incomplete = dict(sections)
             incomplete.pop("Current proposal")
             with self.assertRaisesRegex(orchestrator.WorkflowError, "missing mandatory sections"):
@@ -4442,7 +4593,9 @@ class WorkflowTests(unittest.TestCase):
         )
         runner.start()
         with runner._workflow_lock():
-            header, sections, metadata = runner._plan_review_prompt(2)
+            header, sections, metadata = planning_stages._plan_review_prompt(
+                runner._production_stage_services().planning, 2,
+            )
             sections["Assignment"] += "é" * 110_000
             with patch.dict(os.environ, {claude_reviewer.MAX_REVIEW_PAYLOAD_ENV: "125000"}):
                 _report, manifest = runner._call_claude(
@@ -4690,7 +4843,7 @@ class WorkflowTests(unittest.TestCase):
             "- Finding: missing empty-input behavior.\n\nSecond plan review needed: no\n"
         )
         with self.assertRaisesRegex(orchestrator.WorkflowError, "decision and reason"):
-            orchestrator.Orchestrator._refined_proposal(incomplete)
+            planning_stages._refined_proposal(incomplete, orchestrator.clean_markdown)
 
     def test_complete_diff_is_not_truncated_and_oversize_fails_explicitly(self):
         content = "# complete diff marker\n" + ("line of relevant code\n" * 120)

@@ -7,11 +7,11 @@ import json
 from workflow import planning_review as _planning_review
 from workflow.errors import WorkflowError
 from workflow.review import _safe_review_path
-from workflow.engine import StageInput
-from workflow.stage_services import ProductionStageServices
+from workflow.engine import StageInput, StageResult
 
 
-def _execute_implementation(stage_input: StageInput, services, stage: str) -> None:
+def _execute_implementation(stage_input: StageInput, services) -> StageResult:
+    stage = str(stage_input.configuration.get("legacy_stage", stage_input.definition.stage_id))
     if services.approval_required() and not services.state.get("implementation_approved_at"):
         raise WorkflowError("Explicit human approval is required before implementation.")
     guidance = services.guidance()
@@ -70,10 +70,13 @@ def _execute_implementation(stage_input: StageInput, services, stage: str) -> No
         )
     services.state["implementation_summary"] = services.run_codex(prompt, sandbox="workspace-write")
     services.capture_commitment_evidence(services.state["implementation_summary"])
-    services.state["stage"] = "code_review"
     services.save()
+    return StageResult(output={"summary_sha256": hashlib.sha256(
+        str(services.state.get("implementation_summary") or "").encode("utf-8"),
+    ).hexdigest()})
 
-def _execute_correction(stage_input: StageInput, services, stage: str) -> None:
+def _execute_correction(stage_input: StageInput, services) -> StageResult:
+    stage = str(stage_input.configuration.get("legacy_stage", stage_input.definition.stage_id))
     guidance = services.guidance()
     campaign = services.state.get("review_campaign") or {}
     if campaign.get("status") != "complete":
@@ -164,5 +167,5 @@ def _execute_correction(stage_input: StageInput, services, stage: str) -> None:
     services.state["review_campaign"] = None
     services.state["review_campaign_id"] = None
     services.state["verification_report"] = None
-    services.state["stage"] = "verification"
     services.save()
+    return StageResult(output={"performed": True})

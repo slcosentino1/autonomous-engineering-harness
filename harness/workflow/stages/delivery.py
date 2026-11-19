@@ -7,11 +7,10 @@ import json
 from workflow import planning_review as _planning_review
 from workflow.errors import WorkflowError
 from workflow.review import _safe_review_path
-from workflow.engine import StageInput
-from workflow.stage_services import ProductionStageServices
+from workflow.engine import StageInput, StageResult
 
 
-def _execute_delivery(stage_input: StageInput, services, stage: str) -> None:
+def _execute_delivery(stage_input: StageInput, services) -> StageResult:
     delivery_verification = services.verify_delivery_integrity()
     services.capture_final_target_fingerprint()
     final_target = services.state.get("execution_fingerprint", {}).get("final", {}).get("target", {})
@@ -28,3 +27,4 @@ def _execute_delivery(stage_input: StageInput, services, stage: str) -> None:
     delivery_hash = hashlib.sha256(services.read_bytes(services.delivery_path)).hexdigest()
     services.state.setdefault("integrity", {})["delivery_artifact_sha256"] = delivery_hash
     services.save()
+    return StageResult(output={"delivered": True})

@@ -11,25 +11,25 @@ from typing import Any, Callable
 class PlanningStageServices:
     state: dict[str, Any]
     target: Path
-    approval_required: Callable[[], bool]
     call_claude: Callable[..., Any]
-    plan_review_prompt: Callable[..., Any]
     guidance: Callable[..., Any]
     guidance_for_codex: Callable[..., str]
+    guidance_for_claude: Callable[..., str]
+    claude_skill_content_authorized: Callable[[], bool]
+    repository_context_for_claude: Callable[..., str]
     run_codex: Callable[..., str]
     save: Callable[..., Any]
     write_proposal: Callable[..., Any]
     reassess_after_planning: Callable[..., Any]
     record_unvalidated_planning_output: Callable[..., Any]
-    refined_proposal: Callable[..., Any]
     validate_proposal_ledger: Callable[..., Any]
     clean_markdown: Callable[..., str]
-    review_history_for_prompt: Callable[..., str]
     valid_plan_reviews: Callable[..., list[dict]]
     now: Callable[[], str]
     architectural_decision_output: str
     commitment_ledger_guidance: str
     planning_principles: str
+    plan_review_guidance: str
 
 
 @dataclass(frozen=True)
@@ -93,7 +93,3 @@ class ProductionStageServices:
     implementation: ImplementationStageServices
     review: ReviewStageServices
     delivery: DeliveryStageServices
-    state: dict[str, Any]
-    valid_plan_reviews: Callable[[], list[dict]]
-    max_plan_reviews: int
-    clearly_no_review_findings: Callable[[str], bool]

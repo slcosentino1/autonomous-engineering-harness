@@ -195,9 +195,15 @@ def legacy_stage_id(
     record = stage_records.get(stage_id) if isinstance(stage_records, dict) else None
     if stage_id in allowed_adapters and isinstance(record, dict):
         legacy_id = record.get("legacy_stage_id")
-        if isinstance(legacy_id, str) and legacy_id in allowed_adapters[stage_id]:
+        if (not record.get("invalidated") and isinstance(legacy_id, str)
+                and legacy_id in allowed_adapters[stage_id]):
             return legacy_id
     if stage_id in {"plan_review_2_after_revision", "plan_refine_2_after_revision"}:
+        if stage_id == "plan_refine_2_after_revision":
+            prior_review = stage_records.get("plan_review_2_after_revision")
+            prior_review_stage = prior_review.get("legacy_stage_id") if isinstance(prior_review, dict) else None
+            if prior_review_stage in {"plan_review_1", "plan_review_2"}:
+                return "plan_refine_" + prior_review_stage.rsplit("_", 1)[1]
         current_stage = state.get("stage")
         current_prefix = "plan_review_" if stage_id == "plan_review_2_after_revision" else "plan_refine_"
         if current_stage in {current_prefix + "1", current_prefix + "2"}:

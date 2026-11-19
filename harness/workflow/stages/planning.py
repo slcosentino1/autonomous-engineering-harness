@@ -3,18 +3,49 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 
 from workflow import planning_review as _planning_review
 from workflow.errors import WorkflowError
 from workflow.review import _safe_review_path
-from workflow.engine import StageInput
-from workflow.stage_services import ProductionStageServices
+from workflow.engine import StageInput, StageResult
 
 
-def _execute_noop(stage_input: StageInput, services, stage: str) -> None:
-    pass
+def _current_stage(stage_input: StageInput) -> str:
+    return str(stage_input.configuration.get("legacy_stage", stage_input.definition.stage_id))
 
-def _execute_planning(stage_input: StageInput, services, stage: str) -> None:
+
+def _execute_noop(stage_input: StageInput, services) -> StageResult:
+    stage_id = stage_input.definition.stage_id
+    state = services.state
+    if stage_id == "revision_request":
+        output = {"requested": bool(state.get("human_feedback")),
+                  "proposal_sha256": state.get("proposal_artifact_sha256")}
+    elif stage_id == "plan_review_2_request":
+        prior = stage_input.predecessor_outputs.get("plan_refine_1", {})
+        revision = state.get("workflow_execution", {}).get("stages", {}).get("human_revision", {})
+        revision_applied = (
+            isinstance(revision, dict)
+            and revision.get("status") == "completed"
+            and bool(revision.get("attempts"))
+        )
+        limit = state.get("authorization", {}).get("claude_aily", {}).get("max_plan_reviews", 2)
+        output = {
+            "requested": len(services.valid_plan_reviews()) < limit
+            and (prior.get("second_review_needed") is True or revision_applied),
+            "proposal_sha256": state.get("proposal_artifact_sha256"),
+        }
+    elif stage_id == "revision_plan_review_request":
+        limit = state.get("authorization", {}).get("claude_aily", {}).get("max_plan_reviews", 2)
+        output = {"requested": len(services.valid_plan_reviews()) < limit,
+                  "proposal_sha256": state.get("proposal_artifact_sha256")}
+    else:
+        raise WorkflowError(f"Unsupported planning control stage: {stage_id}.")
+    return StageResult(output=output)
+
+
+def _execute_planning(stage_input: StageInput, services) -> StageResult:
+    stage = _current_stage(stage_input)
     guidance = services.guidance()
     skill_guidance = services.guidance_for_codex(
         guidance, stage=stage, context=stage_input.context.task,
@@ -42,12 +73,14 @@ def _execute_planning(stage_input: StageInput, services, stage: str) -> None:
     services.state["proposal_version"] = 1
     services.write_proposal(proposal)
     services.reassess_after_planning(proposal)
-    services.state["stage"] = "plan_review_1"
     services.save()
+    return StageResult(output={"proposal_version": 1,
+                               "proposal_sha256": services.state.get("proposal_artifact_sha256")})
 
-def _execute_plan_review(stage_input: StageInput, services, stage: str) -> None:
+def _execute_plan_review(stage_input: StageInput, services) -> StageResult:
+    stage = _current_stage(stage_input)
     iteration = int(stage[-1])
-    header, sections, metadata = services.plan_review_prompt(iteration)
+    header, sections, metadata = _plan_review_prompt(services, iteration)
     recoverable_context = next((
         context for context in reversed(services.state.get("claude_contexts", []))
         if context.get("stage") == stage
@@ -75,10 +108,12 @@ def _execute_plan_review(stage_input: StageInput, services, stage: str) -> None:
         "valid": True,
         "context_manifest": manifest,
     })
-    services.state["stage"] = f"plan_refine_{iteration}"
     services.save()
+    return StageResult(output={"valid": True,
+                               "proposal_sha256": services.state.get("proposal_artifact_sha256")})
 
-def _execute_plan_refinement(stage_input: StageInput, services, stage: str) -> None:
+def _execute_plan_refinement(stage_input: StageInput, services) -> StageResult:
+    stage = _current_stage(stage_input)
     iteration = int(stage[-1])
     review = next((record for record in reversed(services.state.get("plan_reviews", []))
                    if record.get("valid") is True and record.get("iteration") == iteration), None)
@@ -113,7 +148,7 @@ def _execute_plan_refinement(stage_input: StageInput, services, stage: str) -> N
     refined = services.run_codex(prompt, sandbox="read-only")
     next_proposal_version = int(services.state.get("proposal_version", 1)) + 1
     try:
-        proposal, review_again, dispositions = services.refined_proposal(refined)
+        proposal, review_again, dispositions = _refined_proposal(refined, services.clean_markdown)
         validated_ledger = services.validate_proposal_ledger(proposal)
     except WorkflowError as exc:
         services.record_unvalidated_planning_output(
@@ -130,17 +165,15 @@ def _execute_plan_refinement(stage_input: StageInput, services, stage: str) -> N
         "second_review_needed": review_again,
     })
     services.write_proposal(proposal, validated_ledger=validated_ledger)
-    if iteration == 1 and review_again:
-        services.state["stage"] = "plan_review_2"
-    elif services.approval_required():
-        services.state["status"] = "awaiting_approval"
-        services.state["stage"] = "implementation"
-    else:
-        services.state["status"] = "running"
-        services.state["stage"] = "implementation"
     services.save()
+    return StageResult(output={
+        "second_review_needed": review_again if iteration == 1 else False,
+        "revision_requested": False,
+        "proposal_sha256": services.state.get("proposal_artifact_sha256"),
+    })
 
-def _execute_human_revision(stage_input: StageInput, services, stage: str) -> None:
+def _execute_human_revision(stage_input: StageInput, services) -> StageResult:
+    stage = _current_stage(stage_input)
     guidance = services.guidance()
     skill_guidance = services.guidance_for_codex(
         guidance, stage=stage,
@@ -157,7 +190,7 @@ def _execute_human_revision(stage_input: StageInput, services, stage: str) -> No
         f"{services.architectural_decision_output}\n\n{services.planning_principles}\n\n{services.commitment_ledger_guidance}\n\n{skill_guidance}\n\n"
         f"Assignment:\n{services.state['task']}\n\nCurrent proposal (version "
         f"{services.state.get('proposal_version', 1)}):\n{services.state['proposal']}\n\n"
-        f"Prior review attempts:\n{services.review_history_for_prompt()}\n\n"
+        f"Prior review attempts:\n{_review_history_for_prompt(services.state)}\n\n"
         f"User feedback:\n{services.state['human_feedback']}"
     )
     services.state["proposal"] = services.clean_markdown(services.run_codex(prompt, sandbox="read-only"))
@@ -166,12 +199,112 @@ def _execute_human_revision(stage_input: StageInput, services, stage: str) -> No
     services.write_proposal(services.state["proposal"])
     authorized_plan_limit = services.state["authorization"]["claude_aily"]["max_plan_reviews"]
     valid_reviews = services.valid_plan_reviews()
-    if len(valid_reviews) < authorized_plan_limit:
-        services.state["stage"] = f"plan_review_{len(valid_reviews) + 1}"
-    elif services.approval_required():
-        services.state["status"] = "awaiting_approval"
-        services.state["stage"] = "implementation"
-    else:
-        services.state["status"] = "running"
-        services.state["stage"] = "implementation"
     services.save()
+    return StageResult(output={
+        "revision_applied": True,
+        "proposal_sha256": hashlib.sha256(
+            str(services.state.get("proposal") or "").encode("utf-8"),
+        ).hexdigest(),
+    })
+
+
+def _plan_review_prompt(services, iteration: int) -> tuple[str, dict[str, str], dict]:
+    state = services.state
+    limit = state["authorization"]["claude_aily"]["max_plan_reviews"]
+    version = int(state.get("proposal_version", 1))
+    guidance = services.guidance()
+    proposal_for_review = state["proposal"]
+    disposition_heading = re.search(
+        r"(?im)^\s*##\s+Claude finding dispositions\s*$", proposal_for_review,
+    )
+    if disposition_heading:
+        proposal_for_review = proposal_for_review[:disposition_heading.start()].rstrip()
+    header = (
+        "Act as an independent Senior Software Architect reviewing a proposal. Inspect the complete assignment, "
+        "current proposal, repository context, workflow constraints, and listed skill guidance. "
+        "Do not rely on prior review conclusions or Codex dispositions; they are withheld. Give evidence-based "
+        "findings and a scorecard. Do not implement code."
+    )
+    sections = {
+        "Review metadata": (
+            f"Plan review iteration {iteration} of at most {limit}; proposal version {version}; "
+            "all required context sections below are complete."
+        ),
+        "Assignment": state["task"],
+        "Current proposal": proposal_for_review,
+        "Repository context": services.repository_context_for_claude(guidance),
+        "Workflow constraints": (
+            f"Target: {services.target}. The proposal is awaiting human approval; implementation is not authorized "
+            "until the user approves it. The workflow does not authorize commits, pushes, merges, deployments, "
+            "publication, shared-infrastructure changes, or access to unrelated repositories. Preserve the "
+            "existing assignment and workflow budget."
+        ),
+        "Engineering Judgment & Proportional Design": services.planning_principles,
+        "Relevant skills": services.guidance_for_claude(
+            guidance,
+            stage="plan_review",
+            context="\n".join((state.get("task", ""), state.get("proposal", ""))),
+            include_skill_content=services.claude_skill_content_authorized(),
+        ),
+        "Review duties": services.plan_review_guidance,
+        "Independence boundary": (
+            "Prior Claude reports and Codex finding dispositions are deliberately withheld from this review. "
+            "Base the assessment on the assignment and current proposal supplied here. The proposal's revision "
+            "number is context only; do not infer that earlier conclusions were correct."
+        ),
+    }
+    metadata = {"iteration": iteration, "proposal_version": version, "header_id": "plan-review-v2"}
+    return header, sections, metadata
+
+
+def _review_history_for_prompt(state: dict) -> str:
+    records = state.get("plan_reviews", [])
+    if not records:
+        return "No previous Claude plan-review attempts."
+    decisions = state.get("plan_review_decisions", [])
+    parts = []
+    for record in records:
+        iteration = record.get("iteration", "unknown")
+        if record.get("valid") is not True or not record.get("context_manifest"):
+            report_hash = hashlib.sha256(record.get("report", "").encode("utf-8")).hexdigest()
+            parts.append(
+                f"Invalidated attempt {record.get('attempt', iteration)} (logical iteration {iteration}): "
+                f"{record.get('invalidated_reason', 'context completeness is unverified')}\n"
+                f"Codex disposition: {record.get('codex_disposition', 'Do not count or reuse its findings.')}\n"
+                f"The unverified report is retained in workflow state for audit only; SHA-256: {report_hash}."
+            )
+            continue
+        prior_decision = next((item for item in decisions if item.get("iteration") == iteration), None)
+        disposition = prior_decision.get("dispositions") if prior_decision else "No Codex disposition recorded."
+        parts.append(
+            f"Valid iteration {iteration}, proposal version {record.get('proposal_version')}:\n"
+            f"Claude findings:\n{record.get('report', '')}\n"
+            f"Codex finding dispositions:\n{disposition}"
+        )
+    return "\n\n".join(parts)
+
+
+def _refined_proposal(value: str, clean_markdown) -> tuple[str, bool, str]:
+    match = re.search(r"(?im)^\s*Second plan review needed:\s*(yes|no)\s*$", value)
+    if not match:
+        raise WorkflowError("Codex refinement must state whether a second plan review is needed.")
+    review_again = match.group(1).lower() == "yes"
+    proposal = value[:match.start()].strip()
+    if not proposal:
+        raise WorkflowError("Codex returned an empty refined proposal.")
+    disposition_heading = re.search(r"(?im)^##\s+Claude finding dispositions\s*$", proposal)
+    if not disposition_heading:
+        raise WorkflowError("Codex refinement is missing the required Claude finding dispositions section.")
+    dispositions = proposal[disposition_heading.end():].strip()
+    if not dispositions:
+        raise WorkflowError("Codex refinement has an empty Claude finding dispositions section.")
+    no_findings = re.search(r"(?im)^-\s*No actionable findings\.?\s*$", dispositions)
+    finding_decisions = re.findall(
+        r"(?im)^-\s*Finding:.*\|\s*Decision:\s*(?:incorporated|rejected|deferred)\s*\|\s*Reason:\s*.+$",
+        dispositions,
+    )
+    if not no_findings and not finding_decisions:
+        raise WorkflowError(
+            "Codex dispositions must list each finding with a decision and reason, or state that there were none."
+        )
+    return clean_markdown(proposal), review_again, dispositions

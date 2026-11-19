@@ -18,6 +18,7 @@ import time
 import tomllib
 import uuid
 from collections import Counter
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN, localcontext
 from pathlib import Path
@@ -1680,10 +1681,9 @@ class Orchestrator:
                 + ", ".join(paths)
             )
             self._mark_recovered_stage_completed(
-                "implementation", _production_stages.workflow_stage_output(
-                    "implementation", self.state, self._valid_plan_reviews,
-                    MAX_PLAN_REVIEWS, _clearly_no_review_findings,
-                ),
+                "implementation", {"summary_sha256": hashlib.sha256(
+                    self.state["implementation_summary"].encode("utf-8"),
+                ).hexdigest()},
                 resolution="human_accepted_current_target_for_independent_review",
             )
             operation["resolution"] = "human_accepted_current_target_for_independent_review"
@@ -4449,12 +4449,13 @@ class Orchestrator:
         try:
             definition = _definition_from_snapshot(self.state.get("workflow_definition"))
             execution = self._ensure_workflow_execution(definition)
-            registry = _production_stages.build_stage_registry({
-                stage.implementation: self._execute_registered_stage
-                for stage in definition.stages
-            })
-            engine = WorkflowEngine(registry, self._persist_workflow_execution)
             production_services = self._production_stage_services()
+            registry = _production_stages.build_stage_registry(
+                (stage.implementation for stage in definition.stages),
+                production_services,
+                self._run_stage_action,
+            )
+            engine = WorkflowEngine(registry, self._persist_workflow_execution)
             context = WorkflowContext(
                 workflow_id=self.workflow_id,
                 task=str(self.state.get("task") or ""),
@@ -4477,7 +4478,6 @@ class Orchestrator:
                     stage, self.state, self.target, self.proposal_path,
                     self._fingerprint_repository, _persistence.read_bytes,
                 ),
-                services={"production": production_services},
             )
         except WorkflowDefinitionError as exc:
             raise WorkflowError(f"Saved workflow execution is invalid: {exc}") from exc
@@ -4596,25 +4596,25 @@ class Orchestrator:
             planning=_stage_services.PlanningStageServices(
                 state=self.state,
                 target=self.target,
-                approval_required=self._approval_required,
                 call_claude=self._call_claude,
-                plan_review_prompt=self._plan_review_prompt,
                 guidance=self._guidance,
                 guidance_for_codex=_guidance_for_codex,
+                guidance_for_claude=_guidance_for_claude,
+                claude_skill_content_authorized=self._claude_skill_content_authorized,
+                repository_context_for_claude=self._repository_context_for_claude,
                 run_codex=self._run_codex,
                 save=self._save,
                 write_proposal=self._write_proposal,
                 reassess_after_planning=self._reassess_after_planning,
                 record_unvalidated_planning_output=self._record_unvalidated_planning_output,
-                refined_proposal=self._refined_proposal,
                 validate_proposal_ledger=self._validate_proposal_ledger,
                 clean_markdown=clean_markdown,
-                review_history_for_prompt=self._review_history_for_prompt,
                 valid_plan_reviews=self._valid_plan_reviews,
                 now=now,
                 architectural_decision_output=ARCHITECTURAL_DECISION_OUTPUT,
                 commitment_ledger_guidance=COMMITMENT_LEDGER_GUIDANCE,
                 planning_principles=PLANNING_PRINCIPLES,
+                plan_review_guidance=PLAN_REVIEW_GUIDANCE,
             ),
             implementation=_stage_services.ImplementationStageServices(
                 state=self.state,
@@ -4663,13 +4663,14 @@ class Orchestrator:
                 save=self._save,
                 now=now,
             ),
-            state=self.state,
-            valid_plan_reviews=self._valid_plan_reviews,
-            max_plan_reviews=MAX_PLAN_REVIEWS,
-            clearly_no_review_findings=_clearly_no_review_findings,
         )
 
-    def _execute_registered_stage(self, stage_input: StageInput) -> StageResult:
+    def _run_stage_action(
+        self,
+        stage_input: StageInput,
+        action: Callable[[StageInput, object], StageResult],
+        services: object,
+    ) -> StageResult:
         stage_id = stage_input.definition.stage_id
         legacy_stage_id = self._legacy_stage_id(stage_id)
         if not isinstance(legacy_stage_id, str) or legacy_stage_id not in TRACE_STAGES:
@@ -4682,25 +4683,24 @@ class Orchestrator:
                 and attempts[-1].get("execution_id") == stage_input.execution_id):
             attempts[-1]["legacy_stage_id"] = legacy_stage_id
             record["legacy_stage_id"] = legacy_stage_id
-        services = (
-            stage_input.services.get("production")
-            if isinstance(stage_input.services, Mapping) else None
-        )
-        if not isinstance(services, _stage_services.ProductionStageServices):
-            raise WorkflowError("WorkflowEngine did not provide production stage services.")
         self._set_stage(legacy_stage_id)
         previous_execution_id = self._active_stage_execution_id
         self._active_stage_execution_id = stage_input.execution_id
         try:
-            return self._run_stage_action(stage_input, legacy_stage_id, services)
+            action_input = replace(
+                stage_input,
+                configuration={**stage_input.configuration, "legacy_stage": legacy_stage_id},
+            )
+            return self._run_stage_body(action_input, action, services, legacy_stage_id)
         finally:
             self._active_stage_execution_id = previous_execution_id
 
-    def _run_stage_action(
+    def _run_stage_body(
         self,
         stage_input: StageInput,
+        action: Callable[[StageInput, object], StageResult],
+        services: object,
         stage: str,
-        services: _stage_services.ProductionStageServices,
     ) -> StageResult:
         result: StageResult | None = None
         if self.state.get("stage") != stage:
@@ -4712,7 +4712,7 @@ class Orchestrator:
         try:
             if self._workflow_runtime_remaining() <= 0:
                 raise WorkflowError("The authorized workflow execution-time limit is exhausted.")
-            result = _production_stages.execute_stage_action(stage_input, stage, services)
+            result = action(stage_input, services)
         except KeyboardInterrupt:
             if self.state.get("status") != "recovery_required":
                 operation = self._operation(self.state.get("active_operation_id"))
@@ -4794,109 +4794,6 @@ class Orchestrator:
         else:
             parts.append("No applicable AGENTS.md instructions were found in or above the target repository.")
         return "\n\n".join(parts)
-
-    def _review_history_for_prompt(self) -> str:
-        records = self.state.get("plan_reviews", [])
-        if not records:
-            return "No previous Claude plan-review attempts."
-        decisions = self.state.get("plan_review_decisions", [])
-        parts = []
-        for record in records:
-            iteration = record.get("iteration", "unknown")
-            if record.get("valid") is not True or not record.get("context_manifest"):
-                report_hash = hashlib.sha256(record.get("report", "").encode("utf-8")).hexdigest()
-                parts.append(
-                    f"Invalidated attempt {record.get('attempt', iteration)} (logical iteration {iteration}): "
-                    f"{record.get('invalidated_reason', 'context completeness is unverified')}\n"
-                    f"Codex disposition: {record.get('codex_disposition', 'Do not count or reuse its findings.')}\n"
-                    f"The unverified report is retained in workflow state for audit only; SHA-256: {report_hash}."
-                )
-                continue
-            prior_decision = next((item for item in decisions if item.get("iteration") == iteration), None)
-            disposition = prior_decision.get("dispositions") if prior_decision else "No Codex disposition recorded."
-            parts.append(
-                f"Valid iteration {iteration}, proposal version {record.get('proposal_version')}:\n"
-                f"Claude findings:\n{record.get('report', '')}\n"
-                f"Codex finding dispositions:\n{disposition}"
-            )
-        return "\n\n".join(parts)
-
-    def _plan_review_prompt(self, iteration: int) -> tuple[str, dict[str, str], dict]:
-        limit = self.state["authorization"]["claude_aily"]["max_plan_reviews"]
-        version = int(self.state.get("proposal_version", 1))
-        guidance = self._guidance()
-        proposal_for_review = self.state["proposal"]
-        disposition_heading = re.search(
-            r"(?im)^\s*##\s+Claude finding dispositions\s*$", proposal_for_review,
-        )
-        if disposition_heading:
-            proposal_for_review = proposal_for_review[:disposition_heading.start()].rstrip()
-        header = (
-            "Act as an independent Senior Software Architect reviewing a proposal. Inspect the complete assignment, "
-            "current proposal, repository context, workflow constraints, and listed skill guidance. "
-            "Do not rely on prior review conclusions or Codex dispositions; they are withheld. Give evidence-based "
-            "findings and a scorecard. Do not implement code."
-        )
-        sections = {
-            "Review metadata": (
-                f"Plan review iteration {iteration} of at most {limit}; proposal version {version}; "
-                "all required context sections below are complete."
-            ),
-            "Assignment": self.state["task"],
-            "Current proposal": proposal_for_review,
-            "Repository context": self._repository_context_for_claude(guidance),
-            "Workflow constraints": (
-                f"Target: {self.target}. The proposal is awaiting human approval; implementation is not authorized "
-                "until the user approves it. The workflow does not authorize commits, pushes, merges, deployments, "
-                "publication, shared-infrastructure changes, or access to unrelated repositories. Preserve the "
-                "existing assignment and workflow budget."
-            ),
-            "Engineering Judgment & Proportional Design": PLANNING_PRINCIPLES,
-            "Relevant skills": _guidance_for_claude(
-                guidance,
-                stage="plan_review",
-                context="\n".join((self.state.get("task", ""), self.state.get("proposal", ""))),
-                include_skill_content=self._claude_skill_content_authorized(),
-            ),
-            "Review duties": PLAN_REVIEW_GUIDANCE,
-            "Independence boundary": (
-                "Prior Claude reports and Codex finding dispositions are deliberately withheld from this review. "
-                "Base the assessment on the assignment and current proposal supplied here. The proposal's revision "
-                "number is context only; do not infer that earlier conclusions were correct."
-            ),
-        }
-        metadata = {
-            "iteration": iteration,
-            "proposal_version": version,
-            "header_id": "plan-review-v2",
-        }
-        return header, sections, metadata
-
-    @staticmethod
-    def _refined_proposal(value: str) -> tuple[str, bool, str]:
-        match = re.search(r"(?im)^\s*Second plan review needed:\s*(yes|no)\s*$", value)
-        if not match:
-            raise WorkflowError("Codex refinement must state whether a second plan review is needed.")
-        review_again = match.group(1).lower() == "yes"
-        proposal = value[:match.start()].strip()
-        if not proposal:
-            raise WorkflowError("Codex returned an empty refined proposal.")
-        disposition_heading = re.search(r"(?im)^##\s+Claude finding dispositions\s*$", proposal)
-        if not disposition_heading:
-            raise WorkflowError("Codex refinement is missing the required Claude finding dispositions section.")
-        dispositions = proposal[disposition_heading.end():].strip()
-        if not dispositions:
-            raise WorkflowError("Codex refinement has an empty Claude finding dispositions section.")
-        no_findings = re.search(r"(?im)^-\s*No actionable findings\.?\s*$", dispositions)
-        finding_decisions = re.findall(
-            r"(?im)^-\s*Finding:.*\|\s*Decision:\s*(?:incorporated|rejected|deferred)\s*\|\s*Reason:\s*.+$",
-            dispositions,
-        )
-        if not no_findings and not finding_decisions:
-            raise WorkflowError(
-                "Codex dispositions must list each finding with a decision and reason, or state that there were none."
-            )
-        return clean_markdown(proposal), review_again, dispositions
 
     def _delivery_report(self) -> str:
         campaign = self.state.get("review_campaign")
