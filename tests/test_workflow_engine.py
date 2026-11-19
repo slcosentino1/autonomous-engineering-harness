@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import sys
 import unittest
 from pathlib import Path
@@ -25,6 +26,7 @@ from workflow.engine import (
     WorkflowEngine,
     WorkflowContext,
     definition_snapshot,
+    definition_from_snapshot,
 )
 from workflow.policies import resolve_policies
 
@@ -61,6 +63,27 @@ class WorkflowEngineTests(unittest.TestCase):
         self.assertEqual(state["stages"]["a"]["status"], "completed")
         self.assertIn(["running"], saves)
 
+    def test_result_save_failure_leaves_durable_running_attempt_after_stage_start_save(self):
+        order: list[str] = []
+        registry = StageRegistry()
+        registry.register("work", RecordingStage("work", order))
+        definition = WorkflowDefinition("save-order", "test", 1, (StageDefinition("work", "work"),))
+        durable_snapshots = []
+
+        def save(state):
+            if not (state["stages"].get("work", {}).get("status") == "completed"):
+                durable_snapshots.append(copy.deepcopy(state))
+                return
+            raise OSError("injected result-save failure")
+
+        with self.assertRaisesRegex(OSError, "injected"):
+            WorkflowEngine(registry, save).execute(definition, WorkflowContext("wf", "task"))
+
+        persisted = durable_snapshots[-1]
+        self.assertEqual(persisted["stages"]["work"]["status"], "running")
+        self.assertTrue(persisted["stages"]["work"]["attempts"][0]["execution_id"])
+        self.assertEqual(order, ["work"])
+
     def test_full_development_definition_completes_with_conditional_correction_not_applicable(self):
         order: list[str] = []
         registry = StageRegistry()
@@ -72,6 +95,25 @@ class WorkflowEngineTests(unittest.TestCase):
         self.assertEqual(result["stages"]["correction"]["status"], "not_applicable")
         self.assertNotIn("correction", order)
         self.assertEqual(result["stages"]["complete"]["status"], "completed")
+
+    def test_invalid_stage_status_is_persisted_as_a_stage_failure(self):
+        class InvalidResult(RecordingStage):
+            def execute(self, stage_input):
+                return StageResult(status="completed")
+
+        registry = StageRegistry()
+        registry.register("invalid", InvalidResult("invalid", []))
+        definition = WorkflowDefinition("invalid-result", "test", 1, (
+            StageDefinition("work", "invalid"),
+        ))
+
+        result = WorkflowEngine(registry, lambda _state: None).execute(
+            definition, WorkflowContext("wf", "task"),
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["stages"]["work"]["status"], "failed")
+        self.assertEqual(result["stages"]["work"]["error"], "Stage raised WorkflowDefinitionError.")
 
     def test_registry_and_definition_validation_reject_duplicates_unknowns_and_bad_dependencies(self):
         registry = StageRegistry()
@@ -122,6 +164,48 @@ class WorkflowEngineTests(unittest.TestCase):
         self.assertEqual(result["stages"]["correction"]["status"], "not_applicable")
         self.assertEqual(result["stages"]["optional"]["status"], "skipped")
         self.assertNotEqual(result["stages"]["optional"]["status"], "completed")
+
+    def test_missing_condition_output_never_matches_not_equals(self):
+        order: list[str] = []
+        registry = StageRegistry()
+        registry.register("record", RecordingStage("record", order, StageResult(output={})))
+        definition = WorkflowDefinition("missing-output", "test", 1, (
+            StageDefinition("source", "record"),
+            StageDefinition(
+                "conditional", "record", (StageDependency("source"),),
+                run_when=StageCondition("source", ("missing",), "not_equals", "ready"),
+            ),
+        ))
+        result = WorkflowEngine(registry, lambda _state: None).execute(
+            definition, WorkflowContext("wf", "task"),
+        )
+        self.assertEqual(result["stages"]["conditional"]["status"], "not_applicable")
+        self.assertEqual(order, ["record"])
+
+    def test_configured_skip_is_persisted_and_requires_an_optional_stage(self):
+        order: list[str] = []
+        registry = StageRegistry()
+        registry.register("record", RecordingStage("record", order))
+        definition = WorkflowDefinition("skip", "test", 1, (
+            StageDefinition("optional", "record", config={"skip_requested": True}, optional=True, allow_skip=True),
+            StageDefinition("required", "record", (StageDependency("optional", accept_skipped=True),)),
+        ))
+        result = WorkflowEngine(registry, lambda _state: None).execute(
+            definition, WorkflowContext("wf", "task"),
+        )
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["stages"]["optional"]["status"], "skipped")
+        self.assertEqual(result["stages"]["optional"]["skipped_by"], "workflow_override")
+        self.assertEqual(result["stages"]["required"]["status"], "completed")
+        self.assertEqual(order, ["record"])
+
+        invalid = WorkflowDefinition("invalid-skip", "test", 1, (
+            StageDefinition("required", "record", config={"skip_requested": True}),
+        ))
+        with self.assertRaisesRegex(WorkflowDefinitionError, "cannot be skipped"):
+            WorkflowEngine(registry, lambda _state: None).execute(
+                invalid, WorkflowContext("wf", "task"),
+            )
 
     def test_warn_failure_keeps_failed_status_and_allows_dependents_to_continue(self):
         order: list[str] = []
@@ -377,6 +461,73 @@ class WorkflowEngineTests(unittest.TestCase):
         )
         self.assertTrue(decision.proposal_required)
         self.assertTrue(decision.approval_required)
+
+    def test_definition_snapshot_round_trips_and_rejects_tampering(self):
+        snapshot = definition_snapshot(FULL_DEVELOPMENT)
+        self.assertEqual(definition_from_snapshot(snapshot), FULL_DEVELOPMENT)
+        snapshot["name"] = "untrusted"
+        with self.assertRaisesRegex(WorkflowDefinitionError, "integrity check"):
+            definition_from_snapshot(snapshot)
+
+    def test_pause_before_stage_persists_pending_stage_and_resumes_after_gate(self):
+        order: list[str] = []
+        registry = StageRegistry()
+        registry.register("first", RecordingStage("first", order))
+        registry.register("second", RecordingStage("second", order))
+        definition = WorkflowDefinition("gated", "test", 1, (
+            StageDefinition("first", "first"),
+            StageDefinition("second", "second", (StageDependency("first"),)),
+        ))
+        engine = WorkflowEngine(registry, lambda _state: None)
+        context = WorkflowContext("wf", "task")
+        state = engine.execute(
+            definition, context, pause_before=lambda stage, _state: "approval required" if stage.stage_id == "second" else None,
+        )
+        self.assertEqual(state["status"], "paused")
+        self.assertEqual(state["waiting_stage"], "second")
+        self.assertEqual(state["stages"]["second"]["status"], "pending")
+        self.assertEqual(order, ["first"])
+
+        state = engine.execute(definition, context, state, pause_before=lambda _stage, _state: None)
+        self.assertEqual(state["status"], "complete")
+        self.assertEqual(order, ["first", "second"])
+
+    def test_recovered_running_stage_keeps_attempt_history_and_receives_contracts(self):
+        received = []
+
+        class CapturesInput(RecordingStage):
+            def execute(self, stage_input):
+                received.append(stage_input)
+                return StageResult(output={"stage": stage_input.definition.stage_id})
+
+        registry = StageRegistry()
+        registry.register("stage", CapturesInput("stage", []))
+        definition = WorkflowDefinition("recover", "test", 1, (
+            StageDefinition("work", "stage", config={"mode": "safe"}),
+        ))
+        context = WorkflowContext("wf", "task")
+        state = {
+            "definition": definition_snapshot(definition), "status": "running",
+            "stages": {"work": {
+                "status": "running", "attempts": [{"attempt": 1, "status": "running"}],
+            }},
+        }
+        services = {"read_artifact": lambda: "artifact"}
+        artifacts = {"target_fingerprint": "abc"}
+        result = WorkflowEngine(registry, lambda _state: None).execute(
+            definition, context, state,
+            resume_running_allowed=lambda _stage_id, _record: True,
+            services=services,
+            artifact_provider=lambda _stage, _outputs: artifacts,
+        )
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["stages"]["work"]["attempts"][0]["status"], "interrupted_recovered")
+        self.assertEqual(len(result["stages"]["work"]["attempts"]), 2)
+        self.assertEqual(received[0].attempt, 2)
+        self.assertEqual(received[0].execution_id, result["stages"]["work"]["attempts"][-1]["execution_id"])
+        self.assertEqual(received[0].configuration, {"mode": "safe"})
+        self.assertEqual(received[0].artifacts, artifacts)
+        self.assertIs(received[0].services, services)
 
 
 if __name__ == "__main__":

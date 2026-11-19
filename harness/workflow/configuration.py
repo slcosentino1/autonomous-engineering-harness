@@ -18,6 +18,17 @@ def resolve_workflow_selection(
     selected_stages: tuple[str, ...] | None = None,
 ) -> tuple[WorkflowDefinition, dict, Assessment, PolicyDecision]:
     """Resolve a profile and reject overrides that weaken trusted repository gates."""
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("A workflow profile name is required.")
+    if not isinstance(skip_stages, tuple) or any(
+        not isinstance(stage, str) or not stage.strip() for stage in skip_stages
+    ):
+        raise ValueError("Skipped stage IDs must be non-empty strings.")
+    if selected_stages is not None and (
+        not isinstance(selected_stages, tuple)
+        or any(not isinstance(stage, str) or not stage.strip() for stage in selected_stages)
+    ):
+        raise ValueError("Selected stage IDs must be non-empty strings.")
     if skip_stages and selected_stages is not None:
         raise ValueError("Use either --skip or --stages, not both.")
     if len(set(skip_stages)) != len(skip_stages):
@@ -32,14 +43,32 @@ def resolve_workflow_selection(
         unknown = [stage for stage in selected_stages if stage not in stages_by_id]
         if unknown:
             raise ValueError("Unknown selected stages: " + ", ".join(unknown))
-        definition = replace(definition, stages=tuple(stages_by_id[stage] for stage in selected_stages))
+        included = set(selected_stages)
+        pending = list(selected_stages)
+        while pending:
+            stage = stages_by_id[pending.pop()]
+            for dependency in stage.dependencies:
+                if dependency.stage_id not in included:
+                    included.add(dependency.stage_id)
+                    pending.append(dependency.stage_id)
+        definition = replace(definition, stages=tuple(
+            stage for stage in definition.stages if stage.stage_id in included
+        ))
     elif skip_stages:
         unknown = [stage for stage in skip_stages if stage not in stages_by_id]
         if unknown:
             raise ValueError("Unknown skipped stages: " + ", ".join(unknown))
         skipped = set(skip_stages)
+        forbidden = [
+            stage for stage in skip_stages
+            if not (stages_by_id[stage].optional and stages_by_id[stage].allow_skip)
+        ]
+        if forbidden:
+            raise ValueError("Required stages cannot be skipped: " + ", ".join(forbidden))
         definition = replace(definition, stages=tuple(
-            stage for stage in definition.stages if stage.stage_id not in skipped
+            replace(stage, config={**stage.config, "skip_requested": True})
+            if stage.stage_id in skipped else stage
+            for stage in definition.stages
         ))
 
     included = {stage.stage_id for stage in definition.stages}

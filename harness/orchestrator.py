@@ -21,7 +21,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN, localcontext
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
 from workflow import workspace as _workspace
 
@@ -39,7 +39,25 @@ from workflow import assessment as _assessment
 from workflow import cli as _cli
 from workflow import configuration as _configuration
 from workflow import definitions as _definitions
-from workflow.engine import definition_snapshot as _definition_snapshot
+from workflow import production_stages as _production_stages
+from workflow import recovery as _recovery
+from workflow import legacy_compatibility as _legacy_compatibility
+from workflow import stage_artifacts as _stage_artifacts
+from workflow import stage_services as _stage_services
+from workflow.errors import WorkflowError
+from workflow.engine import (
+    StageInput,
+    StageRegistry,
+    StageResult,
+    StageStatus,
+    WorkflowContext,
+    WorkflowDefinition,
+    WorkflowEngine,
+    WorkflowDefinitionError,
+    _json_sha256,
+    definition_from_snapshot as _definition_from_snapshot,
+    definition_snapshot as _definition_snapshot,
+)
 from workflow import persistence as _persistence
 from workflow import policies as _policies
 from workflow import process_locks as _process_locks
@@ -120,7 +138,9 @@ MAX_OPERATION_HISTORY = 100
 MAX_EXECUTION_CHANGE_EXAMPLES = 10
 TRACE_STAGES = frozenset({
     "planning", "plan_review_1", "plan_review_2", "plan_refine_1", "plan_refine_2",
-    "human_revision", "implementation", "code_review", "correction", "verification", "complete",
+    "revision_request", "plan_review_2_request", "human_revision", "implementation", "code_review",
+    "revision_plan_review_request", "plan_review_2_after_revision", "plan_refine_2_after_revision",
+    "correction", "verification", "complete",
 })
 CODEX_EXECUTABLE = _cli.CODEX_EXECUTABLE
 PLANNING_PRINCIPLES = """Engineering Judgment & Proportional Design
@@ -234,10 +254,6 @@ CLAUDE_DATA_SCOPE = _authorization.CLAUDE_DATA_SCOPE
 RESTRICTED_OPERATIONS = _authorization.RESTRICTED_OPERATIONS
 SECRET_PATTERNS = claude_reviewer.SECRET_PATTERNS
 SENSITIVE_NAMES = _workspace.SENSITIVE_NAMES
-
-
-class WorkflowError(RuntimeError):
-    """An actionable workflow error."""
 
 
 def _workspace_error(call):
@@ -870,6 +886,9 @@ class Orchestrator:
         self.skip_stages = tuple(skip_stages)
         self.selected_stages = tuple(selected_stages) if selected_stages is not None else None
         self.workflow_selection = workflow_selection
+        self._engine_retry_authorized = False
+        self._engine_resume_authorized = False
+        self._active_stage_execution_id: str | None = None
         if self.skip_stages and self.selected_stages is not None:
             raise WorkflowError("Use either --skip or --stages, not both.")
         self._tracer = None
@@ -895,7 +914,26 @@ class Orchestrator:
         if self.workflow_selection is not None:
             if not isinstance(self.workflow_selection, tuple) or len(self.workflow_selection) != 4:
                 raise WorkflowError("Resolved workflow selection is invalid.")
-            return self.workflow_selection
+            definition, snapshot, assessment, policy = self.workflow_selection
+            try:
+                _definitions.validate_persisted_definition(definition)
+                if (definition.name != self.workflow_name
+                        or snapshot != _definition_snapshot(definition)
+                        or not isinstance(assessment, _assessment.Assessment)
+                        or assessment != _assessment.assess_task(self.task or "")
+                        or not isinstance(policy, _policies.PolicyDecision)):
+                    raise WorkflowDefinitionError("Resolved workflow selection is inconsistent.")
+                expected_policy = _policies.resolve_policies(
+                    proposal_policy=definition.proposal_policy,
+                    approval_policy=definition.approval_policy,
+                    assessment=assessment,
+                    constraints=_definitions.RepositoryWorkflowConstraints(),
+                )
+                if policy != expected_policy:
+                    raise WorkflowDefinitionError("Resolved workflow policy decision is inconsistent.")
+            except (TypeError, ValueError, WorkflowDefinitionError) as exc:
+                raise WorkflowError("Resolved workflow selection is invalid or conflicts with repository policy.") from exc
+            return definition, snapshot, assessment, policy
         try:
             return _configuration.resolve_workflow_selection(
                 self.workflow_name, self.task or "", skip_stages=self.skip_stages,
@@ -1113,6 +1151,7 @@ class Orchestrator:
             "operation_id": uuid.uuid4().hex,
             "operation_type": operation_type,
             "stage": self.state.get("stage"),
+            "stage_execution_id": self._active_stage_execution_id,
             "status": "started",
             "started_at": now(),
             "finished_at": None,
@@ -1640,6 +1679,13 @@ class Orchestrator:
                 "The user inspected and accepted the current target changes for independent review. Changed paths: "
                 + ", ".join(paths)
             )
+            self._mark_recovered_stage_completed(
+                "implementation", _production_stages.workflow_stage_output(
+                    "implementation", self.state, self._valid_plan_reviews,
+                    MAX_PLAN_REVIEWS, _clearly_no_review_findings,
+                ),
+                resolution="human_accepted_current_target_for_independent_review",
+            )
             operation["resolution"] = "human_accepted_current_target_for_independent_review"
             operation["human_accepted_target_fingerprint"] = accepted_fingerprint
             operation["resolved_at"] = now()
@@ -1794,16 +1840,25 @@ class Orchestrator:
                 )
             self.state["resource_usage"] = usage
         self._resource_usage()
-        if not isinstance(self.state.get("workflow_definition"), dict):
+        if not isinstance(self.state.get("workflow_execution"), dict):
             self.state["workflow_name"] = "legacy-default"
             self.state["workflow_definition"] = _definition_snapshot(
                 _definitions.LEGACY_DEFAULT_WORKFLOW,
             )
-            self.state["engine_version"] = 1
+            self.state["engine_version"] = 2
+        try:
+            saved_definition = _definition_from_snapshot(self.state.get("workflow_definition"))
+            _definitions.validate_persisted_definition(saved_definition)
+        except WorkflowDefinitionError as exc:
+            raise WorkflowError(f"Saved workflow definition is not authorized: {exc}") from exc
+        if self.state.get("workflow_name") != saved_definition.name:
+            raise WorkflowError("Saved workflow name does not match its pinned definition.")
+        execution = self.state.get("workflow_execution")
+        if isinstance(execution, dict) and execution.get("definition") != _definition_snapshot(saved_definition):
+            raise WorkflowError("Saved workflow execution does not match its pinned definition.")
         if "assessment" not in self.state:
             task = self.state.get("task")
-            definition = self.state.get("workflow_definition", {})
-            if isinstance(task, str) and isinstance(definition, dict):
+            if isinstance(task, str) and task.strip():
                 legacy_assessment = _assessment.assess_task(task)
                 evaluated_at = self.state.get("created_at") or now()
                 self.state["assessment"] = legacy_assessment.to_dict()
@@ -1814,12 +1869,20 @@ class Orchestrator:
             definition = self.state.get("workflow_definition", {})
             if isinstance(definition, dict):
                 try:
-                    legacy_policy = _policies.resolve_policies(
-                        proposal_policy=definition.get("proposal_policy", "required"),
-                        approval_policy=definition.get("approval_policy", "always"),
-                        assessment=_assessment.assessment_from_dict(self.state.get("assessment")),
-                        constraints=_definitions.RepositoryWorkflowConstraints(),
-                    )
+                    if "assessment" in self.state:
+                        legacy_policy = _policies.resolve_policies(
+                            proposal_policy=definition.get("proposal_policy", "required"),
+                            approval_policy=definition.get("approval_policy", "always"),
+                            assessment=_assessment.assessment_from_dict(self.state.get("assessment")),
+                            constraints=_definitions.RepositoryWorkflowConstraints(),
+                        )
+                    elif (definition.get("proposal_policy") == "required"
+                            and definition.get("approval_policy") == "always"):
+                        legacy_policy = _policies.PolicyDecision(
+                            True, True, "Repository policy gates remain authoritative.",
+                        )
+                    else:
+                        legacy_policy = None
                 except (TypeError, ValueError):
                     legacy_policy = None
                 if legacy_policy is not None:
@@ -1856,6 +1919,15 @@ class Orchestrator:
                 "phase": "legacy_load",
                 "decisions": copy.deepcopy(self.state["policy_decisions"]),
             })
+        decisions = self.state.get("policy_decisions")
+        if (not isinstance(decisions, dict)
+                or not isinstance(decisions.get("proposal"), dict)
+                or decisions["proposal"].get("required") is not True
+                or decisions["proposal"].get("policy") != saved_definition.proposal_policy
+                or not isinstance(decisions.get("approval"), dict)
+                or decisions["approval"].get("required") is not True
+                or decisions["approval"].get("policy") != saved_definition.approval_policy):
+            raise WorkflowError("Saved workflow policy decisions do not satisfy repository constraints.")
         return authorization
 
     def _load(self, *, preflight_tracing: bool = False) -> None:
@@ -2356,6 +2428,12 @@ class Orchestrator:
             "correction_attempts": [],
             "recovery": None,
         }
+        self.state["workflow_execution"] = {
+            "definition": copy.deepcopy(definition_data),
+            "status": "running",
+            "stages": {},
+        }
+        self.state["engine_version"] = 2
         self._save()
         self._begin_execution_trace("start")
         return self.run_pending()
@@ -2438,8 +2516,33 @@ class Orchestrator:
         self.state["project_guidance"] = _project_guidance(self.target, self.state["task"])
         self.state["human_feedback"] = feedback.strip()
         self.state["status"] = "running"
-        self.state["stage"] = "human_revision"
+        self.state["stage"] = "revision_request"
         self.state["error"] = None
+        definition = _definition_from_snapshot(self.state.get("workflow_definition"))
+        execution = self._ensure_workflow_execution(definition)
+        request_record = execution.get("stages", {}).get("revision_request")
+        if not isinstance(request_record, dict):
+            raise WorkflowError("The saved workflow does not contain a revision-request stage.")
+        request_record.update(status=StageStatus.PENDING.value)
+        for key in ("output", "input_sha256", "output_sha256", "error"):
+            request_record.pop(key, None)
+        for stage_id in (
+            "human_revision", "revision_plan_review_request",
+            "plan_review_2_after_revision", "plan_refine_2_after_revision",
+        ):
+            record = execution.get("stages", {}).get(stage_id)
+            if not isinstance(record, dict):
+                continue
+            record["status"] = StageStatus.PENDING.value
+            for key in (
+                "output", "input_sha256", "output_sha256", "input_artifacts", "error",
+                "legacy_stage_id", "rerun_required", "warning_accepted", "skipped_by",
+            ):
+                record.pop(key, None)
+        execution["status"] = "running"
+        execution.pop("waiting_stage", None)
+        execution.pop("waiting_reason", None)
+        self.state["workflow_execution"] = execution
         self._save()
         return self.run_pending()
 
@@ -3072,6 +3175,7 @@ class Orchestrator:
         if extend_budget is not None and set_budget_limit is not None:
             raise WorkflowError("Choose only one of --extend-budget or --set-budget-limit.")
         self._load(preflight_tracing=True)
+        initial_workflow_status = self.state.get("status")
         if self.state.get("status") == "awaiting_approval":
             if budget_change_requested:
                 raise WorkflowError("Budget changes are available only when resuming a saved failed stage.")
@@ -3145,6 +3249,40 @@ class Orchestrator:
         self.state["status"] = "running"
         self.state["error"] = None
         self._save()
+        execution = self.state.get("workflow_execution")
+        records = execution.get("stages", {}) if isinstance(execution, dict) else {}
+        current_stage = self.state.get("stage")
+        stage_record = records.get(current_stage) if isinstance(records, dict) else None
+        unresolved_records = [
+            record for record in records.values()
+            if isinstance(record, dict) and (
+                record.get("status") in {StageStatus.FAILED.value, StageStatus.RUNNING.value}
+                or (record.get("status") == StageStatus.BLOCKED.value
+                    and isinstance(record.get("attempts"), list) and record["attempts"]
+                    and isinstance(record["attempts"][-1], dict)
+                    and record["attempts"][-1].get("status") == StageStatus.FAILED.value)
+            )
+        ] if isinstance(records, dict) else []
+        if len(unresolved_records) == 1:
+            stage_record = unresolved_records[0]
+        if not isinstance(stage_record, dict) and isinstance(current_stage, str):
+            legacy_stage = self._legacy_stage_id(current_stage)
+            stage_record = records.get(legacy_stage) if isinstance(records, dict) else None
+        saved_stage_status = stage_record.get("status") if isinstance(stage_record, dict) else None
+        if saved_stage_status is None:
+            saved_stage_status = (
+                "failed" if initial_workflow_status == "failed" else "running"
+            )
+        self._engine_retry_authorized = saved_stage_status == StageStatus.FAILED.value
+        if saved_stage_status == StageStatus.BLOCKED.value and isinstance(stage_record, dict):
+            attempts = stage_record.get("attempts", [])
+            self._engine_retry_authorized = bool(
+                attempts and attempts[-1].get("status") == StageStatus.FAILED.value
+            )
+        self._engine_resume_authorized = (
+            saved_stage_status == StageStatus.RUNNING.value
+            and (initial_workflow_status in {"running", "failed", "recovery_required"} or recovery_resolved)
+        )
         return self.run_pending()
 
     def _execute_locked(self, operation: Callable[[], dict], *, target_lock: bool | str = False) -> dict:
@@ -4304,540 +4442,336 @@ class Orchestrator:
             return self._run_pending_stages()
         finally:
             self._finish_workflow_runtime()
+            self._engine_retry_authorized = False
+            self._engine_resume_authorized = False
 
     def _run_pending_stages(self) -> dict:
-        while self.state.get("status") == "running":
-            stage = self.state["stage"]
-            stage_label = stage if isinstance(stage, str) and stage in TRACE_STAGES else "unknown"
-            stage_started = time.monotonic()
-            stage_context = self._trace_span("workflow.stage", {"stage": stage_label})
-            stage_context.__enter__()
-            try:
-                if self._workflow_runtime_remaining() <= 0:
-                    raise WorkflowError("The authorized workflow execution-time limit is exhausted.")
-                if stage == "planning":
-                    guidance = self._guidance()
-                    skill_guidance = _guidance_for_codex(
-                        guidance, stage=stage, context=self.state["task"],
-                    )
-                    prompt = (
-                        "Understand the assignment and this repository. Use the applicable instruction and skill "
-                        "content supplied below; inspect relevant target files. Do not merely list skills: apply "
-                        "relevant guidance and record each selected skill and its use. If none apply, say so. "
-                        "Make reasonable technical decisions, identify requirements, edge cases, and verification. "
-                        "Apply Engineering Judgment & Proportional Design. Separate must implement, should implement, "
-                        "future production considerations, and out of scope. Do not invent product behavior. "
-                        "Return a concise, readable Markdown implementation proposal with scope, approach, risks, "
-                        "a requirements-to-design mapping, material architectural decisions and their trade-offs, "
-                        "relevant skills and how they were applied, and concrete validation commands. Include the "
-                        "approved-design commitment classifications and the required machine-readable ledger below. "
-                        "Do not modify "
-                        "files or run tests.\n\n"
-                        f"{COMMITMENT_LEDGER_GUIDANCE}\n\n"
-                        f"{skill_guidance}\n\n"
-                        f"{PLANNING_PRINCIPLES}\n\nTarget: {self.target}\n\nAssignment:\n{self.state['task']}"
-                    )
-                    prompt = f"{ARCHITECTURAL_DECISION_OUTPUT}\n\n{prompt}"
-                    proposal = clean_markdown(self._run_codex(prompt, sandbox="read-only"))
-                    self.state["proposal"] = proposal
-                    self.state["proposal_version"] = 1
-                    self._write_proposal(proposal)
-                    self._reassess_after_planning(proposal)
-                    self.state["stage"] = "plan_review_1"
-                    self._save()
-                elif stage in {"plan_review_1", "plan_review_2"}:
-                    iteration = int(stage[-1])
-                    header, sections, metadata = self._plan_review_prompt(iteration)
-                    recoverable_context = next((
-                        context for context in reversed(self.state.get("claude_contexts", []))
-                        if context.get("stage") == stage
-                        and context.get("proposal_version") == metadata["proposal_version"]
-                        and context.get("call_state") == "completed"
-                        and isinstance(context.get("report"), str)
-                        and context.get("report")
-                        and not any(
-                            review.get("context_manifest", {}).get("prompt_sha256")
-                            == context.get("prompt_sha256")
-                            for review in self.state.get("plan_reviews", [])
-                        )
-                    ), None)
-                    if recoverable_context is not None:
-                        report, manifest = recoverable_context["report"], recoverable_context
-                    else:
-                        report, manifest = self._call_claude(header, stage, sections, metadata=metadata)
-                    report, _scorecard = _planning_review.normalize_scorecard(report)
-                    self.state["plan_reviews"].append({
-                        "attempt": len(self.state.get("plan_reviews", [])) + 1,
-                        "iteration": iteration,
-                        "proposal_version": metadata["proposal_version"],
-                        "report": report,
-                        "time": now(),
-                        "valid": True,
-                        "context_manifest": manifest,
-                    })
-                    self.state["stage"] = f"plan_refine_{iteration}"
-                    self._save()
-                elif stage in {"plan_refine_1", "plan_refine_2"}:
-                    iteration = int(stage[-1])
-                    review = next((record for record in reversed(self.state.get("plan_reviews", []))
-                                   if record.get("valid") is True and record.get("iteration") == iteration), None)
-                    if review is None:
-                        raise WorkflowError(f"No valid Claude plan review exists for iteration {iteration}.")
-                    report = review["report"]
-                    guidance = self._guidance()
-                    skill_guidance = _guidance_for_codex(
-                        guidance, stage=stage,
-                        context="\n".join((self.state["task"], self.state["proposal"], report)),
-                    )
-                    prompt = (
-                        "Evaluate every distinct finding in this valid Claude plan-review report. For each, explicitly "
-                        "mark incorporated, rejected, or deferred and give a reason. Incorporate valid in-scope "
-                        "recommendations; do not turn optional production advice into assignment requirements. "
-                        "Return the complete refined proposal as readable Markdown, retaining requirements mapping, "
-                        "material architectural decisions and trade-offs, scope distinctions, and the relevant skills "
-                        "and their application. Preserve or update the machine-readable commitment ledger to reflect "
-                        "the refined proposal without converting optional or future advice into obligations. Put a section titled "
-                        "`## Claude finding dispositions` at the end of the proposal. Use one bullet for every finding "
-                        "in this format: `- Finding: ... | Decision: incorporated/rejected/deferred | Reason: ...`. "
-                        "If there are none, write `- No actionable findings.` Apply Engineering Judgment & "
-                        "Proportional Design. Add one final "
-                        "line exactly in this form: `Second plan review needed: yes` or `...: no`. Use yes only when "
-                        "a material plan change needs a second independent plan review.\n\n"
-                        f"{ARCHITECTURAL_DECISION_OUTPUT}\n\n{PLANNING_PRINCIPLES}\n\n{skill_guidance}\n\n"
-                        f"{COMMITMENT_LEDGER_GUIDANCE}\n\n"
-                        f"Assignment:\n{self.state['task']}\n\nCurrent proposal (version "
-                        f"{self.state.get('proposal_version', 1)}):\n{self.state['proposal']}\n\n"
-                        f"Claude review (iteration {iteration}, proposal version {review.get('proposal_version')}):\n{report}"
-                    )
-                    refined = self._run_codex(prompt, sandbox="read-only")
-                    next_proposal_version = int(self.state.get("proposal_version", 1)) + 1
-                    try:
-                        proposal, review_again, dispositions = self._refined_proposal(refined)
-                        validated_ledger = self._validate_proposal_ledger(proposal)
-                    except WorkflowError as exc:
-                        self._record_unvalidated_planning_output(
-                            refined, exc, stage=stage, proposal_version=next_proposal_version,
-                        )
-                        raise
-                    self.state["proposal"] = proposal
-                    self.state["proposal_version"] = next_proposal_version
-                    self._reassess_after_planning(proposal)
-                    self.state.setdefault("plan_review_decisions", []).append({
-                        "iteration": iteration,
-                        "proposal_version": self.state["proposal_version"],
-                        "dispositions": dispositions,
-                    })
-                    self._write_proposal(proposal, validated_ledger=validated_ledger)
-                    if iteration == 1 and review_again:
-                        self.state["stage"] = "plan_review_2"
-                    elif self._approval_required():
-                        self.state["status"] = "awaiting_approval"
-                        self.state["stage"] = "implementation"
-                    else:
-                        self.state["status"] = "running"
-                        self.state["stage"] = "implementation"
-                    self._save()
-                elif stage == "human_revision":
-                    guidance = self._guidance()
-                    skill_guidance = _guidance_for_codex(
-                        guidance, stage=stage,
-                        context="\n".join((self.state["task"], self.state["proposal"], self.state["human_feedback"])),
-                    )
-                    prompt = (
-                        "Revise the saved proposal to address the user's explicit feedback. Keep the original "
-                        "assignment and unrelated decisions intact. Apply Engineering Judgment & Proportional Design. "
-                        "Apply relevant skill instructions below, and record the skill name and how it informed the "
-                        "proposal; if there are no applicable skills, state that. Distinguish must implement, should "
-                        "implement, future production considerations, and out of scope. Preserve and update the "
-                        "machine-readable commitment ledger using the user's explicit feedback. Return the complete proposal "
-                        "in readable Markdown; do not implement code.\n\n"
-                        f"{ARCHITECTURAL_DECISION_OUTPUT}\n\n{PLANNING_PRINCIPLES}\n\n{COMMITMENT_LEDGER_GUIDANCE}\n\n{skill_guidance}\n\n"
-                        f"Assignment:\n{self.state['task']}\n\nCurrent proposal (version "
-                        f"{self.state.get('proposal_version', 1)}):\n{self.state['proposal']}\n\n"
-                        f"Prior review attempts:\n{self._review_history_for_prompt()}\n\n"
-                        f"User feedback:\n{self.state['human_feedback']}"
-                    )
-                    self.state["proposal"] = clean_markdown(self._run_codex(prompt, sandbox="read-only"))
-                    self.state["proposal_version"] = int(self.state.get("proposal_version", 1)) + 1
-                    self._reassess_after_planning(self.state["proposal"])
-                    self._write_proposal(self.state["proposal"])
-                    authorized_plan_limit = self.state["authorization"]["claude_aily"]["max_plan_reviews"]
-                    valid_reviews = self._valid_plan_reviews()
-                    if len(valid_reviews) < authorized_plan_limit:
-                        self.state["stage"] = f"plan_review_{len(valid_reviews) + 1}"
-                    elif self._approval_required():
-                        self.state["status"] = "awaiting_approval"
-                        self.state["stage"] = "implementation"
-                    else:
-                        self.state["status"] = "running"
-                        self.state["stage"] = "implementation"
-                    self._save()
-                elif stage == "implementation":
-                    if self._approval_required() and not self.state.get("implementation_approved_at"):
-                        self.state["status"] = "awaiting_approval"
-                        self._save()
-                        break
-                    guidance = self._guidance()
-                    skill_guidance = _guidance_for_codex(
-                        guidance, stage=stage,
-                        context="\n".join((self.state["task"], self.state["proposal"])),
-                    )
-                    validation_baseline = self._commitment_validation_baseline()
-                    prompt = (
-                        "Implement the approved proposal in this repository. Follow repository instructions. "
-                        "Apply the relevant skill instructions supplied below; do not merely list skills. "
-                        "Use the persistent workflow authorization for ordinary target-workspace operations without "
-                        "individual approvals. Install dependencies only from project manifests using the project's "
-                        "package manager; do not use arbitrary download URLs or custom registries. Run relevant checks. "
-                        "Do not expose secrets or read unrelated repositories. Commit, push, merge, deploy, publish, "
-                        "shared-infrastructure changes, and access outside the target require separate explicit "
-                        "user authorization and are not included in this workflow authorization. "
-                        "Do not delete unrelated existing files. Follow Engineering Judgment & Proportional Design "
-                        "and do not invent product behavior. Return a concise summary with files changed, "
-                        "commands actually run, results, and known limitations. Do not use this summary to declare "
-                        "commitments fulfilled. For every required validation scenario, execute an actual pytest or "
-                        "unittest test that asserts the scenario acceptance condition; manual inspection and bare shell "
-                        "checks are not runner receipts. If no suitable existing test applies and adding an application "
-                        "test file would exceed scope, place a temporary unittest under the workflow verification "
-                        "directory inside `.engineering/workflows/` and run it from the target repository with "
-                        "`python3 -m unittest discover -v` so individual test IDs and outcomes are captured. "
-                        "For repository-scope scenarios, compare "
-                        "`git status --porcelain=v1 -z --untracked-files=all` with the supplied initial baseline; "
-                        "preserve pre-existing paths, exclude only the supplied Harness workflow-artifact prefix, "
-                        "verify each pre-existing path's supplied kind, mode, and SHA-256 state, and do not ignore "
-                        "other `.engineering/` paths or sensitive-path policy. If `preexisting_snapshot_complete` is "
-                        "false, do not claim the scope scenario passed. Include test IDs "
-                        "exactly as the runner reports them. Do not invent execution event IDs: set "
-                        "`execution_event_ids` to an empty array and the Harness will bind only observed receipts. "
-                        "Finish with one `harness-evidence` JSON block linking each approved commitment to source "
-                        "references and specific scenario/test IDs. Run all required scenarios after the final code edits, "
-                        "prefer one combined runner invocation, and make it the last tool action; do not edit code afterward. "
-                        "Do not include raw command output or secrets. Use exactly one fenced block labeled "
-                        "`harness-evidence` with this JSON shape, replacing example values:\n"
-                        "```harness-evidence\n"
-                        "{\"schema_version\":1,\"commitments\":["
-                        "{\"commitment_id\":\"C-001\",\"source_refs\":[{\"path\":\"src/file.py\","
-                        "\"symbol\":\"function_name\"}],\"validation_refs\":[{\"scenario_id\":\"scenario-1\","
-                        "\"test_ids\":[\"tests/test_file.py::test_case\"],\"execution_event_ids\":[]}],"
-                        "\"disposition\":null,\"reason\":null}]}\n```. Include only observed references.\n\n"
-                        f"Harness validation baseline (do not modify):\n{validation_baseline}\n\n"
-                        f"{COMMITMENT_LEDGER_GUIDANCE}\n\n{PLANNING_PRINCIPLES}\n\n{skill_guidance}\n\n"
-                        f"Assignment:\n{self.state['task']}\n\nApproved proposal:\n{self.state['proposal']}"
-                    )
-                    approval_conditions = self.state.get("approval_conditions", "")
-                    if approval_conditions:
-                        prompt += (
-                            "\n\nHuman approval conditions (additional implementation constraints; "
-                            "preserve the approved proposal and commitment ledger):\n"
-                            f"{approval_conditions}"
-                        )
-                    self.state["implementation_summary"] = self._run_codex(prompt, sandbox="workspace-write")
-                    self._capture_commitment_evidence(self.state["implementation_summary"])
-                    self.state["stage"] = "code_review"
-                    self._save()
-                elif stage in {"code_review", "verification"}:
-                    purpose = "verification" if stage == "verification" else "initial"
-                    self._require_write_operation_target(purpose)
-                    review_diff = _review_diff(self.state, self.target)
-                    if not review_diff.included_paths and not review_diff.context_files:
-                        self.state["review_included_files"] = []
-                        self.state["review_exclusions"] = [
-                            {"path": _safe_review_path(path), "reason": reason}
-                            for path, reason in review_diff.excluded_files
-                        ]
-                        self.state["review_files_not_reviewed"] = []
-                        self._save()
-                        reasons = "; ".join(
-                            f"{path}: {reason}" for path, reason in review_diff.excluded_files
-                        )
-                        detail = f"No reviewable text changes were found. Excluded changed files: {reasons or 'none'}"
-                        raise WorkflowError(detail)
-                    try:
-                        campaign, shared, parts = self._prepare_review_campaign(review_diff, purpose=purpose)
-                    except WorkflowError as exc:
-                        if not self.state.get("review_campaign"):
-                            self.state["review_included_files"] = list(review_diff.included_paths)
-                            self.state["review_exclusions"] = [
-                                {"path": _safe_review_path(path), "reason": reason}
-                                for path, reason in review_diff.excluded_files
-                            ]
-                            self.state["review_files_not_reviewed"] = [
-                                {"path": path, "reason": redact(str(exc))}
-                                for path in review_diff.included_paths
-                            ]
-                            self._save()
-                        raise
-                    self.state["review_scope_files"] = sorted({
-                        *review_diff.included_paths,
-                        *(path for path, _origin, _baseline, _final in review_diff.context_files),
-                    })
-                    self.state["review_workflow_paths"] = list(review_diff.workflow_paths)
-                    self.state["review_scope_sha256"] = _ReviewCampaign._campaign_source_hash(review_diff)
-                    if purpose == "initial" and not isinstance(self.state.get("implementation_snapshot"), dict):
-                        implementation_snapshot = _workspace.capture_preexisting_snapshot(
-                            self.target, review_diff.included_paths, redactor=redact,
-                        )
-                        implementation_snapshot["source_patch_sha256"] = self.state["review_scope_sha256"]
-                        implementation_snapshot["target_fingerprint"] = self._fingerprint_repository(self.target)
-                        snapshot_body = {
-                            key: value for key, value in implementation_snapshot.items() if key != "sha256"
-                        }
-                        implementation_snapshot["sha256"] = hashlib.sha256(json.dumps(
-                            snapshot_body, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-                        ).encode("utf-8")).hexdigest()
-                        self.state["implementation_snapshot"] = implementation_snapshot
-                    self._save()
-                    report = self._run_review_campaign(
-                        campaign, shared, parts, review_diff,
-                    )
-                    campaign["purpose"] = purpose
-                    if purpose == "verification":
-                        self.state["verification_report"] = report
-                    else:
-                        self.state["code_review"] = report
-                    self._capture_commitment_assessment(report, purpose=purpose)
-                    if purpose == "verification":
-                        self.state["verification_context_sha256"] = campaign.get("shared_context_sha256")
-                    else:
-                        self.state["code_review_context_sha256"] = campaign.get("shared_context_sha256")
-                    review_evidence = "\n\n".join([
-                        report,
-                        *(record.get("report", "") for record in campaign.get("part_reviews", [])),
-                    ])
-                    if campaign.get("status") != "complete" or campaign.get("files_not_reviewed"):
-                        raise WorkflowError("Review did not complete all required files and parts; delivery is blocked.")
-                    no_blocking_findings = _clearly_no_review_findings(review_evidence)
-                    if purpose == "initial" and no_blocking_findings:
-                        self.state["correction_summary"] = (
-                            "Claude reported no acceptance-blocking findings; no correction run was needed."
-                        )
-                    verification_dispositions = None
-                    if purpose == "verification" and no_blocking_findings:
-                        history = self.state.get("review_campaign_history", [])
-                        original_campaign = next((
-                            item for item in reversed(history)
-                            if isinstance(item, dict) and item.get("purpose") == "initial"
-                        ), {})
-                        verification_dispositions, disposition_error = _post_correction_dispositions(
-                            original_campaign, campaign,
-                        )
-                        if disposition_error is not None:
-                            self.state.setdefault("integrity", {})["verification_result"] = {
-                                "status": "failed",
-                                "campaign_id": campaign.get("campaign_id"),
-                                "checked_at": now(),
-                                "report_sha256": hashlib.sha256(report.encode("utf-8")).hexdigest(),
-                                "finding": disposition_error,
-                            }
-                            self._save()
-                            raise WorkflowError(
-                                "Independent post-correction verification is inconclusive; delivery is blocked. "
-                                + disposition_error
-                            )
-                    self._record_review_snapshot(campaign, review_diff, purpose=purpose)
-                    if purpose == "verification":
-                        integrity = self.state.setdefault("integrity", {})
-                        if no_blocking_findings:
-                            integrity["verification_result"] = {
-                                "status": "verified",
-                                "campaign_id": campaign.get("campaign_id"),
-                                "original_campaign_id": (self.state.get("correction_attempts") or [{}])[-1].get(
-                                    "original_campaign_id",
-                                ),
-                                "checked_at": now(),
-                                "report_sha256": hashlib.sha256(report.encode("utf-8")).hexdigest(),
-                                "finding": "No unresolved blocking findings were reported.",
-                                "original_finding_dispositions": verification_dispositions,
-                            }
-                            self.state["stage"] = "complete"
-                        else:
-                            integrity["verification_result"] = {
-                                "status": "failed",
-                                "campaign_id": campaign.get("campaign_id"),
-                                "checked_at": now(),
-                                "report_sha256": hashlib.sha256(report.encode("utf-8")).hexdigest(),
-                                "finding": "The independent verification reports unresolved or new blocking findings.",
-                            }
-                            self._save()
-                            raise WorkflowError(
-                                "Independent post-correction verification found unresolved or new blocking findings; delivery is blocked."
-                            )
-                    elif no_blocking_findings:
-                        self.state["stage"] = "complete"
-                    else:
-                        self.state["stage"] = "correction"
-                    self._save()
-                elif stage == "correction":
-                    guidance = self._guidance()
-                    campaign = self.state.get("review_campaign") or {}
-                    if campaign.get("status") != "complete":
-                        raise WorkflowError("Correction is blocked because the initial review campaign is incomplete.")
-                    external = self.state["authorization"]["claude_aily"]
-                    if external.get("budget_unknown") is True:
-                        raise WorkflowError("Correction is blocked because Claude spend is unknown and verification cannot be authorized safely.")
-                    limits = self._execution_limits()
-                    usage = self._resource_usage()
-                    remaining_claude_calls = limits["max_claude_calls"] - usage["claude_calls"]
-                    minimum_verification_calls = max(1, int(campaign.get("required_calls", 1)))
-                    if remaining_claude_calls < minimum_verification_calls:
-                        raise WorkflowError(
-                            "Correction is blocked because the saved Claude call authorization cannot cover an independent verification campaign."
-                        )
-                    attempts = self.state.setdefault("correction_attempts", [])
-                    attempt = attempts[-1] if attempts and attempts[-1].get("status") == "in_progress" else None
-                    if attempt is None:
-                        if len(attempts) >= limits["max_correction_attempts"]:
-                            raise WorkflowError("The authorized Codex correction-attempt limit is exhausted.")
-                        attempt = {
-                            "attempt": len(attempts) + 1,
-                            "status": "in_progress",
-                            "started_at": now(),
-                            "original_campaign_id": campaign.get("campaign_id"),
-                            "original_report_sha256": hashlib.sha256(
-                                str(self.state.get("code_review") or "").encode("utf-8"),
-                            ).hexdigest(),
-                        }
-                        attempts.append(attempt)
-                        usage["correction_attempts"] += 1
-                        self._save()
-                    individual_reports = "\n\n".join(
-                        f"### {record.get('part_id')}\n{record.get('report', '')}"
-                        for record in campaign.get("part_reviews", []) if record.get("report")
-                    ) or "No separate individual reports were recorded."
-                    skill_guidance = _guidance_for_codex(
-                        guidance, stage=stage,
-                        context="\n".join((
-                            self.state["task"], self.state["proposal"], self.state["code_review"], individual_reports,
-                        )),
-                    )
-                    validation_baseline = self._commitment_validation_baseline()
-                    prompt = (
-                        "Evaluate the independent Claude code review. Treat its findings as the complete correction "
-                        "assignment. Fix valid in-scope defects and reject incorrect recommendations with a brief "
-                        "reason. Assess every distinct finding from individual part reports and the consolidated "
-                        "integration report. Optional improvements are not mandatory. Modify only files necessary to "
-                        "address valid findings; preserve behavior outside those findings. Do not perform unrelated "
-                        "refactoring, cleanup, or scope expansion. Add or update focused tests when needed. For every "
-                        "required validation scenario, execute an actual pytest or unittest test that asserts its "
-                        "acceptance condition; manual inspection and bare shell checks are not runner receipts. If no "
-                        "suitable existing test applies and adding an application test file would exceed scope, place a "
-                        "temporary unittest under this workflow's `.engineering/workflows/` verification directory and "
-                        "run it from the target repository with `python3 -m unittest discover -v` so individual test IDs "
-                        "and outcomes are captured. For repository-scope "
-                        "scenarios, compare `git status --porcelain=v1 -z --untracked-files=all` with the supplied initial "
-                        "baseline; preserve pre-existing paths, exclude only the supplied Harness workflow-artifact "
-                        "prefix, verify each pre-existing path's supplied kind, mode, and SHA-256 state, and do not ignore "
-                        "other `.engineering/` paths or sensitive-path policy. If `preexisting_snapshot_complete` is false, "
-                        "do not claim the scope scenario passed. Include test IDs "
-                        "exactly as the runner reports them. Set `execution_event_ids` to an empty array; the Harness "
-                        "will bind only observed receipts. Do not repeat the review. Return a concise correction and "
-                        "validation summary plus one complete `harness-evidence` JSON block for every approved "
-                        "commitment. Run all required scenarios after the final code edits, prefer one combined runner "
-                        "invocation, and make it the last tool action; do not edit code afterward. Do not include raw "
-                        "output or secrets.\n\n"
-                        f"Harness validation baseline (do not modify):\n{validation_baseline}\n\n"
-                        f"{COMMITMENT_LEDGER_GUIDANCE}\n\n"
-                        f"{PLANNING_PRINCIPLES}\n\n"
-                        f"{skill_guidance}\n\n"
-                        f"Assignment:\n{self.state['task']}\n\nApproved proposal:\n{self.state['proposal']}\n\n"
-                        f"Claude code review:\n{self.state['code_review']}\n\n"
-                        f"Individual Claude part reports:\n{individual_reports}\n\n"
-                        f"Prior implementation summary:\n{self.state['implementation_summary']}"
-                    )
-                    self.state["correction_summary"] = self._run_codex(prompt, sandbox="workspace-write")
-                    self._capture_commitment_evidence(self.state["correction_summary"])
-                    attempt["status"] = "completed"
-                    attempt["finished_at"] = now()
-                    attempt["correction_summary_sha256"] = hashlib.sha256(
-                        self.state["correction_summary"].encode("utf-8"),
-                    ).hexdigest()
-                    campaign["purpose"] = "initial"
-                    campaign_history = self.state.setdefault("review_campaign_history", [])
-                    if not any(item.get("campaign_id") == campaign.get("campaign_id") for item in campaign_history):
-                        campaign_history.append(copy.deepcopy(campaign))
-                    self.state["review_campaign"] = None
-                    self.state["review_campaign_id"] = None
-                    self.state["verification_report"] = None
-                    self.state["stage"] = "verification"
-                    self._save()
-                elif stage == "complete":
-                    delivery_verification = self._verify_delivery_integrity()
-                    self._capture_final_target_fingerprint()
-                    final_target = self.state.get("execution_fingerprint", {}).get("final", {}).get("target", {})
-                    if (final_target.get("status") != "captured"
-                            or final_target.get("commit_sha") != delivery_verification.get("target_commit_sha")
-                            or final_target.get("working_tree_sha256") != delivery_verification.get("target_working_tree_sha256")):
-                        raise WorkflowError("Delivery is blocked because the target changed during final integrity checks.")
-                    self.state["status"] = "complete"
-                    self.state["completed_at"] = now()
-                    self._evaluate_commitment_delivery()
-                    if isinstance(self.state.get("commitment_gate"), dict):
-                        self.state["commitment_gate"]["workflow_status"] = "complete"
-                    _atomic_text(self.delivery_path, self._delivery_report())
-                    delivery_hash = hashlib.sha256(_persistence.read_bytes(self.delivery_path)).hexdigest()
-                    self.state.setdefault("integrity", {})["delivery_artifact_sha256"] = delivery_hash
-                    self._save()
-                else:
-                    raise WorkflowError(f"Unknown workflow stage: {stage}")
-            except KeyboardInterrupt:
-                if self.state.get("status") != "recovery_required":
-                    operation = self._operation(self.state.get("active_operation_id"))
-                    error = f"Workflow cancelled during stage {stage}; resume will retry only the saved stage."
-                    if operation is not None and operation.get("status") == "started":
-                        if operation.get("launch_state") == "not_started":
-                            operation.update({
-                                "status": "failed",
-                                "finished_at": now(),
-                                "outcome": "Workflow was cancelled before launching this external operation; safe to retry.",
-                                "error_category": "CancelledBeforeLaunch",
-                            })
-                            if self.state.get("active_operation_id") == operation.get("operation_id"):
-                                self.state["active_operation_id"] = None
-                            if operation.get("operation_type") == "claude":
-                                external = self.state.get("authorization", {}).get("claude_aily", {})
-                                active_call = external.get("active_call")
-                                if isinstance(active_call, dict) and active_call.get("operation_id") == operation.get("operation_id"):
-                                    external["active_call"] = None
-                                for context in reversed(self.state.get("claude_contexts", [])):
-                                    if context.get("operation_id") == operation.get("operation_id"):
-                                        context["call_state"] = "not_started"
-                                        context["error"] = operation["outcome"]
-                                        break
-                            self._record_operation_runtime(operation, 0)
-                            self.state["status"] = "failed"
-                            self.state["error"] = error
-                            self.state["cancellation"] = {"stage": stage, "cancelled_at": now(), "outcome": error}
-                            self._save()
-                        else:
-                            self.state["cancellation"] = {
-                                "stage": stage,
-                                "cancelled_at": now(),
-                                "outcome": "Process group was stopped locally; any accepted remote provider work may remain unknown.",
-                                "requires_recovery": True,
-                            }
-                            self._require_recovery(operation, error)
-                    else:
+        try:
+            definition = _definition_from_snapshot(self.state.get("workflow_definition"))
+            execution = self._ensure_workflow_execution(definition)
+            registry = _production_stages.build_stage_registry({
+                stage.implementation: self._execute_registered_stage
+                for stage in definition.stages
+            })
+            engine = WorkflowEngine(registry, self._persist_workflow_execution)
+            production_services = self._production_stage_services()
+            context = WorkflowContext(
+                workflow_id=self.workflow_id,
+                task=str(self.state.get("task") or ""),
+                attributes={
+                    "target": str(self.target),
+                    "baseline_commit": self.state.get("baseline_commit"),
+                    "workflow_definition_sha256": self.state["workflow_definition"].get("sha256"),
+                },
+            )
+            result = engine.execute(
+                definition,
+                context,
+                execution,
+                retry_failed=self._engine_retry_authorized,
+                retry_allowed=self._engine_retry_stage_allowed,
+                rerun_allowed=self._engine_rerun_stage_allowed,
+                resume_running_allowed=self._engine_running_stage_allowed,
+                pause_before=self._engine_pause_before_stage,
+                artifact_provider=lambda stage, outputs: _stage_artifacts.provide_stage_artifacts(
+                    stage, self.state, self.target, self.proposal_path,
+                    self._fingerprint_repository, _persistence.read_bytes,
+                ),
+                services={"production": production_services},
+            )
+        except WorkflowDefinitionError as exc:
+            raise WorkflowError(f"Saved workflow execution is invalid: {exc}") from exc
+
+        if result.get("status") == "paused":
+            self.state["status"] = "awaiting_approval"
+            self.state["stage"] = result.get("waiting_stage")
+            self.state["error"] = None
+            self._save()
+            return self.state
+        if result.get("status") == "failed":
+            current_stage = self.state.get("stage")
+            stage_record = result.get("stages", {}).get(current_stage, {})
+            error = self.state.get("error") or stage_record.get("error") or "Workflow stage failed."
+            if self.state.get("status") != "recovery_required":
+                self.state["status"] = "failed"
+                self.state["error"] = redact(str(error))
+                self._capture_final_target_fingerprint()
+                self._save()
+            raise WorkflowError(f"Workflow stopped at {current_stage}: {redact(str(error))}")
+        if result.get("status") == "blocked":
+            current_stage = result.get("waiting_stage") or self.state.get("stage")
+            stage_record = result.get("stages", {}).get(current_stage, {})
+            reason = stage_record.get("error") or result.get("recovery_error") or "Workflow stage is blocked."
+            self.state["status"] = "failed"
+            self.state["stage"] = current_stage
+            self.state["error"] = redact(str(reason))
+            self._save()
+            raise WorkflowError(f"Workflow is blocked at {current_stage}: {redact(str(reason))}")
+        if result.get("status") != "complete":
+            raise WorkflowError(f"Workflow engine returned an unsupported status: {result.get('status')!r}.")
+        return self.state
+
+    def _ensure_workflow_execution(self, definition: WorkflowDefinition) -> dict:
+        return _legacy_compatibility.ensure_workflow_execution(
+            self.state,
+            definition,
+            max_plan_reviews=MAX_PLAN_REVIEWS,
+            clearly_no_review_findings=_clearly_no_review_findings,
+            redact_error=redact,
+        )
+
+    def _persist_workflow_execution(self, execution: dict) -> None:
+        self.state["workflow_execution"] = execution
+        if execution.get("status") == "paused":
+            self.state["status"] = "awaiting_approval"
+            self.state["stage"] = execution.get("waiting_stage")
+            self.state["error"] = None
+        self.state["engine_version"] = 2
+        self._save()
+
+    def _engine_pause_before_stage(self, stage, _execution: dict) -> str | None:
+        if (stage.config.get("requires_approval") is True and self._approval_required()
+                and not self.state.get("implementation_approved_at")):
+            return "Explicit human approval is required before implementation."
+        return None
+
+    def _engine_retry_stage_allowed(self, stage_id: str, _record: dict) -> bool:
+        legacy_stage_id = self._legacy_stage_id(stage_id)
+        if not self._engine_retry_authorized or self.state.get("active_operation_id") is not None:
+            return False
+        return self._stage_operations_are_resolved(legacy_stage_id)
+
+    def _engine_running_stage_allowed(self, stage_id: str, _record: dict) -> bool:
+        legacy_stage_id = self._legacy_stage_id(stage_id)
+        if not self._engine_resume_authorized or self.state.get("active_operation_id") is not None:
+            return False
+        return self._stage_operations_are_resolved(legacy_stage_id)
+
+    def _engine_rerun_stage_allowed(self, stage_id: str, _record: dict) -> bool:
+        legacy_stage_id = self._legacy_stage_id(stage_id)
+        if (self.state.get("active_operation_id") is not None
+                or not self._stage_operations_are_resolved(legacy_stage_id)):
+            return False
+        stage = _saved_stage_definition(self.state, stage_id)
+        stage_config = stage.get("config", {}) if isinstance(stage, dict) else {}
+        if (stage_config.get("requires_approval") is True and self._approval_required()
+                and not self.state.get("implementation_approved_at")):
+            return False
+        capabilities = stage.get("capabilities", []) if isinstance(stage, dict) else []
+        if "codex.execute" in capabilities and not _operation_capability_allowed(
+                self.state, "codex.execute", legacy_stage_id):
+            return False
+        if "documentation.read" in capabilities and not _operation_capability_allowed(
+                self.state, "documentation.read", legacy_stage_id):
+            return False
+        return True
+
+    def _legacy_stage_id(self, stage_id: str) -> str:
+        return _legacy_compatibility.legacy_stage_id(
+            self.state, stage_id, self._valid_plan_reviews, _saved_stage_definition,
+        )
+
+    def _stage_operations_are_resolved(self, stage_id: str) -> bool:
+        return not any(
+            isinstance(operation, dict)
+            and operation.get("stage") == stage_id
+            and operation.get("status") in {"started", "unknown", "interrupted"}
+            and not operation.get("resolution")
+            for operation in self.state.get("operation_history", [])
+        )
+
+    def _mark_recovered_stage_completed(
+        self, stage_id: str, output: dict, *, resolution: str,
+    ) -> None:
+        """Record a human-resolved interrupted stage before the engine continues downstream."""
+        definition = _definition_from_snapshot(self.state.get("workflow_definition"))
+        execution = self._ensure_workflow_execution(definition)
+        _recovery.mark_running_stage_completed(
+            execution, stage_id, output, resolution=resolution,
+        )
+
+    def _production_stage_services(self) -> _stage_services.ProductionStageServices:
+        """Compose stage-scoped capabilities without exposing the Orchestrator instance."""
+        return _stage_services.ProductionStageServices(
+            planning=_stage_services.PlanningStageServices(
+                state=self.state,
+                target=self.target,
+                approval_required=self._approval_required,
+                call_claude=self._call_claude,
+                plan_review_prompt=self._plan_review_prompt,
+                guidance=self._guidance,
+                guidance_for_codex=_guidance_for_codex,
+                run_codex=self._run_codex,
+                save=self._save,
+                write_proposal=self._write_proposal,
+                reassess_after_planning=self._reassess_after_planning,
+                record_unvalidated_planning_output=self._record_unvalidated_planning_output,
+                refined_proposal=self._refined_proposal,
+                validate_proposal_ledger=self._validate_proposal_ledger,
+                clean_markdown=clean_markdown,
+                review_history_for_prompt=self._review_history_for_prompt,
+                valid_plan_reviews=self._valid_plan_reviews,
+                now=now,
+                architectural_decision_output=ARCHITECTURAL_DECISION_OUTPUT,
+                commitment_ledger_guidance=COMMITMENT_LEDGER_GUIDANCE,
+                planning_principles=PLANNING_PRINCIPLES,
+            ),
+            implementation=_stage_services.ImplementationStageServices(
+                state=self.state,
+                target=self.target,
+                approval_required=self._approval_required,
+                capture_commitment_evidence=self._capture_commitment_evidence,
+                commitment_validation_baseline=self._commitment_validation_baseline,
+                guidance=self._guidance,
+                guidance_for_codex=_guidance_for_codex,
+                run_codex=self._run_codex,
+                save=self._save,
+                execution_limits=self._execution_limits,
+                resource_usage=self._resource_usage,
+                now=now,
+                commitment_ledger_guidance=COMMITMENT_LEDGER_GUIDANCE,
+                planning_principles=PLANNING_PRINCIPLES,
+            ),
+            review=_stage_services.ReviewStageServices(
+                state=self.state,
+                target=self.target,
+                capture_commitment_assessment=self._capture_commitment_assessment,
+                require_write_operation_target=self._require_write_operation_target,
+                review_diff=_review_diff,
+                prepare_review_campaign=self._prepare_review_campaign,
+                campaign_source_hash=_ReviewCampaign._campaign_source_hash,
+                capture_preexisting_snapshot=_workspace.capture_preexisting_snapshot,
+                fingerprint_repository=self._fingerprint_repository,
+                run_review_campaign=self._run_review_campaign,
+                record_review_snapshot=self._record_review_snapshot,
+                clearly_no_review_findings=_clearly_no_review_findings,
+                post_correction_dispositions=_post_correction_dispositions,
+                now=now,
+                redact=redact,
+                save=self._save,
+            ),
+            delivery=_stage_services.DeliveryStageServices(
+                state=self.state,
+                target=self.target,
+                delivery_path=self.delivery_path,
+                verify_delivery_integrity=self._verify_delivery_integrity,
+                capture_final_target_fingerprint=self._capture_final_target_fingerprint,
+                evaluate_commitment_delivery=self._evaluate_commitment_delivery,
+                delivery_report=self._delivery_report,
+                atomic_text=_atomic_text,
+                read_bytes=_persistence.read_bytes,
+                save=self._save,
+                now=now,
+            ),
+            state=self.state,
+            valid_plan_reviews=self._valid_plan_reviews,
+            max_plan_reviews=MAX_PLAN_REVIEWS,
+            clearly_no_review_findings=_clearly_no_review_findings,
+        )
+
+    def _execute_registered_stage(self, stage_input: StageInput) -> StageResult:
+        stage_id = stage_input.definition.stage_id
+        legacy_stage_id = self._legacy_stage_id(stage_id)
+        if not isinstance(legacy_stage_id, str) or legacy_stage_id not in TRACE_STAGES:
+            raise WorkflowError(f"Stage {stage_id!r} has an invalid production adapter.")
+        execution = self.state.get("workflow_execution")
+        stage_records = execution.get("stages", {}) if isinstance(execution, dict) else {}
+        record = stage_records.get(stage_id) if isinstance(stage_records, dict) else None
+        attempts = record.get("attempts") if isinstance(record, dict) else None
+        if (isinstance(attempts, list) and attempts and isinstance(attempts[-1], dict)
+                and attempts[-1].get("execution_id") == stage_input.execution_id):
+            attempts[-1]["legacy_stage_id"] = legacy_stage_id
+            record["legacy_stage_id"] = legacy_stage_id
+        services = (
+            stage_input.services.get("production")
+            if isinstance(stage_input.services, Mapping) else None
+        )
+        if not isinstance(services, _stage_services.ProductionStageServices):
+            raise WorkflowError("WorkflowEngine did not provide production stage services.")
+        self._set_stage(legacy_stage_id)
+        previous_execution_id = self._active_stage_execution_id
+        self._active_stage_execution_id = stage_input.execution_id
+        try:
+            return self._run_stage_action(stage_input, legacy_stage_id, services)
+        finally:
+            self._active_stage_execution_id = previous_execution_id
+
+    def _run_stage_action(
+        self,
+        stage_input: StageInput,
+        stage: str,
+        services: _stage_services.ProductionStageServices,
+    ) -> StageResult:
+        result: StageResult | None = None
+        if self.state.get("stage") != stage:
+            raise WorkflowError("The saved lifecycle stage does not match the engine-selected stage.")
+        stage_label = stage if isinstance(stage, str) and stage in TRACE_STAGES else "unknown"
+        stage_started = time.monotonic()
+        stage_context = self._trace_span("workflow.stage", {"stage": stage_label})
+        stage_context.__enter__()
+        try:
+            if self._workflow_runtime_remaining() <= 0:
+                raise WorkflowError("The authorized workflow execution-time limit is exhausted.")
+            result = _production_stages.execute_stage_action(stage_input, stage, services)
+        except KeyboardInterrupt:
+            if self.state.get("status") != "recovery_required":
+                operation = self._operation(self.state.get("active_operation_id"))
+                error = f"Workflow cancelled during stage {stage}; resume will retry only the saved stage."
+                if operation is not None and operation.get("status") == "started":
+                    if operation.get("launch_state") == "not_started":
+                        operation.update({
+                            "status": "failed",
+                            "finished_at": now(),
+                            "outcome": "Workflow was cancelled before launching this external operation; safe to retry.",
+                            "error_category": "CancelledBeforeLaunch",
+                        })
+                        if self.state.get("active_operation_id") == operation.get("operation_id"):
+                            self.state["active_operation_id"] = None
+                        if operation.get("operation_type") == "claude":
+                            external = self.state.get("authorization", {}).get("claude_aily", {})
+                            active_call = external.get("active_call")
+                            if isinstance(active_call, dict) and active_call.get("operation_id") == operation.get("operation_id"):
+                                external["active_call"] = None
+                            for context in reversed(self.state.get("claude_contexts", [])):
+                                if context.get("operation_id") == operation.get("operation_id"):
+                                    context["call_state"] = "not_started"
+                                    context["error"] = operation["outcome"]
+                                    break
+                        self._record_operation_runtime(operation, 0)
                         self.state["status"] = "failed"
                         self.state["error"] = error
                         self.state["cancellation"] = {"stage": stage, "cancelled_at": now(), "outcome": error}
-                        self._capture_final_target_fingerprint()
                         self._save()
+                    else:
+                        self.state["cancellation"] = {
+                            "stage": stage,
+                            "cancelled_at": now(),
+                            "outcome": "Process group was stopped locally; any accepted remote provider work may remain unknown.",
+                            "requires_recovery": True,
+                        }
+                        self._require_recovery(operation, error)
                 else:
-                    self.state["cancellation"] = {
-                        "stage": stage,
-                        "cancelled_at": now(),
-                        "outcome": "The active provider operation was interrupted and requires recovery.",
-                        "requires_recovery": True,
-                    }
+                    self.state["status"] = "failed"
+                    self.state["error"] = error
+                    self.state["cancellation"] = {"stage": stage, "cancelled_at": now(), "outcome": error}
+                    self._capture_final_target_fingerprint()
                     self._save()
-                raise
-            except Exception as exc:
-                self._fail(exc)
-                raise WorkflowError(f"Workflow stopped at {stage}: {redact(str(exc))}") from exc
-            finally:
-                stage_context.update(duration_ms=max(0, round((time.monotonic() - stage_started) * 1000)))
-                stage_context.__exit__(*sys.exc_info())
-        return self.state
+            else:
+                self.state["cancellation"] = {
+                    "stage": stage,
+                    "cancelled_at": now(),
+                    "outcome": "The active provider operation was interrupted and requires recovery.",
+                    "requires_recovery": True,
+                }
+                self._save()
+            raise
+        except Exception as exc:
+            self._fail(exc)
+            raise WorkflowError(f"Workflow stopped at {stage}: {redact(str(exc))}") from exc
+        finally:
+            stage_context.update(duration_ms=max(0, round((time.monotonic() - stage_started) * 1000)))
+            stage_context.__exit__(*sys.exc_info())
+        return result if result is not None else StageResult(output={})
 
     def _repository_context_for_claude(self, guidance: dict, review_paths: list[str] | None = None) -> str:
         files = guidance.get("files") or []

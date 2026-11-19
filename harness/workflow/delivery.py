@@ -45,6 +45,19 @@ def render_delivery_report(
         "## Commitment traceability",
         "",
     ]
+    execution = state.get("workflow_execution")
+    stage_records = execution.get("stages") if isinstance(execution, Mapping) else None
+    sections.extend(["## Stage outcomes", ""])
+    if isinstance(stage_records, Mapping):
+        for stage_id, record in stage_records.items():
+            if not isinstance(stage_id, str) or not isinstance(record, Mapping):
+                continue
+            attempts = record.get("attempts", [])
+            attempt_count = len(attempts) if isinstance(attempts, list) else 0
+            sections.append(f"- `{stage_id}`: `{record.get('status', 'unknown')}` ({attempt_count} attempt(s)).")
+    else:
+        sections.append("Stage execution outcomes were not recorded for this legacy workflow.")
+    sections.append("")
     gate = state.get("commitment_gate")
     if isinstance(gate, dict):
         sections.extend([

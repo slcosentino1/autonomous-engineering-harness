@@ -1212,6 +1212,7 @@ class PersistenceModuleTests(unittest.TestCase):
             "target": str(runner.target),
             "status": "awaiting_approval",
             "stage": "implementation_approval",
+            "task": "Add a small feature.",
             "authorization": authorization,
         }
         runner.state_path.parent.mkdir(parents=True)
@@ -1224,7 +1225,7 @@ class PersistenceModuleTests(unittest.TestCase):
         self.assertEqual(runner.state_path.read_bytes(), saved_bytes)
         self.assertEqual(runner.state["workflow_name"], "legacy-default")
         self.assertEqual(runner.state["workflow_definition"]["name"], "legacy-default")
-        self.assertEqual(runner.state["engine_version"], 1)
+        self.assertEqual(runner.state["engine_version"], 2)
         self.assertNotIn("codex_model", runner.state)
         self.assertNotIn("code_review_policy", runner.state["authorization"]["claude_aily"])
 
@@ -2187,6 +2188,12 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(completed["stage"], "complete")
         self.assertEqual(replacement.commands, [])
         self.assertEqual(len(original_codex.commands), 3)
+        implementation_record = completed["workflow_execution"]["stages"]["implementation"]
+        self.assertEqual(implementation_record["status"], "completed")
+        self.assertEqual(
+            implementation_record["recovery_resolution"],
+            "human_accepted_current_target_for_independent_review",
+        )
         accepted = next(
             operation for operation in completed["operation_history"]
             if operation.get("resolution") == "human_accepted_current_target_for_independent_review"
@@ -2898,11 +2905,52 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(revised["status"], "awaiting_approval")
         self.assertEqual(len(revised["plan_reviews"]), 2)
         self.assertEqual(len(claude.prompts), 2)
+        execution = revised["workflow_execution"]
+        self.assertEqual(execution["stages"]["plan_review_2_after_revision"]["status"], "completed")
+        self.assertEqual(execution["stages"]["plan_refine_2_after_revision"]["status"], "completed")
         self.assertFalse(any("workspace-write" in command for command in codex.commands))
         self.assertIn("User-edited proposal", codex.prompts[2])
         self.assertIn("uncertain outcomes", codex.prompts[2])
         self.assertIn("external dependencies", codex.prompts[2])
         self.assertIn("empty-input", (runner.workflow_dir / "proposal.md").read_text(encoding="utf-8"))
+
+    def test_failed_revision_review_resumes_the_engine_stage_and_keeps_its_iteration(self):
+        codex = FakeCodex(
+            "# Proposal\nInitial plan.\n", self.refined(),
+            "# Revised proposal\nClarify the behavior.\n", self.refined(),
+        )
+        claude = FakeClaude(
+            claude_reviewer.ReviewResult("Decision: APPROVED\nPlan is adequate.", 0.05),
+            claude_reviewer.ReviewError("temporary reviewer failure", cost_usd=0),
+        )
+        runner = orchestrator.Orchestrator(
+            self.target, task="Add a feature", budget_usd=1.0, workflow_id="revision-review-retry",
+            process_runner=codex, claude_runner=claude,
+        )
+        self.assertEqual(runner.start()["status"], "awaiting_approval")
+        with self.assertRaises(orchestrator.WorkflowError):
+            runner.revise("Clarify the empty-input behavior.")
+
+        failed = json.loads(runner.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(failed["stage"], "plan_review_2")
+        self.assertEqual(
+            failed["workflow_execution"]["stages"]["plan_review_2_after_revision"]["status"], "failed",
+        )
+
+        retry_codex = FakeCodex(self.refined())
+        retry_claude = FakeClaude(
+            claude_reviewer.ReviewResult("Decision: APPROVED\nRevision is clear.", 0.05),
+        )
+        resumed = orchestrator.Orchestrator(
+            self.target, workflow_id="revision-review-retry", process_runner=retry_codex,
+            claude_runner=retry_claude,
+        ).resume()
+
+        self.assertEqual(resumed["status"], "awaiting_approval")
+        self.assertEqual(resumed["workflow_execution"]["stages"]["plan_review_2_after_revision"]["status"], "completed")
+        self.assertEqual(resumed["plan_reviews"][-1]["iteration"], 2)
+        self.assertEqual(len(retry_claude.prompts), 1)
+        self.assertEqual(len(retry_codex.commands), 1)
 
     def test_user_can_reject_without_implementation(self):
         codex = FakeCodex("# Proposal\nInitial plan.\n", self.refined())
@@ -4460,10 +4508,13 @@ class WorkflowTests(unittest.TestCase):
             self.refined(),
             "# Corrected proposal\nThe prior review is invalid.\n",
             self.refined(dispositions="- No actionable findings."),
+            "# Second revision\nClarify the remaining iteration.\n",
+            self.refined(dispositions="- No actionable findings."),
         )
         claude = FakeClaude(
             claude_reviewer.ReviewResult("The assignment and proposal are missing.", 0.1),
             claude_reviewer.ReviewResult("Decision: APPROVED\nThe complete proposal meets the assignment.", 0.2),
+            claude_reviewer.ReviewResult("Decision: APPROVED\nThe second proposal is clear.", 0.2),
         )
         runner = orchestrator.Orchestrator(
             self.target, task="Build a REST API", budget_usd=1.0, workflow_id="invalidate-legacy-review",
@@ -4494,6 +4545,21 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("Architectural decision completeness", claude.prompts[1])
         self.assertIn("Alternatives analysis", claude.prompts[1])
         self.assertIn("Mark the prior review invalid", codex.prompts[2])
+        self.assertEqual(
+            revised["workflow_execution"]["stages"]["plan_review_2_after_revision"]["legacy_stage_id"],
+            "plan_review_1",
+        )
+
+        revised_again = runner.revise("Use the remaining review iteration for the new proposal wording.")
+        self.assertEqual(revised_again["status"], "awaiting_approval")
+        self.assertEqual(revised_again["plan_reviews"][-1]["iteration"], 2)
+        self.assertEqual(
+            len(revised_again["workflow_execution"]["stages"]["human_revision"]["attempts"]), 2,
+        )
+        self.assertEqual(
+            revised_again["workflow_execution"]["stages"]["plan_review_2_after_revision"]["legacy_stage_id"],
+            "plan_review_2",
+        )
 
     def test_codex_receives_target_instructions_and_applicable_skill_contents(self):
         codex_home = self.root / "codex-home"

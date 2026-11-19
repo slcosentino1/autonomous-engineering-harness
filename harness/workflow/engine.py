@@ -81,6 +81,11 @@ class StageInput:
     context: WorkflowContext
     definition: StageDefinition
     predecessor_outputs: Mapping[str, Any]
+    attempt: int
+    execution_id: str
+    configuration: Mapping[str, Any] = field(default_factory=dict)
+    artifacts: Mapping[str, Any] = field(default_factory=dict)
+    services: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -164,6 +169,8 @@ def validate_definition(definition: WorkflowDefinition) -> None:
                 or any(not isinstance(capability, str) or not capability for capability in stage.capabilities)
                 or len(set(stage.capabilities)) != len(stage.capabilities)):
             raise WorkflowDefinitionError(f"Stage {stage.stage_id!r} capabilities must be unique non-empty strings.")
+        if stage.config.get("skip_requested") is True and not (stage.optional and stage.allow_skip):
+            raise WorkflowDefinitionError(f"Required stage {stage.stage_id!r} cannot be skipped by configuration.")
         for dependency in stage.dependencies:
             if (not isinstance(dependency, StageDependency) or not isinstance(dependency.stage_id, str)
                     or not dependency.stage_id.strip()
@@ -241,6 +248,81 @@ def definition_snapshot(definition: WorkflowDefinition) -> dict[str, Any]:
     return snapshot
 
 
+def definition_from_snapshot(snapshot: Mapping[str, Any]) -> WorkflowDefinition:
+    """Reconstruct a trusted code-defined workflow from its validated persisted snapshot."""
+    if not isinstance(snapshot, Mapping):
+        raise WorkflowDefinitionError("Saved workflow definition is invalid.")
+    value = _json_value(snapshot)
+    if not isinstance(value, dict) or value.get("schema_version") != DEFINITION_SCHEMA_VERSION:
+        raise WorkflowDefinitionError("Saved workflow definition uses an unsupported schema version.")
+    supplied_digest = value.pop("sha256", None)
+    expected_digest = hashlib.sha256(json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+    if supplied_digest != expected_digest:
+        raise WorkflowDefinitionError("Saved workflow definition failed its integrity check.")
+    required = {
+        "schema_version", "name", "description", "version", "stages", "failure_policy",
+        "execution_policy", "approval_policy", "proposal_policy", "recovery_policy",
+    }
+    if set(value) != required or not isinstance(value.get("stages"), list):
+        raise WorkflowDefinitionError("Saved workflow definition has an invalid shape.")
+    stages: list[StageDefinition] = []
+    try:
+        for item in value["stages"]:
+            if not isinstance(item, dict) or set(item) != {
+                "stage_id", "implementation", "dependencies", "config", "capabilities", "run_when",
+                "optional", "allow_skip",
+            }:
+                raise WorkflowDefinitionError("Saved workflow stage has an invalid shape.")
+            dependencies = item["dependencies"]
+            if not isinstance(dependencies, list):
+                raise WorkflowDefinitionError("Saved workflow stage dependencies are invalid.")
+            parsed_dependencies = tuple(
+                StageDependency(
+                    dependency["stage_id"],
+                    dependency.get("accept_skipped", False),
+                    dependency.get("accept_not_applicable", False),
+                )
+                for dependency in dependencies
+                if isinstance(dependency, dict)
+                and set(dependency) == {"stage_id", "accept_skipped", "accept_not_applicable"}
+            )
+            if len(parsed_dependencies) != len(dependencies):
+                raise WorkflowDefinitionError("Saved workflow stage dependency is invalid.")
+            condition_value = item["run_when"]
+            condition = None
+            if condition_value is not None:
+                if not isinstance(condition_value, dict) or set(condition_value) != {
+                    "stage_id", "path", "operator", "value",
+                } or not isinstance(condition_value.get("path"), list):
+                    raise WorkflowDefinitionError("Saved workflow stage condition is invalid.")
+                condition = StageCondition(
+                    condition_value["stage_id"], tuple(condition_value["path"]),
+                    condition_value["operator"], condition_value["value"],
+                )
+            if not isinstance(item["config"], dict) or not isinstance(item["capabilities"], list):
+                raise WorkflowDefinitionError("Saved workflow stage configuration is invalid.")
+            stages.append(StageDefinition(
+                stage_id=item["stage_id"], implementation=item["implementation"],
+                dependencies=parsed_dependencies, config=item["config"],
+                capabilities=tuple(item["capabilities"]), run_when=condition,
+                optional=item["optional"], allow_skip=item["allow_skip"],
+            ))
+        definition = WorkflowDefinition(
+            name=value["name"], description=value["description"], version=value["version"],
+            stages=tuple(stages), failure_policy=value["failure_policy"],
+            execution_policy=value["execution_policy"], approval_policy=value["approval_policy"],
+            proposal_policy=value["proposal_policy"], recovery_policy=value["recovery_policy"],
+        )
+        validate_definition(definition)
+    except (KeyError, TypeError) as exc:
+        raise WorkflowDefinitionError("Saved workflow definition is invalid.") from exc
+    if definition_snapshot(definition) != {**value, "sha256": supplied_digest}:
+        raise WorkflowDefinitionError("Saved workflow definition is not canonical.")
+    return definition
+
+
 def _json_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         if any(not isinstance(key, str) for key in value):
@@ -275,6 +357,10 @@ class WorkflowEngine:
         retry_failed: bool = False,
         retry_allowed: Callable[[str, Mapping[str, Any]], bool] | None = None,
         rerun_allowed: Callable[[str, Mapping[str, Any]], bool] | None = None,
+        resume_running_allowed: Callable[[str, Mapping[str, Any]], bool] | None = None,
+        pause_before: Callable[[StageDefinition, Mapping[str, Any]], str | None] | None = None,
+        artifact_provider: Callable[[StageDefinition, Mapping[str, Any]], Mapping[str, Any]] | None = None,
+        services: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         self.registry.validate_definition(definition)
         snapshot = definition_snapshot(definition)
@@ -299,6 +385,9 @@ class WorkflowEngine:
             if not isinstance(attempts, list) or any(not isinstance(attempt, dict) for attempt in attempts):
                 raise WorkflowDefinitionError(f"Saved attempts for stage {stage_id!r} are invalid.")
         retry_stage = self._prepare_retry(definition, state, retry_allowed) if retry_failed else None
+        state["status"] = "running"
+        state.pop("waiting_stage", None)
+        state.pop("waiting_reason", None)
 
         for stage in definition.stages:
             record = records.setdefault(stage.stage_id, {"status": StageStatus.PENDING.value, "attempts": []})
@@ -310,13 +399,31 @@ class WorkflowEngine:
                 for dependency in stage.dependencies
                 if isinstance(records.get(dependency.stage_id), dict)
             }
-            input_sha256 = _stage_input_hash(stage, context, outputs, records)
+            completed_statuses = {
+                StageStatus.COMPLETED.value, StageStatus.SKIPPED.value, StageStatus.NOT_APPLICABLE.value,
+            }
+            if status in completed_statuses and "input_artifacts" in record:
+                artifacts = record["input_artifacts"]
+            else:
+                artifacts = artifact_provider(stage, outputs) if artifact_provider is not None else {}
+            if not isinstance(artifacts, Mapping):
+                raise WorkflowDefinitionError(f"Artifacts for stage {stage.stage_id!r} must be a mapping.")
+            artifacts = _json_value(artifacts)
+            input_sha256 = _stage_input_hash(stage, context, outputs, records, artifacts)
             if status in {StageStatus.COMPLETED.value, StageStatus.SKIPPED.value,
                           StageStatus.NOT_APPLICABLE.value}:
-                if status == StageStatus.SKIPPED.value and "input_sha256" not in record:
+                if record.pop("legacy_migrated", False):
                     record["input_sha256"] = input_sha256
+                    record["input_artifacts"] = copy.deepcopy(dict(artifacts))
                     self._save(state)
                     continue
+                if status == StageStatus.SKIPPED.value and "input_sha256" not in record:
+                    record["input_sha256"] = input_sha256
+                    record["input_artifacts"] = copy.deepcopy(dict(artifacts))
+                    self._save(state)
+                    continue
+                if "input_artifacts" not in record:
+                    record["input_artifacts"] = copy.deepcopy(dict(artifacts))
                 if record.get("input_sha256") == input_sha256:
                     continue
                 try:
@@ -349,7 +456,22 @@ class WorkflowEngine:
                     state["status"] = "blocked"
                     self._save(state)
                     return state
-            if status in {StageStatus.RUNNING.value, StageStatus.BLOCKED.value}:
+            if status == StageStatus.RUNNING.value:
+                if resume_running_allowed is not None and resume_running_allowed(stage.stage_id, record):
+                    attempts = record.get("attempts", [])
+                    if attempts and attempts[-1].get("status") == StageStatus.RUNNING.value:
+                        attempts[-1]["status"] = "interrupted_recovered"
+                    record["status"] = StageStatus.PENDING.value
+                    status = StageStatus.PENDING.value
+                    record["recovery_resolution"] = "existing_operation_guards_authorized_stage_replay"
+                    self._save(state)
+                else:
+                    record["status"] = StageStatus.BLOCKED.value
+                    record["error"] = record.get("error") or "Stage requires recovery before it can run again."
+                    state["status"] = "blocked"
+                    self._save(state)
+                    return state
+            if status == StageStatus.BLOCKED.value:
                 record["status"] = StageStatus.BLOCKED.value
                 record["error"] = record.get("error") or "Stage requires recovery before it can run again."
                 state["status"] = "blocked"
@@ -376,9 +498,39 @@ class WorkflowEngine:
                 self._save(state)
                 return state
             if stage.run_when is not None and not _condition_matches(stage.run_when, outputs):
-                record.update(status=StageStatus.NOT_APPLICABLE.value, output=None, input_sha256=input_sha256)
+                record.update(
+                    status=StageStatus.NOT_APPLICABLE.value,
+                    output=None,
+                    input_sha256=input_sha256,
+                    input_artifacts=copy.deepcopy(dict(artifacts)),
+                )
                 self._save(state)
                 continue
+
+            if stage.config.get("skip_requested") is True:
+                record.update(
+                    status=StageStatus.SKIPPED.value,
+                    output=None,
+                    input_sha256=input_sha256,
+                    input_artifacts=copy.deepcopy(dict(artifacts)),
+                    skipped_by="workflow_override",
+                )
+                self._save(state)
+                continue
+
+            if pause_before is not None:
+                pause_reason = pause_before(stage, state)
+                if pause_reason is not None:
+                    if not isinstance(pause_reason, str) or not pause_reason.strip():
+                        raise WorkflowDefinitionError("A stage pause requires a non-empty reason.")
+                    state.update(
+                        status="paused",
+                        waiting_stage=stage.stage_id,
+                        waiting_reason=pause_reason.strip(),
+                    )
+                    record.update(status=StageStatus.PENDING.value, input_sha256=input_sha256)
+                    self._save(state)
+                    return state
 
             attempt = len(record.get("attempts", [])) + 1
             attempt_record = {
@@ -393,14 +545,27 @@ class WorkflowEngine:
             self._save(state)
             try:
                 result = self.registry.resolve(stage.implementation).execute(
-                    StageInput(context, stage, outputs),
+                    StageInput(
+                        context=context,
+                        definition=stage,
+                        predecessor_outputs=outputs,
+                        attempt=attempt,
+                        execution_id=attempt_record["execution_id"],
+                        configuration=copy.deepcopy(dict(stage.config)),
+                        artifacts=copy.deepcopy(dict(artifacts)),
+                        services=services,
+                    ),
                 )
                 if not isinstance(result, StageResult):
                     raise WorkflowDefinitionError(
                         f"Stage implementation {stage.implementation!r} returned an invalid result."
                     )
+                if not isinstance(result.status, StageStatus):
+                    raise WorkflowDefinitionError("A stage result must use a valid StageStatus value.")
                 if result.status in {StageStatus.PENDING, StageStatus.RUNNING, StageStatus.BLOCKED}:
                     raise WorkflowDefinitionError("A stage implementation returned an engine-owned status.")
+                if result.error is not None and not isinstance(result.error, str):
+                    raise WorkflowDefinitionError("Stage result errors must be strings when present.")
                 _json_value(result.output)
             except Exception as exc:
                 safe_error = f"Stage raised {type(exc).__name__}."
@@ -419,6 +584,7 @@ class WorkflowEngine:
                 output=copy.deepcopy(result.output),
                 input_sha256=input_sha256,
                 output_sha256=output_sha256,
+                input_artifacts=copy.deepcopy(dict(artifacts)),
             )
             attempt_record.update(
                 status=result.status.value,
@@ -491,6 +657,7 @@ class WorkflowEngine:
             status=StageStatus.SKIPPED.value,
             skipped_by="policy_or_user",
             input_sha256=_stage_input_hash(stage, context, outputs, records),
+            input_artifacts={},
         )
         self._save(state)
         return state
@@ -553,6 +720,7 @@ class WorkflowEngine:
             record.pop("error", None)
             record.pop("input_sha256", None)
             record.pop("output_sha256", None)
+            record.pop("input_artifacts", None)
             records[invalidated_id] = record
         state["status"] = "running"
         self._save(state)
@@ -613,21 +781,28 @@ class WorkflowEngine:
 
 
 def _condition_matches(condition: StageCondition, outputs: Mapping[str, Any]) -> bool:
-    current = outputs.get(condition.stage_id)
+    missing = object()
+    current = outputs.get(condition.stage_id, missing)
     for part in condition.path:
         if not isinstance(current, Mapping) or part not in current:
-            current = None
+            current = missing
             break
         current = current[part]
+    if current is missing:
+        return False
     if condition.operator == "equals":
-        return current == condition.value
+        return _typed_equal(current, condition.value)
     if condition.operator == "not_equals":
-        return current != condition.value
+        return not _typed_equal(current, condition.value)
     if condition.operator == "in":
-        return current in condition.value
+        return any(_typed_equal(current, candidate) for candidate in condition.value)
     if condition.operator == "truthy":
         return bool(current)
     raise WorkflowDefinitionError(f"Unsupported condition operator: {condition.operator}")
+
+
+def _typed_equal(left: Any, right: Any) -> bool:
+    return type(left) is type(right) and left == right
 
 
 def _json_sha256(value: Any) -> str:
@@ -642,6 +817,7 @@ def _stage_input_hash(
     context: WorkflowContext,
     outputs: Mapping[str, Any],
     records: Mapping[str, Any],
+    artifacts: Mapping[str, Any] | None = None,
 ) -> str:
     dependencies = {
         dependency.stage_id: {
@@ -658,4 +834,5 @@ def _stage_input_hash(
         "implementation": stage.implementation,
         "config": stage.config,
         "dependencies": dependencies,
+        "artifacts": artifacts or {},
     })

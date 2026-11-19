@@ -96,11 +96,26 @@ class DeliveryReportTests(unittest.TestCase):
         self.assertIn("- Completed: 2026-11-13T10:20:30Z", report)
         self.assertIn("- Codex model: Codex CLI default", report)
         self.assertIn("- Claude spend recorded: $0.1250 / $2.00", report)
+        self.assertIn("Stage execution outcomes were not recorded for this legacy workflow.", report)
         self.assertIn("## Implementation\n\nImplemented the feature and ran its checks.", report)
         self.assertIn("Claude plan-review iterations: 1 valid of 2 maximum.", report)
         self.assertIn("## Structured code-review feedback", report)
         self.assertIn("## Approved proposal\n\n# Approved proposal", report)
         self.assertEqual(self.state, original)
+
+    def test_stage_outcomes_report_skipped_failed_and_blocked_states(self):
+        state = copy.deepcopy(self.state)
+        state["workflow_execution"] = {"stages": {
+            "review": {"status": "skipped", "attempts": []},
+            "verification": {"status": "failed", "attempts": [{"attempt": 1}]},
+            "delivery": {"status": "blocked", "attempts": []},
+        }}
+
+        report = self.render(state)
+
+        self.assertIn("`review`: `skipped` (0 attempt(s)).", report)
+        self.assertIn("`verification`: `failed` (1 attempt(s)).", report)
+        self.assertIn("`delivery`: `blocked` (0 attempt(s)).", report)
 
     def test_missing_optional_fields_and_legacy_state_use_existing_fallbacks(self):
         legacy = {
