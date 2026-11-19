@@ -35,8 +35,13 @@ from observability.tracer import (
     safe_workflow_reference,
 )
 from workflow import authorization as _authorization
+from workflow import assessment as _assessment
 from workflow import cli as _cli
+from workflow import configuration as _configuration
+from workflow import definitions as _definitions
+from workflow.engine import definition_snapshot as _definition_snapshot
 from workflow import persistence as _persistence
+from workflow import policies as _policies
 from workflow import process_locks as _process_locks
 from workflow import process_control as _process_control
 from workflow import planning_review as _planning_review
@@ -611,8 +616,39 @@ def _configured_codex_mcp_servers(environ=None) -> list[str]:
     return sorted(servers)
 
 
-def _planning_read_only_authorized_urls(stage: str, task: str) -> list[str]:
-    if stage not in {"planning", "plan_refine_1", "plan_refine_2", "human_revision"}:
+def _saved_stage_definition(state: dict, stage: str) -> dict | None:
+    workflow_definition = state.get("workflow_definition")
+    stages = workflow_definition.get("stages") if isinstance(workflow_definition, dict) else None
+    if not isinstance(stages, list):
+        return None
+    return next((item for item in stages if isinstance(item, dict) and item.get("stage_id") == stage), None)
+
+
+def _operation_capability_allowed(state: dict, capability: str, stage: str) -> bool:
+    authorization = state.get("authorization")
+    if not isinstance(authorization, dict):
+        return False
+    return _authorization.operation_capability_authorized(
+        authorization, capability, stage, _saved_stage_definition(state, stage),
+    )
+
+
+def _planning_read_only_authorized_urls(
+    stage: str,
+    task: str,
+    *,
+    authorization: dict | None = None,
+    stage_definition: dict | None = None,
+) -> list[str]:
+    allowed = (
+        stage in _authorization.LEGACY_STAGE_CAPABILITIES
+        and "documentation.read" in _authorization.LEGACY_STAGE_CAPABILITIES[stage]
+        if authorization is None else
+        _authorization.operation_capability_authorized(
+            authorization, "documentation.read", stage, stage_definition,
+        )
+    )
+    if not allowed:
         return []
     urls = re.findall(r"https://[^\s<>\]\)\"']+", task, re.IGNORECASE)
     authorized_urls = set()
@@ -784,6 +820,10 @@ class Orchestrator:
         claude_runner: Callable = claude_reviewer.review,
         tracing_enabled: bool = False,
         github_publication: dict | None = None,
+        workflow_name: str = "full-development",
+        skip_stages: tuple[str, ...] = (),
+        selected_stages: tuple[str, ...] | None = None,
+        workflow_selection: tuple | None = None,
     ):
         if (isinstance(max_code_review_calls, bool) or not isinstance(max_code_review_calls, int)
                 or not 1 <= max_code_review_calls <= MAX_AUTHORIZED_CODE_REVIEW_CALLS):
@@ -826,6 +866,12 @@ class Orchestrator:
         self.claude_runner = claude_runner
         self.tracing_enabled = bool(tracing_enabled)
         self.github_publication = github_publication
+        self.workflow_name = workflow_name
+        self.skip_stages = tuple(skip_stages)
+        self.selected_stages = tuple(selected_stages) if selected_stages is not None else None
+        self.workflow_selection = workflow_selection
+        if self.skip_stages and self.selected_stages is not None:
+            raise WorkflowError("Use either --skip or --stages, not both.")
         self._tracer = None
         self._active_trace_context = None
         self._trace_started_at: float | None = None
@@ -843,6 +889,91 @@ class Orchestrator:
     @staticmethod
     def _new_workflow_id() -> str:
         return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+
+    def _selected_workflow(self) -> tuple[_definitions.WorkflowDefinition, dict, _assessment.Assessment,
+                                           _policies.PolicyDecision]:
+        if self.workflow_selection is not None:
+            if not isinstance(self.workflow_selection, tuple) or len(self.workflow_selection) != 4:
+                raise WorkflowError("Resolved workflow selection is invalid.")
+            return self.workflow_selection
+        try:
+            return _configuration.resolve_workflow_selection(
+                self.workflow_name, self.task or "", skip_stages=self.skip_stages,
+                selected_stages=self.selected_stages,
+            )
+        except (ValueError, TypeError) as exc:
+            raise WorkflowError(str(exc)) from exc
+
+    def _append_state_history(self, key: str, entry: dict) -> None:
+        history = self.state.get(key)
+        if history is None:
+            history = []
+            self.state[key] = history
+        if not isinstance(history, list) or any(not isinstance(item, dict) for item in history):
+            raise WorkflowError(f"Saved {key.replace('_', ' ')} is invalid.")
+        history.append(entry)
+
+    def _reassess_after_planning(self, plan_text: str) -> None:
+        saved = self.state.get("assessment")
+        try:
+            previous = _assessment.assessment_from_dict(saved)
+        except ValueError as exc:
+            raise WorkflowError("Saved task assessment is incomplete or invalid; reassessment stopped safely.") from exc
+        task = self.state.get("task")
+        definition = self.state.get("workflow_definition")
+        if not isinstance(task, str) or not isinstance(definition, dict):
+            raise WorkflowError("Saved task or workflow policy is incomplete; reassessment stopped safely.")
+        assessment = _assessment.reassess_task(previous, task, plan_text=plan_text)
+        constraints = _definitions.RepositoryWorkflowConstraints()
+        try:
+            policy = _policies.resolve_policies(
+                proposal_policy=definition.get("proposal_policy"),
+                approval_policy=definition.get("approval_policy"),
+                assessment=assessment,
+                constraints=constraints,
+            )
+        except (ValueError, TypeError) as exc:
+            raise WorkflowError("Saved workflow policies are invalid; reassessment stopped safely.") from exc
+        prior_decisions = self.state.get("policy_decisions", {})
+        if not isinstance(prior_decisions, dict):
+            raise WorkflowError("Saved policy decisions are invalid; reassessment stopped safely.")
+        prior_proposal = prior_decisions.get("proposal", {})
+        prior_approval = prior_decisions.get("approval", {})
+        if (not isinstance(prior_proposal, dict) or type(prior_proposal.get("required")) is not bool
+                or not isinstance(prior_approval, dict) or type(prior_approval.get("required")) is not bool):
+            raise WorkflowError("Saved policy decisions are incomplete; reassessment stopped safely.")
+        proposal_required = prior_proposal["required"] or policy.proposal_required
+        approval_required = prior_approval["required"] or policy.approval_required
+        evaluated_at = now()
+        self.state["assessment"] = assessment.to_dict()
+        self._append_state_history("assessment_history", {
+            **assessment.to_dict(), "phase": "post_planning", "evaluated_at": evaluated_at,
+        })
+        decisions = {
+            "proposal": {
+                "required": proposal_required,
+                "policy": definition["proposal_policy"],
+                "reason": policy.reason,
+                "evaluated_at": evaluated_at,
+            },
+            "approval": {
+                "required": approval_required,
+                "policy": definition["approval_policy"],
+                "reason": policy.reason,
+                "evaluated_at": evaluated_at,
+            },
+        }
+        self.state["policy_decisions"] = decisions
+        self._append_state_history("policy_decision_history", {
+            "phase": "post_planning", "decisions": copy.deepcopy(decisions),
+        })
+
+    def _approval_required(self) -> bool:
+        decisions = self.state.get("policy_decisions")
+        approval = decisions.get("approval") if isinstance(decisions, dict) else None
+        if not isinstance(approval, dict) or type(approval.get("required")) is not bool:
+            raise WorkflowError("Saved approval policy decision is missing or invalid.")
+        return approval["required"]
 
     def _save(self) -> None:
         if not self._process_lock_held:
@@ -1663,6 +1794,68 @@ class Orchestrator:
                 )
             self.state["resource_usage"] = usage
         self._resource_usage()
+        if not isinstance(self.state.get("workflow_definition"), dict):
+            self.state["workflow_name"] = "legacy-default"
+            self.state["workflow_definition"] = _definition_snapshot(
+                _definitions.LEGACY_DEFAULT_WORKFLOW,
+            )
+            self.state["engine_version"] = 1
+        if "assessment" not in self.state:
+            task = self.state.get("task")
+            definition = self.state.get("workflow_definition", {})
+            if isinstance(task, str) and isinstance(definition, dict):
+                legacy_assessment = _assessment.assess_task(task)
+                evaluated_at = self.state.get("created_at") or now()
+                self.state["assessment"] = legacy_assessment.to_dict()
+                self._append_state_history("assessment_history", {
+                    **legacy_assessment.to_dict(), "phase": "legacy_load", "evaluated_at": evaluated_at,
+                })
+        if "policy_decisions" not in self.state:
+            definition = self.state.get("workflow_definition", {})
+            if isinstance(definition, dict):
+                try:
+                    legacy_policy = _policies.resolve_policies(
+                        proposal_policy=definition.get("proposal_policy", "required"),
+                        approval_policy=definition.get("approval_policy", "always"),
+                        assessment=_assessment.assessment_from_dict(self.state.get("assessment")),
+                        constraints=_definitions.RepositoryWorkflowConstraints(),
+                    )
+                except (TypeError, ValueError):
+                    legacy_policy = None
+                if legacy_policy is not None:
+                    evaluated_at = self.state.get("created_at") or now()
+                    self.state["policy_decisions"] = {
+                        "proposal": {
+                            "required": legacy_policy.proposal_required,
+                            "policy": definition.get("proposal_policy", "required"),
+                            "reason": "Migrated from the repository-required legacy workflow policy.",
+                            "evaluated_at": evaluated_at,
+                        },
+                        "approval": {
+                            "required": legacy_policy.approval_required,
+                            "policy": definition.get("approval_policy", "always"),
+                            "reason": "Migrated from the repository-required legacy workflow policy.",
+                            "evaluated_at": evaluated_at,
+                        },
+                    }
+                    self._append_state_history("policy_decision_history", {
+                        "phase": "legacy_load", "decisions": copy.deepcopy(self.state["policy_decisions"]),
+                    })
+        if "assessment" in self.state and "assessment_history" not in self.state:
+            try:
+                legacy_assessment = _assessment.assessment_from_dict(self.state["assessment"])
+            except ValueError as exc:
+                raise WorkflowError("Saved task assessment is incomplete or invalid.") from exc
+            self._append_state_history("assessment_history", {
+                **legacy_assessment.to_dict(),
+                "phase": "legacy_load",
+                "evaluated_at": self.state.get("created_at") or now(),
+            })
+        if "policy_decisions" in self.state and "policy_decision_history" not in self.state:
+            self._append_state_history("policy_decision_history", {
+                "phase": "legacy_load",
+                "decisions": copy.deepcopy(self.state["policy_decisions"]),
+            })
         return authorization
 
     def _load(self, *, preflight_tracing: bool = False) -> None:
@@ -2033,6 +2226,7 @@ class Orchestrator:
             raise WorkflowError("A non-empty task is required to start a workflow.")
         if self.workflow_dir.exists() or self.workflow_dir.is_symlink():
             raise WorkflowError(f"Workflow already exists; use resume: {self.workflow_id}")
+        definition, definition_data, assessment, policy = self._selected_workflow()
         try:
             budget = Decimal(str(self.budget_usd if self.budget_usd is not None else DEFAULT_CLAUDE_BUDGET_USD))
         except Exception as exc:
@@ -2072,9 +2266,35 @@ class Orchestrator:
         self.state_path = self.workflow_dir / "state.json"
         self.proposal_path = self.workflow_dir / "proposal.md"
         self.delivery_path = self.workflow_dir / "delivery.md"
+        initial_assessment_time = now()
+        initial_policy_decisions = {
+            "proposal": {
+                "required": policy.proposal_required,
+                "policy": definition.proposal_policy,
+                "reason": policy.reason,
+                "evaluated_at": initial_assessment_time,
+            },
+            "approval": {
+                "required": policy.approval_required,
+                "policy": definition.approval_policy,
+                "reason": policy.reason,
+                "evaluated_at": initial_assessment_time,
+            },
+        }
         self.state = {
             "version": 1,
             "workflow_id": self.workflow_id,
+            "workflow_name": definition.name,
+            "workflow_definition": definition_data,
+            "engine_version": 1,
+            "assessment": assessment.to_dict(),
+            "assessment_history": [{
+                **assessment.to_dict(), "phase": "initial", "evaluated_at": initial_assessment_time,
+            }],
+            "policy_decisions": initial_policy_decisions,
+            "policy_decision_history": [{
+                "phase": "initial", "decisions": copy.deepcopy(initial_policy_decisions),
+            }],
             "target": str(self.target),
             "task": self.task.strip(),
             "created_at": now(),
@@ -2153,6 +2373,8 @@ class Orchestrator:
         self._load(preflight_tracing=True)
         if self.state.get("status") != "awaiting_approval":
             raise WorkflowError("This workflow is not waiting for implementation approval.")
+        if not self._approval_required():
+            raise WorkflowError("The saved approval policy does not require an approval command.")
         self._require_current_approval_baseline()
         current_proposal = self._read_proposal()
         if current_proposal != clean_markdown(self.state.get("proposal", "")):
@@ -2179,6 +2401,19 @@ class Orchestrator:
             "conditions_sha256": hashlib.sha256(conditions.encode("utf-8")).hexdigest(),
         }
         self.state["approval_conditions"] = conditions
+        self.state["approval_policy_decision"] = {
+            "decision": "approved",
+            "reason": "Explicit approve command satisfied the persisted approval policy.",
+            "policy": self.state.get("workflow_definition", {}).get("approval_policy", "always"),
+            "assessment": copy.deepcopy(self.state.get("assessment")),
+            "timestamp": self.state["implementation_approved_at"]["time"],
+            "proposal_sha256": hashlib.sha256(current_proposal.encode("utf-8")).hexdigest(),
+            "scope": {
+                "workflow_id": self.workflow_id,
+                "target": str(self.target),
+                "proposal_version": self.state.get("proposal_version"),
+            },
+        }
         if ledger_snapshot is not None:
             self.state["commitment_ledger_approval"] = ledger_snapshot
         self.state["status"] = "running"
@@ -3190,8 +3425,14 @@ class Orchestrator:
             )
             stage = self.state.get("stage")
             task = self.state.get("task", "")
+            if not _operation_capability_allowed(self.state, "codex.execute", str(stage or "")):
+                raise WorkflowError("The saved workflow authorization does not permit Codex execution for this stage.")
             read_only_authorized_urls = (
-                _planning_read_only_authorized_urls(str(stage or ""), str(task))
+                _planning_read_only_authorized_urls(
+                    str(stage or ""), str(task),
+                    authorization=authorization,
+                    stage_definition=_saved_stage_definition(self.state, str(stage or "")),
+                )
                 if sandbox == "read-only" else []
             )
             disabled_user_mcp_servers: list[str] = []
@@ -4101,6 +4342,7 @@ class Orchestrator:
                     self.state["proposal"] = proposal
                     self.state["proposal_version"] = 1
                     self._write_proposal(proposal)
+                    self._reassess_after_planning(proposal)
                     self.state["stage"] = "plan_review_1"
                     self._save()
                 elif stage in {"plan_review_1", "plan_review_2"}:
@@ -4179,6 +4421,7 @@ class Orchestrator:
                         raise
                     self.state["proposal"] = proposal
                     self.state["proposal_version"] = next_proposal_version
+                    self._reassess_after_planning(proposal)
                     self.state.setdefault("plan_review_decisions", []).append({
                         "iteration": iteration,
                         "proposal_version": self.state["proposal_version"],
@@ -4187,8 +4430,11 @@ class Orchestrator:
                     self._write_proposal(proposal, validated_ledger=validated_ledger)
                     if iteration == 1 and review_again:
                         self.state["stage"] = "plan_review_2"
-                    else:
+                    elif self._approval_required():
                         self.state["status"] = "awaiting_approval"
+                        self.state["stage"] = "implementation"
+                    else:
+                        self.state["status"] = "running"
                         self.state["stage"] = "implementation"
                     self._save()
                 elif stage == "human_revision":
@@ -4213,17 +4459,21 @@ class Orchestrator:
                     )
                     self.state["proposal"] = clean_markdown(self._run_codex(prompt, sandbox="read-only"))
                     self.state["proposal_version"] = int(self.state.get("proposal_version", 1)) + 1
+                    self._reassess_after_planning(self.state["proposal"])
                     self._write_proposal(self.state["proposal"])
                     authorized_plan_limit = self.state["authorization"]["claude_aily"]["max_plan_reviews"]
                     valid_reviews = self._valid_plan_reviews()
                     if len(valid_reviews) < authorized_plan_limit:
                         self.state["stage"] = f"plan_review_{len(valid_reviews) + 1}"
-                    else:
+                    elif self._approval_required():
                         self.state["status"] = "awaiting_approval"
+                        self.state["stage"] = "implementation"
+                    else:
+                        self.state["status"] = "running"
                         self.state["stage"] = "implementation"
                     self._save()
                 elif stage == "implementation":
-                    if not self.state.get("implementation_approved_at"):
+                    if self._approval_required() and not self.state.get("implementation_approved_at"):
                         self.state["status"] = "awaiting_approval"
                         self._save()
                         break

@@ -17,6 +17,41 @@ from workflow import authorization  # noqa: E402
 
 
 class AuthorizationModuleTests(unittest.TestCase):
+    def test_legacy_stage_capability_mapping_preserves_only_existing_operation_scope(self):
+        expected = {
+            "planning": {"codex.execute", "documentation.read"},
+            "plan_refine_1": {"codex.execute", "documentation.read"},
+            "plan_refine_2": {"codex.execute", "documentation.read"},
+            "human_revision": {"codex.execute", "documentation.read"},
+            "implementation": {"codex.execute"},
+            "correction": {"codex.execute"},
+            "renamed_planning": set(),
+            "code_review": set(),
+        }
+        legacy = {"codex_stages": authorization.CODEX_STAGES.copy()}
+        for stage, capabilities in expected.items():
+            with self.subTest(stage=stage):
+                self.assertEqual(
+                    {capability for capability in authorization.OPERATION_CAPABILITIES
+                     if authorization.operation_capability_authorized(legacy, capability, stage)},
+                    capabilities,
+                )
+
+    def test_renamed_stage_needs_an_explicit_authorized_capability_declaration(self):
+        saved = authorization.new_workflow_authorization(Path("/target"), "renamed-stage", 2.0)
+        self.assertFalse(authorization.operation_capability_authorized(
+            saved, "documentation.read", "renamed_planning", None,
+        ))
+        self.assertFalse(authorization.operation_capability_authorized(
+            saved, "documentation.read", "renamed_planning", {"capabilities": ["codex.execute"]},
+        ))
+        self.assertFalse(authorization.operation_capability_authorized(
+            saved, "documentation.read", "planning", {"capabilities": []},
+        ))
+        self.assertTrue(authorization.operation_capability_authorized(
+            saved, "documentation.read", "renamed_planning", {"capabilities": ["documentation.read"]},
+        ))
+
     def test_digest_is_deterministic_and_uses_existing_json_serialization(self):
         terms = {"scope": ["workspace", "review"], "label": "café"}
         authorization_data = {**terms, "scope_sha256": "ignored"}

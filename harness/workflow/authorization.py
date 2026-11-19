@@ -32,6 +32,15 @@ WORKSPACE_OPERATIONS = [
     "save_workflow_state_logs_proposals_reports_and_artifacts",
 ]
 CODEX_STAGES = ["planning", "implementation", "correction"]
+OPERATION_CAPABILITIES = ("codex.execute", "documentation.read")
+LEGACY_STAGE_CAPABILITIES = {
+    "planning": frozenset({"codex.execute", "documentation.read"}),
+    "plan_refine_1": frozenset({"codex.execute", "documentation.read"}),
+    "plan_refine_2": frozenset({"codex.execute", "documentation.read"}),
+    "human_revision": frozenset({"codex.execute", "documentation.read"}),
+    "implementation": frozenset({"codex.execute"}),
+    "correction": frozenset({"codex.execute"}),
+}
 LEGACY_CLAUDE_DATA_SCOPE = [
     "assignment",
     "implementation_proposal",
@@ -309,6 +318,7 @@ def new_workflow_authorization(
         "workflow_id": workflow_id,
         "workspace_operations": WORKSPACE_OPERATIONS.copy(),
         "codex_stages": CODEX_STAGES.copy(),
+        "operation_capabilities": list(OPERATION_CAPABILITIES),
         "execution_limits": {
             "max_codex_calls": max_codex_calls,
             "codex_timeout_seconds": codex_timeout_seconds,
@@ -361,6 +371,9 @@ def validate_workflow_authorization(state: dict, target: Path, workflow_id: str)
         raise AuthorizationError("Saved workspace authorization is missing, changed, or broader than the supported scope.")
     if authorization.get("codex_stages") != CODEX_STAGES:
         raise AuthorizationError("Saved Codex authorization is missing, changed, or broader than the supported stages.")
+    if ("operation_capabilities" in authorization
+            and authorization.get("operation_capabilities") != list(OPERATION_CAPABILITIES)):
+        raise AuthorizationError("Saved operation capabilities are missing, changed, or broader than supported.")
     if authorization.get("restricted_operations") != RESTRICTED_OPERATIONS:
         raise AuthorizationError("Saved protected-operation boundaries are missing or changed.")
     github_publication = authorization.get("github_publication")
@@ -454,3 +467,26 @@ def validate_workflow_authorization(state: dict, target: Path, workflow_id: str)
     if authorization.get("scope_sha256") != authorization_scope_digest(authorization):
         raise AuthorizationError("Saved workflow authorization changed after initialization.")
     return authorization
+
+
+def operation_capability_authorized(
+    authorization: dict,
+    capability: str,
+    stage: str,
+    stage_definition: dict | None = None,
+) -> bool:
+    """Check a new stage declaration or map a version 1 stage to its old scope."""
+    if capability not in OPERATION_CAPABILITIES or not isinstance(stage, str):
+        return False
+    if "operation_capabilities" in authorization:
+        declared = stage_definition.get("capabilities") if isinstance(stage_definition, dict) else None
+        if not isinstance(stage_definition, dict):
+            # Older callers and state fixtures do not carry a workflow-definition snapshot.
+            return (
+                capability in authorization.get("operation_capabilities", [])
+                and capability in LEGACY_STAGE_CAPABILITIES.get(stage, frozenset())
+            )
+        return capability in authorization.get("operation_capabilities", []) and (
+            isinstance(declared, list) and capability in declared
+        )
+    return capability in LEGACY_STAGE_CAPABILITIES.get(stage, frozenset())

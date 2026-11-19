@@ -51,6 +51,12 @@ class ApprovalConditionsTests(unittest.TestCase):
 
         self.assertEqual(approved["status"], "complete")
         self.assertEqual(approved["approval_conditions"], conditions)
+        self.assertEqual(approved["approval_policy_decision"]["decision"], "approved")
+        self.assertEqual(approved["approval_policy_decision"]["policy"], "always")
+        self.assertEqual(
+            approved["approval_policy_decision"]["scope"]["proposal_version"],
+            approved["proposal_version"],
+        )
         self.assertEqual(
             approved["implementation_approved_at"]["conditions_sha256"],
             __import__("hashlib").sha256(conditions.encode("utf-8")).hexdigest(),

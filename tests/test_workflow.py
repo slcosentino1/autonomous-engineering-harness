@@ -1222,6 +1222,9 @@ class PersistenceModuleTests(unittest.TestCase):
 
         self.assertEqual(loaded_authorization, authorization)
         self.assertEqual(runner.state_path.read_bytes(), saved_bytes)
+        self.assertEqual(runner.state["workflow_name"], "legacy-default")
+        self.assertEqual(runner.state["workflow_definition"]["name"], "legacy-default")
+        self.assertEqual(runner.state["engine_version"], 1)
         self.assertNotIn("codex_model", runner.state)
         self.assertNotIn("code_review_policy", runner.state["authorization"]["claude_aily"])
 

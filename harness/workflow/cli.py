@@ -22,6 +22,7 @@ from workflow.authorization import (
 )
 from workflow.review import _validated_campaign_reports, render_review_feedback
 from workflow import github as _github
+from workflow.configuration import resolve_workflow_selection
 
 
 DEFAULT_CLAUDE_BUDGET_USD = 2.00
@@ -65,6 +66,9 @@ def print_summary(state: dict, *, workflow_root: str) -> None:
     valid_reviews = [record for record in reviews if record.get("valid") is True]
     print(json.dumps({
         "workflow_id": state.get("workflow_id"),
+        "workflow_name": state.get("workflow_name"),
+        "assessment": state.get("assessment"),
+        "policy_decisions": state.get("policy_decisions"),
         "target": state.get("target"),
         "status": state.get("status"),
         "workflow_status": state.get("workflow_status", state.get("status")),
@@ -187,6 +191,15 @@ def main(
     task.add_argument("--task", help="Assignment text")
     task.add_argument("--task-file", help="UTF-8 file containing the assignment")
     start.add_argument("--workflow-id", help="Optional stable ID")
+    start.add_argument(
+        "--workflow", default="full-development",
+        help="Registered workflow profile (the current repository policy permits full-development)",
+    )
+    overrides = start.add_mutually_exclusive_group()
+    overrides.add_argument("--skip", action="append", default=[], metavar="STAGE",
+                           help="Skip a stage only when the profile and repository policy permit it")
+    overrides.add_argument("--stages", metavar="A,B,C",
+                           help="Select an ordered comma-separated stage list")
     start.add_argument("--budget-usd", type=float, default=DEFAULT_CLAUDE_BUDGET_USD,
                        help=f"Total cap for Claude/Aily calls (default: ${DEFAULT_CLAUDE_BUDGET_USD:.2f})")
     start.add_argument(
@@ -359,6 +372,16 @@ def main(
     args = parser.parse_args(argv)
     try:
         if args.command == "start":
+            task = task_text(args, workflow_error=workflow_error)
+            selected_stages = (
+                tuple(item.strip() for item in args.stages.split(",")) if args.stages is not None else None
+            )
+            try:
+                workflow_selection = resolve_workflow_selection(
+                    args.workflow, task, skip_stages=tuple(args.skip), selected_stages=selected_stages,
+                )
+            except ValueError as exc:
+                raise workflow_error(str(exc)) from exc
             if args.trace:
                 from observability.langfuse import LangfusePreflightError, preflight_langfuse_tracing
 
@@ -367,7 +390,7 @@ def main(
                 except LangfusePreflightError as exc:
                     raise workflow_error(str(exc)) from exc
             runner = runner_factory(
-                args.target, task=task_text(args, workflow_error=workflow_error),
+                args.target, task=task,
                 budget_usd=args.budget_usd, max_code_review_calls=args.max_code_review_calls,
                 max_codex_calls=args.max_codex_calls,
                 timeout_seconds=args.codex_timeout_seconds,
@@ -375,6 +398,10 @@ def main(
                 workflow_timeout_seconds=args.workflow_timeout_seconds,
                 workflow_id=args.workflow_id, codex=args.codex, aily=args.aily, model=args.model,
                 tracing_enabled=args.trace or tracing_enabled_from_environment(),
+                workflow_name=args.workflow,
+                skip_stages=tuple(args.skip),
+                selected_stages=selected_stages,
+                workflow_selection=workflow_selection,
             )
             print(f"Effective Claude/Aily budget: ${runner.budget_usd:.2f}")
             print(f"Authorized Claude code-review campaign calls: {runner.max_code_review_calls}")
